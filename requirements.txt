@@ -1,0 +1,9 @@
+# Core runtime dependencies for the GitHub contribution report tool.
+# Python 3.12+ is required.
+
+aiohttp>=3.9,<4.0        # async HTTP client for the GitHub REST API
+pandas>=2.1             # data wrangling and statistics
+openpyxl>=3.1           # Excel (.xlsx) writer engine used by pandas
+matplotlib>=3.8         # contribution charts and dashboard PNGs
+tqdm>=4.66             # progress bars
+python-dotenv>=1.0     # loads tokens from a local .env file (env vars also work without it)

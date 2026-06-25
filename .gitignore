@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Generated output
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env.local
+
+# Machine-specific local launcher + vendored deps (this split-Python machine only)
+.deps/
+run.ps1
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -123,6 +123,11 @@ class RepoWork:
     highlights: list[str]  # readable PR titles + humanised branch topics
     themes: list[str]      # recurring keywords
     conv_types: dict[str, int]
+    # Line-level impact (0 when --no-commit-stats was used)
+    total_additions: int = 0
+    total_deletions: int = 0
+    total_files_changed: int = 0
+    most_impactful_commit: str = ""  # "message (±N lines)"
 
     def headline(self) -> str:
         span = ""
@@ -134,7 +139,10 @@ class RepoWork:
         branch = ""
         if len(self.branches) > 1:
             branch = f" across {len(self.branches)} branches"
-        return f"{self.commits} commit(s){branch}{pr}{span}"
+        lines = ""
+        if self.total_additions or self.total_deletions:
+            lines = f", +{self.total_additions:,}/−{self.total_deletions:,} lines"
+        return f"{self.commits} commit(s){branch}{pr}{lines}{span}"
 
 
 @dataclass(slots=True)
@@ -246,6 +254,18 @@ def _build_repo_work(
 
     themes, conv_types = extract_themes([c.message for c in commits])
 
+    total_additions = sum(c.additions for c in commits)
+    total_deletions = sum(c.deletions for c in commits)
+    total_files_changed = sum(c.files_changed for c in commits)
+
+    most_impactful = ""
+    if commits:
+        big = max(commits, key=lambda c: c.additions + c.deletions)
+        if big.additions or big.deletions:
+            total_ch = big.additions + big.deletions
+            msg = (big.message_first_line or big.sha[:8])[:60]
+            most_impactful = f"{msg} (±{total_ch:,} lines)"
+
     return RepoWork(
         full_name=repo.full_name,
         organization=repo.organization,
@@ -261,6 +281,10 @@ def _build_repo_work(
         highlights=highlights[:12],
         themes=themes,
         conv_types=conv_types,
+        total_additions=total_additions,
+        total_deletions=total_deletions,
+        total_files_changed=total_files_changed,
+        most_impactful_commit=most_impactful,
     )
 
 

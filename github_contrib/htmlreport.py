@@ -39,7 +39,7 @@ def _fmt_date(value: object) -> str:
 
 def _metric_pairs(summary: dict[str, object], insights: Insights) -> list[tuple[str, object]]:
     ins = insights.to_summary_dict()
-    return [
+    pairs: list[tuple[str, object]] = [
         ("Lifetime commits", summary.get("total_lifetime_commits", 0)),
         ("Pull requests", summary.get("total_pull_requests", 0)),
         ("Merged PRs", summary.get("merged_pull_requests", 0)),
@@ -49,6 +49,16 @@ def _metric_pairs(summary: dict[str, object], insights: Insights) -> list[tuple[
         ("Longest streak (days)", ins.get("longest_daily_streak", 0)),
         ("Avg commits / active week", ins.get("avg_commits_per_active_week", 0)),
     ]
+    if summary.get("total_lines_added"):
+        added = int(summary["total_lines_added"])  # type: ignore[arg-type]
+        deleted = int(summary.get("total_lines_deleted", 0))  # type: ignore[arg-type]
+        pairs += [
+            ("Lines added", f"+{added:,}"),
+            ("Lines deleted", f"−{deleted:,}"),
+            ("Net lines", f"{int(summary.get('net_lines', 0)):+,}"),  # type: ignore[arg-type]
+            ("Files touched", f"{int(summary.get('total_files_changed', 0)):,}"),  # type: ignore[arg-type]
+        ]
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +187,13 @@ tr:nth-child(even) td { background:#fafbfe; }
 .themes { margin-top:10px; }
 .chip { display:inline-block; background:#eef2f9; color:#33476a; border-radius:999px; padding:2px 10px; margin:3px 4px 0 0; font-size:12.5px; }
 .note { color:var(--muted); font-size:13.5px; font-style:italic; }
+.impact { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 10px; }
+.istat { font-size:12.5px; font-weight:600; padding:2px 10px; border-radius:999px; background:#f0f2f7; }
+.istat.add { color:#1e7d34; background:#e7f4ea; }
+.istat.del { color:#b3261e; background:#fdecea; }
+.istat.net { background:#f0f2f7; }
+.istat.files { color:var(--muted); }
+.bigcommit { font-size:12.5px; color:var(--muted); margin-bottom:8px; }
 footer { color:var(--muted); font-size:12.5px; margin-top:40px; text-align:center; }
 """
 
@@ -311,11 +328,30 @@ def _render_repo_card(work: RepoWork) -> str:
     items = "".join(f"<li>{_esc(h)}</li>" for h in work.highlights)
     items_html = f"<ul>{items}</ul>" if items else "<p class='note'>No PR/branch descriptions available.</p>"
     themes_html = f"<div class='themes'>Recurring themes: {chips}</div>" if chips else ""
+
+    impact_html = ""
+    if work.total_additions or work.total_deletions:
+        net = work.total_additions - work.total_deletions
+        net_sign = "+" if net >= 0 else ""
+        net_color = "#1e7d34" if net >= 0 else "#b3261e"
+        impact_html = (
+            "<div class='impact'>"
+            f"<span class='istat add'>+{work.total_additions:,} added</span>"
+            f"<span class='istat del'>−{work.total_deletions:,} deleted</span>"
+            f"<span class='istat net' style='color:{net_color}'>{net_sign}{net:,} net</span>"
+            f"<span class='istat files'>{work.total_files_changed:,} files</span>"
+            "</div>"
+        )
+        if work.most_impactful_commit:
+            impact_html += (
+                f"<div class='bigcommit'>Largest commit: <em>{_esc(work.most_impactful_commit)}</em></div>"
+            )
+
     return (
         "<div class='repo'>"
         f"<div class='name'>{_esc(work.full_name)}<span class='badge {badge}'>{badge}</span></div>"
         f"<div class='sub'>{_esc(work.headline())}{lang}</div>"
-        f"{items_html}{themes_html}"
+        f"{impact_html}{items_html}{themes_html}"
         "</div>"
     )
 

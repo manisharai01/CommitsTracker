@@ -7,10 +7,17 @@ output/
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
 *.egg-info/
 .venv/
 venv/
 .env.local
+dist/
+build/
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
 
 # Machine-specific local launcher + vendored deps (this split-Python machine only)
 .deps/
@@ -18,5 +25,7 @@ run.ps1
 
 # OS / editor
 .DS_Store
+Thumbs.db
+ehthumbs.db
 .vscode/
 .idea/

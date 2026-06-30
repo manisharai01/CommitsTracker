@@ -74,19 +74,34 @@ async def collect_commits_for_repo(
     target_logins: list[str],
     *,
     scan_all_branches: bool = False,
+    author_emails: list[str] | None = None,
 ) -> list[CommitRecord]:
-    """Collect commits authored by ``target_logins`` in ``repo``.
+    """Collect commits authored by ``target_logins`` (and optionally ``author_emails``) in ``repo``.
+
+    The GitHub API's ``?author=`` parameter accepts both a GitHub login and a raw
+    email address.  Login-based queries return commits whose author email is linked
+    to that GitHub account.  Email-based queries catch commits made with a work or
+    personal address that has *not* been added to the GitHub profile — the most
+    common reason private/work commits are missing.
 
     Commits are de-duplicated by SHA within the repository (a commit reachable
     from multiple branches is reported once, against the first branch on which
-    it is found)."""
+    it is found).
+    """
     branches = await _branches_to_scan(client, repo, scan_all_branches)
     seen: set[str] = set()
     results: list[CommitRecord] = []
 
-    for login in target_logins:
+    # (author_key passed to ?author=, fallback_login used when the payload has
+    #  no gh_author.login — i.e. the email is not linked to any GitHub account)
+    primary_login = target_logins[0] if target_logins else ""
+    author_keys: list[tuple[str, str]] = [(login, login) for login in target_logins]
+    for email in (author_emails or []):
+        author_keys.append((email, primary_login))
+
+    for author_key, fallback_login in author_keys:
         for branch in branches:
-            params: dict[str, Any] = {"author": login, "sha": branch}
+            params: dict[str, Any] = {"author": author_key, "sha": branch}
             try:
                 async for payload in client.paginate(
                     f"/repos/{repo.full_name}/commits", params=params
@@ -97,13 +112,13 @@ async def collect_commits_for_repo(
                     if not sha or sha in seen:
                         continue
                     seen.add(sha)
-                    results.append(_commit_from_payload(payload, repo, branch, login))
+                    results.append(_commit_from_payload(payload, repo, branch, fallback_login))
             except GitHubError as exc:
                 # Empty repos, disabled repos, or revoked access - skip quietly.
                 log.debug(
                     "Skipping commits for %s (author=%s, branch=%s): %s",
                     repo.full_name,
-                    login,
+                    author_key,
                     branch,
                     exc,
                 )
@@ -112,3 +127,37 @@ async def collect_commits_for_repo(
     if results:
         log.debug("%s: %d commit(s) by tracked users", repo.full_name, len(results))
     return results
+
+
+async def enrich_commits_with_stats(
+    repo_client: dict[str, "GitHubClient"],
+    commits: list[CommitRecord],
+) -> None:
+    """Fetch line-level stats for every commit (one extra API request each).
+
+    Results are written in-place.  Individual failures are silently skipped so
+    a single 403/404 never aborts the enrichment pass.  Pass ``repo_client`` as
+    a ``{full_name: GitHubClient}`` mapping so each request uses the token that
+    already has read access to that repository.
+    """
+    import asyncio
+
+    fallback: GitHubClient | None = next(iter(repo_client.values()), None)
+    if fallback is None:
+        return
+
+    async def _one(commit: CommitRecord) -> None:
+        client = repo_client.get(commit.full_name) or fallback
+        try:
+            payload = await client.request(  # type: ignore[union-attr]
+                "GET", f"/repos/{commit.full_name}/commits/{commit.sha}"
+            )
+            if isinstance(payload, dict):
+                s = payload.get("stats") or {}
+                commit.additions = int(s.get("additions") or 0)
+                commit.deletions = int(s.get("deletions") or 0)
+                commit.files_changed = len(payload.get("files") or [])
+        except Exception:  # noqa: BLE001 - best effort; never abort
+            pass
+
+    await asyncio.gather(*[_one(c) for c in commits])

@@ -13,7 +13,7 @@ from typing import Awaitable, Callable
 import aiohttp
 
 from .client import GitHubClient, GitHubError
-from .commits import collect_commits_for_repo
+from .commits import collect_commits_for_repo, enrich_commits_with_stats
 from .config import AppConfig
 from .discovery import (
     discover_org_repos,
@@ -268,6 +268,7 @@ async def collect(config: AppConfig) -> CollectedData:
                         repo,
                         config.target_logins,
                         scan_all_branches=config.scan_all_branches,
+                        author_emails=config.author_emails or None,
                     ),
                     repo.full_name,
                 )
@@ -277,6 +278,27 @@ async def collect(config: AppConfig) -> CollectedData:
                 commits.extend(batch)
         commits = _dedupe_commits(commits)
         log.info("collected %d commit(s)", len(commits))
+
+        # --- line-level stats (one request per commit) --------------------
+        if config.fetch_commit_stats and commits:
+            # Build a full_name → client map so each request uses the token
+            # that already has read access to that repo.
+            repo_client: dict[str, GitHubClient] = {
+                repo.full_name: client_for(repo) for repo in repo_list
+            }
+            log.info(
+                "Fetching line stats for %d commit(s) (%d extra API request(s)) — "
+                "use --no-commit-stats to skip.",
+                len(commits), len(commits),
+            )
+            enrich_coros = [
+                _guard(
+                    enrich_commits_with_stats(repo_client, [c]),
+                    c.sha[:7],
+                )
+                for c in commits
+            ]
+            await _gather_with_progress(enrich_coros, "Line stats")
 
         # --- pull requests ------------------------------------------------
         prs: list[PullRequestRecord] = []

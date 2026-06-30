@@ -3,15 +3,17 @@
 
 Examples
 --------
-    python github_report.py                      # both users (default)
-    python github_report.py --all                # both users (explicit)
-    python github_report.py --user manisharai01  # a single user
-    python github_report.py --user manisharai01 --user manisharai21
-    python github_report.py --all-branches --output ./out
+    # Single account
+    python github_report.py --user octocat
 
-Tokens are read from the environment variables GITHUB_TOKEN_1 (manisharai01)
-and GITHUB_TOKEN_2 (manisharai21).  A local .env file is loaded automatically
-when python-dotenv is installed.
+    # Multiple accounts
+    python github_report.py --user alice --user bob
+
+    # Quick run (default branch only)
+    python github_report.py --user octocat --default-branch-only
+
+Set GITHUB_TOKEN_<LOGIN> (or just GITHUB_TOKEN) in your environment or .env
+file before running.  See .env.example and README.md for details.
 """
 
 from __future__ import annotations
@@ -134,6 +136,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--author-email",
+        action="append",
+        metavar="EMAIL",
+        dest="author_email",
+        help=(
+            "Also collect commits by this git author email address (repeatable). "
+            "Use this when commits were made with a work or personal email that is "
+            "NOT linked to the GitHub account — the most common reason private/work "
+            "commits go missing. Also reads AUTHOR_EMAILS from the environment."
+        ),
+    )
+    parser.add_argument(
+        "--no-commit-stats",
+        action="store_true",
+        help=(
+            "Skip fetching per-commit line stats (additions/deletions/files changed). "
+            "Saves one API request per commit — useful when rate-limited or for quick runs."
+        ),
+    )
+    parser.add_argument(
         "--no-search-discovery",
         action="store_true",
         help="Disable commit-search-based repository discovery.",
@@ -174,7 +196,7 @@ def resolve_users(args: argparse.Namespace) -> list[str]:
                 seen.add(u)
                 users.append(u)
         return users
-    # --all or default
+    # --all or default (KNOWN_USERS may be empty when no defaults are configured)
     return list(KNOWN_USERS)
 
 
@@ -222,6 +244,14 @@ def main(argv: list[str] | None = None) -> int:
     _configure_event_loop()
     users = resolve_users(args)
 
+    if not users:
+        parser.error(
+            "No users specified. Use --user LOGIN (repeatable) to choose which "
+            "GitHub account(s) to report on, then set GITHUB_TOKEN_LOGIN (or "
+            "GITHUB_TOKEN) in your environment or .env file.\n\n"
+            "  Example: python github_report.py --user octocat"
+        )
+
     try:
         config = build_config(
             selected_logins=users,
@@ -238,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             enumerate_org_repos=not args.no_org_repos,
             extra_repos=args.repo,
             extra_orgs=args.org,
+            author_emails=args.author_email or [],
+            fetch_commit_stats=not args.no_commit_stats,
         )
     except ConfigError as exc:
         # Logging may not be configured yet; print plainly to stderr.

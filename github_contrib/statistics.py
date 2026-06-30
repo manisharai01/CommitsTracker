@@ -37,6 +37,8 @@ class Statistics:
     pr_summary: pd.DataFrame
     per_user: pd.DataFrame
     summary: pd.DataFrame
+    lines_by_repo: pd.DataFrame          # additions/deletions/net per repo
+    top_commits_by_impact: pd.DataFrame  # top commits ranked by lines changed
     summary_dict: dict[str, object] = field(default_factory=dict)
 
 
@@ -58,6 +60,7 @@ _COMMIT_COLS = [
     "author_login", "author_name", "author_email", "committer_name",
     "committer_email", "authored_date", "committed_date", "branch",
     "message_first_line", "message", "url",
+    "additions", "deletions", "files_changed",
 ]
 _PR_COLS = [
     "repository", "full_name", "organization", "number", "title",
@@ -167,6 +170,10 @@ def compute_statistics(data: CollectedData) -> Statistics:
     # -- per-user breakdown ------------------------------------------------
     per_user = _per_user(data)
 
+    # -- line-level impact tables ------------------------------------------
+    lines_by_repo = _lines_by_repo(data)
+    top_commits = _top_commits_by_impact(data)
+
     # -- headline summary --------------------------------------------------
     summary_dict = _summary_dict(data, authored)
     summary_df = pd.DataFrame(
@@ -188,6 +195,8 @@ def compute_statistics(data: CollectedData) -> Statistics:
         pr_summary=pr_summary,
         per_user=per_user,
         summary=summary_df,
+        lines_by_repo=lines_by_repo,
+        top_commits_by_impact=top_commits,
         summary_dict=summary_dict,
     )
 
@@ -308,7 +317,12 @@ def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]
     first_dt = valid_dates.min() if not valid_dates.empty else None
     last_dt = valid_dates.max() if not valid_dates.empty else None
 
-    return {
+    total_additions = sum(c.additions for c in data.commits)
+    total_deletions = sum(c.deletions for c in data.commits)
+    total_files_changed = sum(c.files_changed for c in data.commits)
+    has_line_stats = total_additions > 0 or total_deletions > 0
+
+    d: dict[str, object] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tracked_users": ", ".join(sorted({c.author_login for c in data.commits} | {p.author_login for p in data.pull_requests})),
         "total_lifetime_commits": len(data.commits),
@@ -324,6 +338,64 @@ def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]
         "first_contribution_date": _iso_date(first_dt),
         "latest_contribution_date": _iso_date(last_dt),
     }
+    if has_line_stats:
+        d["total_lines_added"] = total_additions
+        d["total_lines_deleted"] = total_deletions
+        d["net_lines"] = total_additions - total_deletions
+        d["total_files_changed"] = total_files_changed
+        avg = round(total_additions / len(data.commits), 1) if data.commits else 0.0
+        d["avg_lines_added_per_commit"] = avg
+    return d
+
+
+def _lines_by_repo(data: CollectedData) -> pd.DataFrame:
+    """Additions, deletions, net lines and files changed grouped by repository."""
+    cols = ["full_name", "organization", "commits", "additions", "deletions", "net_lines", "files_changed"]
+    if not data.commits or not any(c.additions or c.deletions for c in data.commits):
+        return pd.DataFrame(columns=cols)
+    buckets: dict[str, dict[str, object]] = {}
+    for c in data.commits:
+        key = c.full_name
+        b = buckets.setdefault(key, {
+            "full_name": key,
+            "organization": c.organization or "(personal)",
+            "commits": 0, "additions": 0, "deletions": 0, "files_changed": 0,
+        })
+        b["commits"] = int(b["commits"]) + 1  # type: ignore[arg-type]
+        b["additions"] = int(b["additions"]) + c.additions  # type: ignore[arg-type]
+        b["deletions"] = int(b["deletions"]) + c.deletions  # type: ignore[arg-type]
+        b["files_changed"] = int(b["files_changed"]) + c.files_changed  # type: ignore[arg-type]
+    rows = []
+    for b in buckets.values():
+        rows.append({**b, "net_lines": int(b["additions"]) - int(b["deletions"])})  # type: ignore[arg-type]
+    df = pd.DataFrame(rows, columns=cols)
+    return df.sort_values("additions", ascending=False, ignore_index=True)
+
+
+def _top_commits_by_impact(data: CollectedData, top: int = 20) -> pd.DataFrame:
+    """Top commits ranked by total lines changed (additions + deletions)."""
+    cols = ["sha", "repository", "author_login", "authored_date",
+            "additions", "deletions", "total_changes", "files_changed", "message_first_line", "url"]
+    commits_with_stats = [c for c in data.commits if c.additions or c.deletions]
+    if not commits_with_stats:
+        return pd.DataFrame(columns=cols)
+    rows = [
+        {
+            "sha": c.sha[:8],
+            "repository": c.full_name,
+            "author_login": c.author_login,
+            "authored_date": _iso_date(c.authored_date),
+            "additions": c.additions,
+            "deletions": c.deletions,
+            "total_changes": c.additions + c.deletions,
+            "files_changed": c.files_changed,
+            "message_first_line": c.message_first_line[:80],
+            "url": c.url,
+        }
+        for c in commits_with_stats
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    return df.sort_values("total_changes", ascending=False, ignore_index=True).head(top)
 
 
 def _iso_date(value) -> str:

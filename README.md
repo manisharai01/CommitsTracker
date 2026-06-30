@@ -2,11 +2,82 @@
 
 A production-quality, async Python tool that exports **every commit, pull
 request, repository contribution and organization contribution** accessible to
-one or more GitHub Personal Access Tokens into clean **CSV**, **Excel** and
-**chart** outputs.
+one or more GitHub Personal Access Tokens into clean **CSV**, **Excel**,
+**HTML/Markdown reports** and **charts**.
 
-It is pre-configured for two accounts — **`manisharai01`** and
-**`manisharai21`** — but the user→token mapping is configurable.
+Works for **any GitHub account** — just pass `--user <login>` and set the
+matching token once.
+
+---
+
+## Quick Start (your own account)
+
+> **5 minutes to your first report.**
+
+### 1. Clone and install dependencies
+
+```bash
+git clone https://github.com/YOUR_FORK/CommitsTracker.git
+cd CommitsTracker
+```
+
+**macOS / Linux**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Windows (PowerShell)**
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2. Create a GitHub token
+
+Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**.
+
+Create a classic token with these scopes:
+
+| Scope | Why |
+| --- | --- |
+| `repo` | Read your own private repos AND private repos you collaborate on |
+| `read:org` | Read organization membership and org repos |
+
+> **Fine-grained tokens will miss private/work commits.** See [Capturing private commits](#capturing-private--organization--work-commits) below.
+
+### 3. Set your token
+
+```bash
+# macOS / Linux
+export GITHUB_TOKEN=ghp_your_token_here
+
+# Windows PowerShell
+$env:GITHUB_TOKEN = "ghp_your_token_here"
+```
+
+Or copy the example and fill it in:
+
+```bash
+cp .env.example .env          # macOS/Linux
+Copy-Item .env.example .env   # Windows PowerShell
+```
+
+Then edit `.env`:
+
+```dotenv
+GITHUB_TOKEN=ghp_your_token_here
+```
+
+### 4. Run
+
+```bash
+python github_report.py --user YOUR_GITHUB_LOGIN
+```
+
+Open `output/report.html` in your browser — done.
 
 ---
 
@@ -14,18 +85,18 @@ It is pre-configured for two accounts — **`manisharai01`** and
 
 | Area | What it does |
 | --- | --- |
-| **Authentication** | Separate Personal Access Tokens per account, read from `GITHUB_TOKEN_1` / `GITHUB_TOKEN_2` (optionally via a `.env` file). |
-| **Repository discovery** | Personal, private, organization and collaborator repos — paginated and de-duplicated across both accounts. |
-| **Commits** | Every commit authored by the tracked users, with repo, org, SHA, message, dates, author name/email, branch and URL. Optional all-branch scanning. |
+| **Authentication** | One Personal Access Token per account, read from `GITHUB_TOKEN_<LOGIN>` or `GITHUB_TOKEN` (optionally via a `.env` file). |
+| **Repository discovery** | Personal, private, organization and collaborator repos — paginated and de-duplicated. |
+| **Commits** | Every commit authored by the tracked users, with repo, org, SHA, message, dates, author name/email, branch and URL. Scans all branches by default. |
 | **Pull requests** | Open / closed / merged PRs with repo, title, created/merged dates, state and URL. |
 | **Organizations** | Org membership plus per-org contribution counts (commits, PRs, merged PRs, repos contributed to). |
 | **Statistics** | Commits per repo / year / month, by author email, by organization; PR & merged-PR counts; top repositories. |
 | **Readable reports** | A self-contained **styled HTML report** (`report.html`, charts embedded — open/share in any browser) and a structured **Markdown report** (`report.md`). |
-| **Work narrative** | Per-repo "what was worked on", derived deterministically from **PR titles, humanised branch names and recurring commit keywords** — so the work is explained *even when commit messages are terse*. No AI/API key needed. |
+| **Work narrative** | Per-repo "what was worked on", derived deterministically from **PR titles, humanised branch names and recurring commit keywords** — no AI/API key needed. |
 | **Activity insights** | Active days, longest daily streak, busiest day-of-week & month, average commits per active week, and primary languages. |
-| **Any user** | Not hardcoded — report on **any** GitHub login via `--user <login>` with a matching token. The two accounts are just the defaults. |
+| **Any user** | Works for any GitHub login via `--user <login>`. |
 | **Outputs** | 5 CSV files + a 13-sheet formatted Excel workbook + HTML & Markdown reports. |
-| **Charts (bonus)** | Per-year, per-month, day-of-week, top-repository and per-org charts, plus a combined dashboard PNG. |
+| **Charts** | Per-year, per-month, day-of-week, top-repository and per-org bar charts, plus a combined dashboard PNG. |
 | **Branches** | Scans **every branch by default** (complete coverage); `--default-branch-only` for a faster run. |
 | **Performance** | Async (`aiohttp`) requests with a shared concurrency limiter, GitHub rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |
 | **Quality** | Python 3.12+, full type hints, structured logging, modular architecture, defensive error handling, offline test suite. |
@@ -50,6 +121,8 @@ CommitsTracker/
 │   ├── statistics.py           # pandas statistics
 │   ├── exporters.py            # CSV / Excel / text-report writers
 │   ├── charts.py               # matplotlib charts + dashboard
+│   ├── insights.py             # deterministic work narrative + activity insights
+│   ├── htmlreport.py           # styled HTML + Markdown report generation
 │   └── report.py               # orchestration (collect → compute → export)
 ├── tests/
 │   └── test_offline.py         # offline tests (no network needed)
@@ -68,9 +141,7 @@ output/
 ├── repositories.csv
 ├── organizations.csv
 ├── contribution_summary.csv
-├── github_contributions.xlsx     # sheets: Commits, Pull Requests, Repositories,
-│                                  #         Organizations, Summary, Yearly Stats,
-│                                  #         Monthly Stats (+ extras)
+├── github_contributions.xlsx     # 13-sheet formatted workbook
 ├── report.html                   # styled, self-contained, shareable report
 ├── report.md                     # structured Markdown report
 ├── summary_report.txt            # human-readable lifetime summary
@@ -88,83 +159,26 @@ output/
 
 ## Setup
 
-### 1. Requirements
+### Token environment variables
 
-* **Python 3.12 or newer** (`python --version`).
-* The Python packages listed in `requirements.txt`.
+The tool resolves each user's token in this order (first match wins):
 
-### 2. Create a virtual environment & install dependencies
+| Priority | Variable name | Example |
+| --- | --- | --- |
+| 1 | An explicit mapping in `config.py` → `DEFAULT_USER_TOKEN_ENV` | — |
+| 2 | `GITHUB_TOKEN_<LOGIN>` (login upper-cased, `-`/`.` → `_`) | `GITHUB_TOKEN_ALICE` for login `alice` |
+| 3 | `GITHUB_TOKEN` | single-user fallback |
 
-**macOS / Linux**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-**Windows (PowerShell)**
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### 3. Create Personal Access Tokens
-
-For **each** account (`manisharai01`, `manisharai21`) create a token at
-**GitHub → Settings → Developer settings → Personal access tokens**.
-
-> ### ⚠️ Use a **classic** token with `repo` + `read:org`
->
-> This is the single most important setup decision. Token type controls what
-> the GitHub API will return:
->
-> | You want to capture… | Classic `ghp_…` (`repo`,`read:org`) | Fine-grained `github_pat_…` |
-> | --- | :---: | :---: |
-> | Your own public repos | ✅ | ✅ |
-> | Your own private repos | ✅ | only if granted |
-> | **Private repos of *other* users you collaborate on** | ✅ | ❌ *(impossible)* |
-> | **Private organization / work repos** | ✅ | only if token is scoped to that org |
-> | Org membership (`/user/orgs`) | ✅ | ❌ unless granted |
->
-> A **fine-grained** token can only reach repositories owned by **you** (or one
-> organization it was explicitly created for) — so commits you made in other
-> people's or companies' private repos are **invisible to the API itself**, and
-> no tool can export them. **If your work commits are missing, this is why.**
-> Recreate the tokens as **classic** with the `repo` and `read:org` scopes.
-
-* **Classic token (recommended)** — scopes: `repo` and `read:org`.
-  Use `public_repo` + `read:org` if you only need public data.
-* **Fine-grained token** — only works for your own / a single granted org's
-  repos. Grant *Contents: read*, *Metadata: read*, *Pull requests: read* on the
-  repositories, plus organization *Members: read*.
-
-> Each token only sees the data **its own account** can access. To capture
-> private/org repositories for both accounts, provide both tokens. The tool
-> prints a warning at startup if it detects a fine-grained token or a classic
-> token missing `repo` / `read:org`.
-
-### 4. Provide the tokens
-
-Copy the example env file and fill in real tokens:
-
-```bash
-cp .env.example .env          # macOS/Linux
-Copy-Item .env.example .env   # Windows PowerShell
-```
+**Examples for multiple accounts:**
 
 ```dotenv
-GITHUB_TOKEN_1=ghp_xxxxxxxx_for_manisharai01
-GITHUB_TOKEN_2=ghp_xxxxxxxx_for_manisharai21
+# in .env
+GITHUB_TOKEN_ALICE=ghp_aaaa   # python github_report.py --user alice
+GITHUB_TOKEN_BOB=ghp_bbbb     # python github_report.py --user bob
 ```
 
-…or export them directly:
-
 ```bash
-export GITHUB_TOKEN_1=ghp_xxxx      # macOS/Linux
-$env:GITHUB_TOKEN_1 = "ghp_xxxx"    # Windows PowerShell
+python github_report.py --user alice --user bob
 ```
 
 ---
@@ -172,36 +186,34 @@ $env:GITHUB_TOKEN_1 = "ghp_xxxx"    # Windows PowerShell
 ## Usage
 
 ```bash
-# Both users (default)
-python github_report.py
+# Single account
+python github_report.py --user YOUR_LOGIN
 
-# Both users (explicit)
-python github_report.py --all
+# Multiple accounts
+python github_report.py --user alice --user bob
 
-# A single user
-python github_report.py --user manisharai01
-python github_report.py --user manisharai21
+# All-branches (this is the DEFAULT — complete coverage)
+python github_report.py --user YOUR_LOGIN
 
-# Combine users explicitly
-python github_report.py --user manisharai01 --user manisharai21
+# Faster run: default branch only
+python github_report.py --user YOUR_LOGIN --default-branch-only
 
-# ANY GitHub user (set GITHUB_TOKEN_OCTOCAT or GITHUB_TOKEN first)
-python github_report.py --user octocat
-
-# Faster run: only each repo's default branch (skips unmerged feature branches)
-python github_report.py --all --default-branch-only
+# Force-include repos/orgs that auto-discovery might miss
+python github_report.py --user YOUR_LOGIN \
+    --org your-company \
+    --repo colleague/private-project
 ```
 
 > **Branch coverage:** every branch is scanned **by default** so nothing is
-> missed. This is slower on large accounts; pass `--default-branch-only` for a
-> quick run that covers just the default branch of each repo.
+> missed. Use `--default-branch-only` for a quick run that covers just the
+> default branch of each repo (5-10× faster on large accounts).
 
 ### Options
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--user LOGIN` | Restrict to one user (repeatable). | all users |
-| `--all` | All known users. | — |
+| `--user LOGIN` | Restrict to one user (repeatable). Required — no built-in defaults. | — |
+| `--all` | All users listed in `DEFAULT_USER_TOKEN_ENV` (empty unless you add entries). | — |
 | `--output DIR` | Output directory. | `output` |
 | `--concurrency N` | Max concurrent API requests. | `8` |
 | `--repo OWNER/NAME` | Force-include a specific repo (repeatable). Also reads `EXTRA_REPOS`. | — |
@@ -218,8 +230,23 @@ python github_report.py --all --default-branch-only
 | `--log-level LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. | `INFO` |
 | `--version` | Print version and exit. | — |
 
-Only the tokens for the **selected** users are required. For example,
-`--user manisharai01` needs only `GITHUB_TOKEN_1`.
+---
+
+## Configuring default users (optional)
+
+If you regularly run reports for the same logins, you can add them as
+defaults so you don't have to type `--user` every time.
+
+Edit `github_contrib/config.py` and add your logins to `DEFAULT_USER_TOKEN_ENV`:
+
+```python
+DEFAULT_USER_TOKEN_ENV: dict[str, str] = {
+    "alice": "GITHUB_TOKEN_ALICE",
+    "bob":   "GITHUB_TOKEN_BOB",
+}
+```
+
+After that, `python github_report.py --all` runs for both without extra flags.
 
 ---
 
@@ -228,7 +255,7 @@ Only the tokens for the **selected** users are required. For example,
 1. **Authenticate & discover** — each token calls `GET /user` (validation) then
    `GET /user/repos?affiliation=owner,collaborator,organization_member&visibility=all`
    to enumerate every accessible repo, plus `GET /user/orgs` for membership.
-   Repos seen by both tokens are merged (the union of "who can reach it" is kept).
+   Repos seen by multiple tokens are merged (union of "who can reach it" is kept).
 2. **Collect commits** — for every repo, `GET /repos/{owner}/{repo}/commits?author={login}`
    for each tracked login. De-duplicated by SHA per repo.
 3. **Collect pull requests** — `GET /repos/{owner}/{repo}/pulls?state=all`, filtered
@@ -249,39 +276,35 @@ Only the tokens for the **selected** users are required. For example,
 ## Capturing private / organization / work commits
 
 If commits you made in **private or work repositories are missing**, it is
-almost always the **token type** (see the setup warning above), not the tool.
-Work through this checklist:
+almost always the **token type**, not the tool.  Work through this checklist:
 
 1. **Use a classic token with `repo` + `read:org`.** Fine-grained tokens cannot
    read repos owned by other users/orgs. The tool warns you at startup if it
    detects this.
-2. **Let discovery do its work.** With a proper token the tool finds your repos
-   four ways and merges them:
+
+   | You want to capture… | Classic `ghp_…` (`repo`,`read:org`) | Fine-grained `github_pat_…` |
+   | --- | :---: | :---: |
+   | Your own public repos | ✅ | ✅ |
+   | Your own private repos | ✅ | only if granted |
+   | **Private repos of *other* users you collaborate on** | ✅ | ❌ |
+   | **Private organization / work repos** | ✅ | only if token is scoped to that org |
+   | Org membership | ✅ | ❌ unless granted |
+
+2. **Let discovery do its work.** With a proper token the tool finds repos
+   four ways:
    * `GET /user/repos` (owner + collaborator + organization_member),
-   * every repo inside each organization you belong to (`--no-org-repos` to skip),
+   * every repo inside each org you belong to (`--no-org-repos` to skip),
    * repos surfaced by the **commit Search API** (`--no-search-discovery` to skip),
    * anything you force-include below.
+
 3. **Force-include known repos/orgs** the discovery still misses:
    ```bash
-   python github_report.py --all \
+   python github_report.py --user YOUR_LOGIN \
        --org acme-corp \
-       --repo someuser/their-private-repo \
+       --repo colleague/their-private-repo \
        --repo acme-corp/work-backend
    ```
    or set `EXTRA_REPOS` / `EXTRA_ORGS` in `.env`.
-
-You can confirm what a token can actually see at any time — the startup log
-prints the token kind, discovered repo counts and org membership.
-
-## Notes & limitations
-
-* The commit `author` filter matches the **GitHub login**. Commits whose author
-  email is not linked to the GitHub account won't be attributed by the API's
-  filter — this is a GitHub API characteristic, not a tool bug.
-* By default only the **default branch** is scanned (the common case and far
-  kinder to rate limits). Use `--all-branches` for exhaustive branch coverage.
-* Line-level additions/deletions are intentionally not fetched (they require one
-  extra request per commit) to keep large accounts within rate limits.
 
 ---
 
@@ -302,7 +325,8 @@ pytest -q
 
 | Symptom | Fix |
 | --- | --- |
-| `Configuration error: Missing GitHub token(s)` | Set `GITHUB_TOKEN_1` / `GITHUB_TOKEN_2` (env or `.env`). |
+| `No users specified` | Add `--user YOUR_LOGIN` to the command. |
+| `Configuration error: Missing GitHub token(s)` | Set `GITHUB_TOKEN_<LOGIN>` or `GITHUB_TOKEN` (env or `.env`). |
 | `Authentication failed (401)` | Token is invalid/expired or lacks scopes. Recreate it. |
 | Repeated "Rate limit reached; sleeping…" | Normal for large accounts; lower `--concurrency` or wait. |
 | Private/org repos missing | Token lacks `repo` / `read:org` (classic) or the equivalent fine-grained permissions. |
@@ -312,4 +336,11 @@ pytest -q
 
 ## License
 
-Provided as-is for the requested reporting task.
+MIT — see [LICENSE](LICENSE) if present, otherwise provided as-is.
+
+
+python -m venv .venv
+>> .\.venv\Scripts\Activate.ps1
+>> pip install -r requirements.txt
+>> python github_report.py --all
+.\run.ps1

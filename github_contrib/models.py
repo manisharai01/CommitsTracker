@@ -105,6 +105,11 @@ class CommitRecord:
     committed_date: datetime | None
     branch: str
     url: str
+    # Line-level stats — populated by a second-pass enrichment after collection.
+    # Zero means either no changes (e.g. merge commit) or stats were not fetched.
+    additions: int = 0
+    deletions: int = 0
+    files_changed: int = 0
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -124,6 +129,9 @@ class CommitRecord:
             "message_first_line": self.message_first_line,
             "message": self.message,
             "url": self.url,
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "files_changed": self.files_changed,
         }
 
 

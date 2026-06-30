@@ -1,11 +1,11 @@
 """Configuration loading and application settings.
 
 Tokens are read from environment variables (optionally populated from a local
-``.env`` file).  Each tracked GitHub login is mapped to the environment
-variable that holds *its* Personal Access Token:
+``.env`` file).  Run with ``--user <login>`` and set one of these env vars
+(first match wins):
 
-    manisharai01 -> GITHUB_TOKEN_1
-    manisharai21 -> GITHUB_TOKEN_2
+    GITHUB_TOKEN_<LOGIN>   e.g. GITHUB_TOKEN_OCTOCAT for login "octocat"
+    GITHUB_TOKEN           single-user convenience fallback
 """
 
 from __future__ import annotations
@@ -23,10 +23,9 @@ API_BASE_URL: str = "https://api.github.com"
 API_VERSION_HEADER: str = "2022-11-28"
 
 #: Default mapping of GitHub login -> environment variable holding its token.
-DEFAULT_USER_TOKEN_ENV: dict[str, str] = {
-    "manisharai01": "GITHUB_TOKEN_1",
-    "manisharai21": "GITHUB_TOKEN_2",
-}
+#: Empty by default — specify users with ``--user LOGIN`` on the command line
+#: and set GITHUB_TOKEN_<LOGIN> (or GITHUB_TOKEN) in your environment.
+DEFAULT_USER_TOKEN_ENV: dict[str, str] = {}
 
 DEFAULT_OUTPUT_DIR: Path = Path("output")
 DEFAULT_CONCURRENCY: int = 8
@@ -80,6 +79,11 @@ class AppConfig:
     extra_repos: list[str] = field(default_factory=list)
     extra_orgs: list[str] = field(default_factory=list)
     user_token_env: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_USER_TOKEN_ENV))
+    # Additional author emails for commits not attributed to a GitHub login
+    author_emails: list[str] = field(default_factory=list)
+    # Fetch per-commit line stats (additions/deletions/files_changed).
+    # Adds one API request per commit — disable with --no-commit-stats to save quota.
+    fetch_commit_stats: bool = True
 
     @property
     def charts_dir(self) -> Path:
@@ -190,6 +194,8 @@ def build_config(
     enumerate_org_repos: bool = True,
     extra_repos: list[str] | None = None,
     extra_orgs: list[str] | None = None,
+    author_emails: list[str] | None = None,
+    fetch_commit_stats: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     user_token_env: dict[str, str] | None = None,
@@ -204,6 +210,7 @@ def build_config(
 
     repos = list(dict.fromkeys([*(extra_repos or []), *_parse_env_list("EXTRA_REPOS")]))
     orgs = list(dict.fromkeys([*(extra_orgs or []), *_parse_env_list("EXTRA_ORGS")]))
+    emails = list(dict.fromkeys([*(author_emails or []), *_parse_env_list("AUTHOR_EMAILS")]))
 
     return AppConfig(
         accounts=accounts,
@@ -221,6 +228,8 @@ def build_config(
         enumerate_org_repos=enumerate_org_repos,
         extra_repos=repos,
         extra_orgs=orgs,
+        author_emails=emails,
+        fetch_commit_stats=fetch_commit_stats,
         max_retries=max_retries,
         request_timeout=request_timeout,
         user_token_env=mapping,

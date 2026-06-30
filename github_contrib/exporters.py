@@ -27,6 +27,8 @@ _EXCEL_SHEETS: list[tuple[str, str]] = [
     ("By Email", "commits_by_email"),
     ("Top Repositories", "top_repositories"),
     ("PR Summary", "pr_summary"),
+    ("Lines By Repo", "lines_by_repo"),
+    ("Top Commits Impact", "top_commits_by_impact"),
 ]
 
 # CSV file name -> attribute on Statistics.

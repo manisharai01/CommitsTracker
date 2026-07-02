@@ -454,6 +454,120 @@ def test_insights_and_reports():
     print("ok  test_insights_and_reports")
 
 
+def test_owner_exclusion_filter():
+    """Repos owned by the tracked login (personal repos) must be filterable."""
+    from github_contrib.config import AppConfig
+    from github_contrib.filters import apply_owner_exclusions, excluded_owner_set
+
+    data = _synthetic_data()
+    config = AppConfig(accounts=[], target_logins=["manisharai01"],
+                       exclude_own_repos=True, exclude_owners=[])
+    owners = excluded_owner_set(config, data)
+    assert owners == {"manisharai01"}
+
+    filtered, removed = apply_owner_exclusions(data, owners)
+    assert removed == {"repos": 1, "commits": 1, "pull_requests": 0}
+    assert all(r.owner != "manisharai01" for r in filtered.repos)
+    assert all(c.full_name != "manisharai01/personal" for c in filtered.commits)
+    # Company repo data must be untouched.
+    assert len(filtered.commits) == 3 and len(filtered.pull_requests) == 2
+    acme = next(o for o in filtered.organizations if o.login == "acme")
+    assert acme.commit_count == 3 and acme.is_member
+
+    # Without target logins (e.g. --regen), author logins are used instead.
+    config2 = AppConfig(accounts=[], target_logins=[], exclude_own_repos=True)
+    owners2 = excluded_owner_set(config2, data)
+    assert {"manisharai01", "manisharai21"} == owners2
+
+    # Disabled -> nothing removed.
+    config3 = AppConfig(accounts=[], target_logins=["manisharai01"],
+                        exclude_own_repos=False)
+    _, removed3 = apply_owner_exclusions(data, excluded_owner_set(config3, data))
+    assert not any(removed3.values())
+    print("ok  test_owner_exclusion_filter")
+
+
+def test_offline_csv_roundtrip():
+    """Data exported to CSV must reload into an equivalent CollectedData."""
+    from github_contrib.exporters import export_csvs
+    from github_contrib.offline import load_collected_from_csv
+    from github_contrib.statistics import compute_statistics as _cs
+
+    data = _synthetic_data()
+    stats = _cs(data)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        export_csvs(out, stats)
+        # repositories/organizations come from their own CSVs
+        import pandas as pd  # noqa: F401 (ensure pandas loaded before csv read)
+        loaded = load_collected_from_csv(out)
+
+    assert len(loaded.commits) == len(data.commits)
+    assert len(loaded.pull_requests) == len(data.pull_requests)
+    assert len(loaded.repos) == len(data.repos)
+    assert len(loaded.organizations) == len(data.organizations)
+
+    orig = {c.sha: c for c in data.commits}
+    for c in loaded.commits:
+        o = orig[c.sha]
+        assert c.full_name == o.full_name and c.author_login == o.author_login
+        assert c.authored_date == o.authored_date
+    merged = [p for p in loaded.pull_requests if p.merged]
+    assert len(merged) == 1 and merged[0].number == 1
+    # Reloaded data must produce identical headline stats.
+    stats2 = _cs(loaded)
+    assert stats2.summary_dict["total_lifetime_commits"] == 4
+    assert stats2.summary_dict["merged_pull_requests"] == 1
+    print("ok  test_offline_csv_roundtrip")
+
+
+def test_exec_summary():
+    from github_contrib.insights import build_exec_summary
+
+    data = _synthetic_data()
+    insights = compute_insights(data)
+    stats = compute_statistics(data)
+    es = build_exec_summary(insights, stats.summary_dict)
+    assert es.overview, "expected overview paragraphs"
+    assert "4 commits" in es.overview[0]
+    assert es.key_projects and es.key_projects[0].full_name == "acme/widget"
+    assert any("PR1" in feature for _repo, feature in es.features)
+    assert any(label == "Teams / accounts contributed to" for label, _v in es.strengths)
+    print("ok  test_exec_summary")
+
+
+def test_html_report_has_commit_lists_and_summary():
+    data = _synthetic_data()
+    insights = compute_insights(data)
+    stats = compute_statistics(data)
+    from github_contrib.htmlreport import render_html
+
+    html = render_html(stats, insights, stats.summary_dict, Path("nonexistent"),
+                       include_charts=False)
+    assert "Executive summary" in html
+    assert "commitlist" in html and "Show all 3 commit(s)" in html
+    # Every commit sha appears as a link in its repo's commit list.
+    for sha in ("a1", "a2", "a3", "b1"):
+        assert f">{sha}</a>" in html or f">{sha[:7]}</a>" in html, sha
+    assert "beforeprint" in html  # PDF/print support script present
+
+    # Numbers-first dashboard comes before the narrative sections.
+    assert "Repository dashboard" in html
+    assert html.index("repo-dashboard") < html.index("exec-summary")
+
+    # Chronological appendix: last section, ascending order, month headers.
+    # (anchor on the section id attribute — 'commit-timeline' alone also
+    #  matches the print stylesheet in <head>)
+    anchor = "id='commit-timeline'"
+    assert anchor in html
+    timeline = html[html.index(anchor):]
+    assert html.index("Work breakdown") < html.index(anchor)
+    order = [timeline.index(f">{sha}</a>") for sha in ("a1", "a2", "a3", "b1")]
+    assert order == sorted(order), "timeline must be oldest-first"
+    assert "January 2022" in timeline and "July 2023" in timeline
+    print("ok  test_html_report_has_commit_lists_and_summary")
+
+
 def _all_tests():
     return [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 

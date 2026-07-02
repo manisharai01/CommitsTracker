@@ -81,6 +81,12 @@ class AppConfig:
     user_token_env: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_USER_TOKEN_ENV))
     # Additional author emails for commits not attributed to a GitHub login
     author_emails: list[str] = field(default_factory=list)
+    # Report filtering: drop repositories OWNED by the tracked logins themselves
+    # (personal repos) so the outputs show only work done in other accounts /
+    # organizations (typically company repos).  Extra owners can be excluded
+    # explicitly with ``exclude_owners`` (--exclude-owner / EXCLUDE_OWNERS).
+    exclude_own_repos: bool = True
+    exclude_owners: list[str] = field(default_factory=list)
     # Fetch per-commit line stats (additions/deletions/files_changed).
     # Adds one API request per commit — disable with --no-commit-stats to save quota.
     fetch_commit_stats: bool = True
@@ -114,7 +120,7 @@ def token_env_candidates(login: str, mapping: dict[str, str]) -> list[str]:
     """Ordered list of environment variable names that may hold ``login``'s token.
 
     Resolution order (first one that is set wins):
-      1. An explicit mapping entry (e.g. manisharai01 -> GITHUB_TOKEN_1).
+      1. An explicit mapping entry (e.g. alice -> GITHUB_TOKEN_ALICE).
       2. ``GITHUB_TOKEN_<SANITIZED_LOGIN>`` (e.g. octocat -> GITHUB_TOKEN_OCTOCAT).
       3. ``GITHUB_TOKEN`` (single-user convenience).
 
@@ -178,6 +184,34 @@ def _parse_env_list(name: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def build_offline_config(
+    *,
+    selected_logins: list[str],
+    output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+    make_charts: bool = True,
+    log_level: str = "INFO",
+    exclude_own_repos: bool = True,
+    exclude_owners: list[str] | None = None,
+) -> AppConfig:
+    """An :class:`AppConfig` for ``--regen`` runs.
+
+    Rebuilding reports from previously collected CSVs needs no token, so
+    account resolution is skipped entirely; only the report-shaping options
+    matter here.
+    """
+    _maybe_load_dotenv()
+    excluded = list(dict.fromkeys([*(exclude_owners or []), *_parse_env_list("EXCLUDE_OWNERS")]))
+    return AppConfig(
+        accounts=[],
+        target_logins=list(selected_logins),
+        output_dir=Path(output_dir),
+        make_charts=make_charts,
+        log_level=log_level,
+        exclude_own_repos=exclude_own_repos,
+        exclude_owners=excluded,
+    )
+
+
 def build_config(
     *,
     selected_logins: list[str],
@@ -195,6 +229,8 @@ def build_config(
     extra_repos: list[str] | None = None,
     extra_orgs: list[str] | None = None,
     author_emails: list[str] | None = None,
+    exclude_own_repos: bool = True,
+    exclude_owners: list[str] | None = None,
     fetch_commit_stats: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -211,6 +247,7 @@ def build_config(
     repos = list(dict.fromkeys([*(extra_repos or []), *_parse_env_list("EXTRA_REPOS")]))
     orgs = list(dict.fromkeys([*(extra_orgs or []), *_parse_env_list("EXTRA_ORGS")]))
     emails = list(dict.fromkeys([*(author_emails or []), *_parse_env_list("AUTHOR_EMAILS")]))
+    excluded = list(dict.fromkeys([*(exclude_owners or []), *_parse_env_list("EXCLUDE_OWNERS")]))
 
     return AppConfig(
         accounts=accounts,
@@ -229,6 +266,8 @@ def build_config(
         extra_repos=repos,
         extra_orgs=orgs,
         author_emails=emails,
+        exclude_own_repos=exclude_own_repos,
+        exclude_owners=excluded,
         fetch_commit_stats=fetch_commit_stats,
         max_retries=max_retries,
         request_timeout=request_timeout,

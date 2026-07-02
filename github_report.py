@@ -31,6 +31,7 @@ from github_contrib.config import (
     AppConfig,
     ConfigError,
     build_config,
+    build_offline_config,
 )
 from github_contrib.logging_config import get_logger, setup_logging
 
@@ -148,6 +149,43 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--exclude-owner",
+        action="append",
+        metavar="LOGIN",
+        dest="exclude_owner",
+        default=None,
+        help=(
+            "Exclude every repository OWNED by this GitHub login from the outputs "
+            "(repeatable). Also reads EXCLUDE_OWNERS from the environment."
+        ),
+    )
+    parser.add_argument(
+        "--include-own-repos",
+        action="store_true",
+        help=(
+            "Keep repositories owned by the tracked login(s) themselves. By default "
+            "those personal repos are EXCLUDED so the report shows only work done in "
+            "other accounts / organizations (i.e. company work)."
+        ),
+    )
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help=(
+            "Also render report.html to report.pdf using headless Edge/Chrome "
+            "(no extra Python dependencies; a Chromium-based browser must be installed)."
+        ),
+    )
+    parser.add_argument(
+        "--regen",
+        action="store_true",
+        help=(
+            "Rebuild every report artifact (HTML, Markdown, Excel, charts, PDF with "
+            "--pdf) from the CSVs of a previous run in the output directory. No "
+            "network access or token required. The source CSVs are left untouched."
+        ),
+    )
+    parser.add_argument(
         "--no-commit-stats",
         action="store_true",
         help=(
@@ -244,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     _configure_event_loop()
     users = resolve_users(args)
 
-    if not users:
+    if not users and not args.regen:
         parser.error(
             "No users specified. Use --user LOGIN (repeatable) to choose which "
             "GitHub account(s) to report on, then set GITHUB_TOKEN_LOGIN (or "
@@ -253,24 +291,37 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        config = build_config(
-            selected_logins=users,
-            output_dir=args.output,
-            concurrency=args.concurrency,
-            scan_all_branches=not args.default_branch_only,
-            skip_forks=args.skip_forks,
-            collect_commits=not args.no_commits,
-            collect_prs=not args.no_prs,
-            make_charts=not args.no_charts,
-            max_repos=args.max_repos,
-            log_level=args.log_level,
-            use_search_discovery=not args.no_search_discovery,
-            enumerate_org_repos=not args.no_org_repos,
-            extra_repos=args.repo,
-            extra_orgs=args.org,
-            author_emails=args.author_email or [],
-            fetch_commit_stats=not args.no_commit_stats,
-        )
+        if args.regen:
+            # No token needed: the CSVs of a previous run are the data source.
+            config = build_offline_config(
+                selected_logins=users,
+                output_dir=args.output,
+                make_charts=not args.no_charts,
+                log_level=args.log_level,
+                exclude_own_repos=not args.include_own_repos,
+                exclude_owners=args.exclude_owner,
+            )
+        else:
+            config = build_config(
+                selected_logins=users,
+                output_dir=args.output,
+                concurrency=args.concurrency,
+                scan_all_branches=not args.default_branch_only,
+                skip_forks=args.skip_forks,
+                collect_commits=not args.no_commits,
+                collect_prs=not args.no_prs,
+                make_charts=not args.no_charts,
+                max_repos=args.max_repos,
+                log_level=args.log_level,
+                use_search_discovery=not args.no_search_discovery,
+                enumerate_org_repos=not args.no_org_repos,
+                extra_repos=args.repo,
+                extra_orgs=args.org,
+                author_emails=args.author_email or [],
+                exclude_own_repos=not args.include_own_repos,
+                exclude_owners=args.exclude_owner,
+                fetch_commit_stats=not args.no_commit_stats,
+            )
     except ConfigError as exc:
         # Logging may not be configured yet; print plainly to stderr.
         print(f"Configuration error: {exc}", file=sys.stderr)
@@ -279,13 +330,20 @@ def main(argv: list[str] | None = None) -> int:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(config.log_level, config.log_file)
     log = get_logger("cli")
-    log.info("github-contrib %s starting for: %s", __version__, ", ".join(users))
+    log.info("github-contrib %s starting for: %s", __version__, ", ".join(users) or "(regen)")
 
     # Import here so a misconfiguration above fails fast without heavy imports.
-    from github_contrib.report import run
-
     try:
-        stats = run(config)
+        if args.regen:
+            from github_contrib.offline import load_collected_from_csv
+            from github_contrib.report import generate_outputs
+
+            data = load_collected_from_csv(config.output_dir)
+            stats = generate_outputs(data, config, export_source_csvs=False)
+        else:
+            from github_contrib.report import run
+
+            stats = run(config)
     except KeyboardInterrupt:
         log.error("Interrupted by user.")
         return 130
@@ -293,7 +351,16 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("Report generation failed: %s", exc)
         return 1
 
+    pdf_path = None
+    if args.pdf:
+        from github_contrib.pdfexport import export_pdf
+
+        pdf_path = export_pdf(config.output_dir / "report.html")
+
     _print_final_summary(stats, config)
+    if args.pdf:
+        location = pdf_path.resolve() if pdf_path else "FAILED - see log; print report.html to PDF manually"
+        print(f"  PDF report          : {location}")
     return 0
 
 

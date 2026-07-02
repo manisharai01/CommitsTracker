@@ -170,6 +170,134 @@ class Insights:
         }
 
 
+# ---------------------------------------------------------------------------
+# Executive summary (promotion-ready narrative, fully data-driven)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ExecSummary:
+    """A promotion-ready narrative of the tracked user's contribution.
+
+    Everything is derived deterministically from the collected commits and
+    pull requests — no manual editing or AI required.
+    """
+
+    overview: list[str] = field(default_factory=list)       # short paragraphs
+    key_projects: list[RepoWork] = field(default_factory=list)
+    features: list[tuple[str, str]] = field(default_factory=list)  # (repo, feature)
+    strengths: list[tuple[str, str]] = field(default_factory=list)  # (label, value)
+
+
+def _fmt_day(value: object) -> str:
+    text = str(value or "")
+    return text[:10] if text else ""
+
+
+def _span_months(first: str, last: str) -> int:
+    """Whole months between two ISO date strings (0 when unknown)."""
+    try:
+        f = datetime.fromisoformat(first.replace("Z", "+00:00"))
+        l = datetime.fromisoformat(last.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return 0
+    return max(0, (l.year - f.year) * 12 + (l.month - f.month))
+
+
+def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSummary:
+    """Build the executive summary from insights + the headline summary dict."""
+    works = sorted(insights.repo_work, key=lambda w: (-w.commits, w.full_name))
+    ins = insights.to_summary_dict()
+
+    users = str(summary.get("tracked_users") or "the tracked user")
+    commits = int(summary.get("total_lifetime_commits") or 0)
+    repos = int(summary.get("repositories_contributed_to") or 0)
+    prs = int(summary.get("total_pull_requests") or 0)
+    merged = int(summary.get("merged_pull_requests") or 0)
+    owners = sorted({w.full_name.split("/", 1)[0] for w in works})
+    first = _fmt_day(summary.get("first_contribution_date"))
+    last = _fmt_day(summary.get("latest_contribution_date"))
+    months = _span_months(first, last)
+
+    overview: list[str] = []
+    span = f"Between {first} and {last}"
+    if months >= 2:
+        span += f" ({months} months)"
+    sentence = (
+        f"{span}, {users} delivered {commits:,} commits across "
+        f"{repos} repositories spanning {len(owners)} team/organization account(s)"
+    )
+    if prs:
+        sentence += f", and opened {prs} pull request(s) of which {merged} were merged"
+    overview.append(sentence + ".")
+
+    added = int(summary.get("total_lines_added") or 0)
+    deleted = int(summary.get("total_lines_deleted") or 0)
+    files = int(summary.get("total_files_changed") or 0)
+    if added or deleted:
+        overview.append(
+            f"That work amounts to {added:,} lines added and {deleted:,} lines removed "
+            f"across {files:,} file touches — a net footprint of {added - deleted:+,} lines."
+        )
+
+    active_days = int(ins.get("active_days") or 0)
+    streak = int(ins.get("longest_daily_streak") or 0)
+    per_week = ins.get("avg_commits_per_active_week") or 0
+    if active_days:
+        overview.append(
+            f"Delivery was sustained: {active_days} active coding days, a longest streak "
+            f"of {streak} consecutive day(s), and an average of {per_week} commits per active week."
+        )
+
+    # Features delivered: PR titles first (most descriptive), round-robin across
+    # projects so a single busy repo does not crowd out the others; then
+    # humanised branch topics to fill remaining slots.
+    features: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _take(get_items, cap: int) -> None:
+        for i in range(8):
+            for w in works:
+                if len(features) >= cap:
+                    return
+                items = get_items(w)
+                if i < len(items):
+                    key = items[i].lower()
+                    if key not in seen:
+                        seen.add(key)
+                        features.append((w.full_name.split("/", 1)[-1], items[i]))
+
+    _take(lambda w: [h for h in w.highlights if "(PR #" in h], 14)
+    _take(lambda w: [h for h in w.highlights if "(PR #" not in h], 14)
+
+    strengths: list[tuple[str, str]] = []
+    if insights.languages:
+        strengths.append((
+            "Technologies",
+            ", ".join(f"{lang} ({c} commits)" for lang, _r, c in insights.languages[:6]
+                      if lang != "Unknown") or ins.get("primary_languages", ""),
+        ))
+    if owners:
+        strengths.append(("Teams / accounts contributed to", ", ".join(owners)))
+    if ins.get("busiest_month"):
+        strengths.append(("Peak delivery month", str(ins["busiest_month"])))
+    private = sum(1 for w in works if w.is_private)
+    if works:
+        strengths.append((
+            "Project mix",
+            f"{len(works)} repositories ({private} private / {len(works) - private} public)",
+        ))
+    branches = sum(len(w.branches) for w in works)
+    if branches > len(works):
+        strengths.append(("Branch coverage", f"work landed on {branches} branches"))
+
+    return ExecSummary(
+        overview=overview,
+        key_projects=works[:8],
+        features=features,
+        strengths=strengths,
+    )
+
+
 def _compute_activity(commits: list[CommitRecord]) -> dict[str, object]:
     days = sorted({c.authored_date.date() for c in commits if c.authored_date})
     longest = current = 0

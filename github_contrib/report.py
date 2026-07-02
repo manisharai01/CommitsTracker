@@ -24,6 +24,7 @@ from .discovery import (
     merge_repositories,
 )
 from .exporters import export_csvs, export_excel, export_summary_report
+from .filters import apply_owner_exclusions, excluded_owner_set
 from .htmlreport import export_reports
 from .insights import compute_insights
 from .logging_config import get_logger
@@ -350,11 +351,34 @@ def _make_client_selector(
     return selector
 
 
-def generate_outputs(data: CollectedData, config: AppConfig) -> Statistics:
-    """Compute statistics & insights and write every output file."""
+def generate_outputs(
+    data: CollectedData,
+    config: AppConfig,
+    *,
+    export_source_csvs: bool = True,
+) -> Statistics:
+    """Compute statistics & insights and write every output file.
+
+    ``export_source_csvs=False`` skips rewriting the raw CSVs — used by
+    ``--regen``, where the CSVs *are* the input and rewriting them (possibly
+    filtered) would destroy the only cached copy of the collected data.
+    """
     import pandas as pd
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Drop personal repos (repos owned by the tracked logins / --exclude-owner)
+    # before any statistics are computed so every output tells the same story.
+    owners = excluded_owner_set(config, data)
+    data, removed = apply_owner_exclusions(data, owners)
+    if any(removed.values()):
+        log.info(
+            "Report excludes %d repo(s), %d commit(s), %d PR(s) owned by: %s "
+            "(use --include-own-repos to keep them).",
+            removed["repos"], removed["commits"], removed["pull_requests"],
+            ", ".join(sorted(owners)),
+        )
+
     stats = compute_statistics(data)
     insights = compute_insights(data)
 
@@ -367,7 +391,8 @@ def generate_outputs(data: CollectedData, config: AppConfig) -> Statistics:
         ignore_index=True,
     )
 
-    export_csvs(config.output_dir, stats)
+    if export_source_csvs:
+        export_csvs(config.output_dir, stats)
     export_excel(config.output_dir, stats)
     export_summary_report(config.output_dir, stats)
 

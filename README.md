@@ -95,7 +95,7 @@ Open `output/report.html` in your browser — done.
 | **Executive summary** | A promotion-ready narrative section (key projects & impact, features delivered, profile strengths) generated deterministically from the data. |
 | **Work narrative** | Per-repo "what was worked on", derived deterministically from **PR titles, humanised branch names and recurring commit keywords** — no AI/API key needed. |
 | **PDF export** | `--pdf` renders `report.html` to `report.pdf` with headless Edge/Chrome — commit lists expanded, ready to submit. |
-| **Company focus** | Personal repos (owned by the tracked login) are excluded by default; `--include-own-repos` / `--exclude-owner` control this. `--regen` restyles reports from cached CSVs without re-collecting. |
+| **All repos included** | Personal repos (owned by the tracked login) are included by default; opt in to dropping them with `--exclude-own-repos` / `--exclude-owner`. `--regen` restyles reports from cached CSVs without re-collecting. |
 | **Activity insights** | Active days, longest daily streak, busiest day-of-week & month, average commits per active week, and primary languages. |
 | **Any user** | Works for any GitHub login via `--user <login>`. |
 | **Outputs** | 5 CSV files + a 13-sheet formatted Excel workbook + HTML & Markdown reports. |
@@ -230,25 +230,25 @@ python github_report.py --user YOUR_LOGIN \
 | `--no-commits` | Skip commit collection. | off |
 | `--no-charts` | Skip chart/dashboard generation. | off |
 | `--max-repos N` | Limit repositories scanned (testing). | unlimited |
-| `--include-own-repos` | Keep repos **owned by the tracked login(s)** in the outputs. By default those personal repos are excluded so the report shows only work in other accounts/orgs (company work). | excluded |
+| `--exclude-own-repos` | Drop repos **owned by the tracked login(s)** from the outputs, so the report shows only work in other accounts/orgs (company work). | included |
 | `--exclude-owner LOGIN` | Exclude every repo owned by this login (repeatable). Also reads `EXCLUDE_OWNERS`. | — |
 | `--pdf` | Also render `report.html` → `report.pdf` via headless Edge/Chrome (all commit lists expanded). | off |
 | `--regen` | Rebuild all report artifacts from the CSVs of a previous run — no token/network needed. Source CSVs are left untouched. | off |
 | `--log-level LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. | `INFO` |
 | `--version` | Print version and exit. | — |
 
-> **Personal vs. company repos:** the report is usually meant to document work
-> done *for the company*, so repositories owned by the tracked account itself
-> (personal projects) are excluded from every output by default. Re-include
-> them with `--include-own-repos`, or exclude additional owners with
-> `--exclude-owner LOGIN`.
+> **Personal vs. company repos:** by default every repository the tracked
+> account can reach is included, so reports show all of your commits. If you
+> only want to document work done *for the company*, exclude the account's
+> own personal repos with `--exclude-own-repos`, or exclude additional owners
+> with `--exclude-owner LOGIN`.
 
 ### Regenerate / restyle without re-collecting
 
 ```bash
 # Tweak the report from cached CSVs (fast, offline, no token):
-python github_report.py --regen --pdf                     # excludes own repos (default)
-python github_report.py --regen --include-own-repos      # keep personal repos too
+python github_report.py --regen --pdf                     # includes own repos (default)
+python github_report.py --regen --exclude-own-repos      # drop personal repos
 ```
 
 ---

@@ -81,11 +81,12 @@ class AppConfig:
     user_token_env: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_USER_TOKEN_ENV))
     # Additional author emails for commits not attributed to a GitHub login
     author_emails: list[str] = field(default_factory=list)
-    # Report filtering: drop repositories OWNED by the tracked logins themselves
-    # (personal repos) so the outputs show only work done in other accounts /
-    # organizations (typically company repos).  Extra owners can be excluded
-    # explicitly with ``exclude_owners`` (--exclude-owner / EXCLUDE_OWNERS).
-    exclude_own_repos: bool = True
+    # Report filtering: optionally drop repositories OWNED by the tracked logins
+    # themselves (personal repos) so the outputs show only work done in other
+    # accounts / organizations (typically company repos). Disabled by default so
+    # reports include ALL of the tracked login's commits. Extra owners can still
+    # be excluded explicitly with ``exclude_owners`` (--exclude-owner / EXCLUDE_OWNERS).
+    exclude_own_repos: bool = False
     exclude_owners: list[str] = field(default_factory=list)
     # Fetch per-commit line stats (additions/deletions/files_changed).
     # Adds one API request per commit — disable with --no-commit-stats to save quota.
@@ -190,7 +191,7 @@ def build_offline_config(
     output_dir: Path | str = DEFAULT_OUTPUT_DIR,
     make_charts: bool = True,
     log_level: str = "INFO",
-    exclude_own_repos: bool = True,
+    exclude_own_repos: bool = False,
     exclude_owners: list[str] | None = None,
 ) -> AppConfig:
     """An :class:`AppConfig` for ``--regen`` runs.
@@ -229,7 +230,7 @@ def build_config(
     extra_repos: list[str] | None = None,
     extra_orgs: list[str] | None = None,
     author_emails: list[str] | None = None,
-    exclude_own_repos: bool = True,
+    exclude_own_repos: bool = False,
     exclude_owners: list[str] | None = None,
     fetch_commit_stats: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,

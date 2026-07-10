@@ -373,8 +373,7 @@ def generate_outputs(
     data, removed = apply_owner_exclusions(data, owners)
     if any(removed.values()):
         log.info(
-            "Report excludes %d repo(s), %d commit(s), %d PR(s) owned by: %s "
-            "(use --include-own-repos to keep them).",
+            "Report excludes %d repo(s), %d commit(s), %d PR(s) owned by: %s.",
             removed["repos"], removed["commits"], removed["pull_requests"],
             ", ".join(sorted(owners)),
         )

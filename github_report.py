@@ -160,12 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--include-own-repos",
+        "--exclude-own-repos",
         action="store_true",
         help=(
-            "Keep repositories owned by the tracked login(s) themselves. By default "
-            "those personal repos are EXCLUDED so the report shows only work done in "
-            "other accounts / organizations (i.e. company work)."
+            "Drop repositories owned by the tracked login(s) themselves (personal "
+            "repos) so the report shows only work done in other accounts / "
+            "organizations (i.e. company work). By default all repos are included."
         ),
     )
     parser.add_argument(
@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output,
                 make_charts=not args.no_charts,
                 log_level=args.log_level,
-                exclude_own_repos=not args.include_own_repos,
+                exclude_own_repos=args.exclude_own_repos,
                 exclude_owners=args.exclude_owner,
             )
         else:
@@ -318,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_repos=args.repo,
                 extra_orgs=args.org,
                 author_emails=args.author_email or [],
-                exclude_own_repos=not args.include_own_repos,
+                exclude_own_repos=args.exclude_own_repos,
                 exclude_owners=args.exclude_owner,
                 fetch_commit_stats=not args.no_commit_stats,
             )

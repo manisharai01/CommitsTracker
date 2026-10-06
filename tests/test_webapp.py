@@ -275,7 +275,8 @@ def test_web_end_to_end_local():
                 assert header in page.headers, header
             assert (await client.get("/static/app.js")).status == 200
             config = await (await client.get("/api/config")).json()
-            assert config["mode"] == "local" and {"env_logins", "defaults", "pdf_browser"} <= set(config)
+            assert config["mode"] == "local" and {"env_logins", "pdf_browser"} <= set(config)
+            assert "defaults" not in config  # .env emails / lists never reach the browser
 
             # Requests other sites could forge are refused.
             assert (await client.get("/api/jobs", headers={"Host": "evil.example"})).status == 403
@@ -358,7 +359,7 @@ def test_web_public_mode_isolation_and_limits():
             async with TestClient(TestServer(app)) as alice:
                 config = await (await alice.get("/api/config")).json()
                 assert config["mode"] == "public"
-                assert config["env_logins"] == [] and config["defaults"] == {} and config["output_dir"] == ""
+                assert config["env_logins"] == [] and config["output_dir"] == "" and "defaults" not in config
 
                 # Cross-site requests: the Origin must be the public origin.
                 assert (await alice.post("/api/jobs", json=_payload("alice"))).status == 403
@@ -412,6 +413,87 @@ def test_web_public_mode_isolation_and_limits():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(scenario(Path(tmp)))
     print("ok  test_web_public_mode_isolation_and_limits")
+
+
+def test_share_links_and_linkedin_summary():
+    async def scenario(tmp: Path) -> None:
+        jobs_dir = tmp / "runs"
+        settings = public_settings(PUBLIC_URL, jobs_dir=jobs_dir)
+        settings.script = _fake(tmp)
+        origin = {"Origin": PUBLIC_URL}
+        app = create_app(settings)
+        async with TestClient(TestServer(app)) as owner:
+            payload = _payload("alice")
+            payload["accounts"][0]["emails"] = "alice@private.example"
+            created = await owner.post("/api/jobs", json=payload, headers=origin)
+            job = await _wait_until_finished(owner, (await created.json())["id"])
+            assert job["status"] == "done" and job["share_url"] == ""
+
+            # LinkedIn draft: the report's numbers, no repository names.
+            post = await (await owner.get(f"/api/jobs/{job['id']}/linkedin")).json()
+            assert "I shipped 2 commits" in post["text"] and post["limit"] == 3000
+
+            shared = await (await owner.post(f"/api/jobs/{job['id']}/share", json={}, headers=origin)).json()
+            url = shared["share_url"]
+            assert url.startswith(f"{PUBLIC_URL}/shared/") and "share_token" not in shared
+            path = url[len(PUBLIC_URL):]
+            again = await (await owner.post(f"/api/jobs/{job['id']}/share", json={}, headers=origin)).json()
+            assert again["share_url"] == url, "sharing twice keeps the same link"
+
+            async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as stranger:
+                at = owner.make_url
+                page = await stranger.get(at(path))
+                body = await page.text()
+                assert page.status == 200 and "alice" in body and "<b>2</b> commits" in body
+                assert "alice@private.example" not in body and job["id"] not in body
+                assert page.headers["X-Robots-Tag"].startswith("noindex")
+                assert page.headers["Cache-Control"] == "no-store"
+                assert "script-src" not in page.headers["Content-Security-Policy"]  # no scripts at all
+                assert "Set-Cookie" not in page.headers, "link viewers get no session"
+                pdf = await stranger.get(at(f"{path}/files/pdf"))
+                assert pdf.status == 200 and pdf.headers["Content-Disposition"].startswith("inline")
+                html = await stranger.get(at(f"{path}/files/html"))
+                assert html.headers["Content-Security-Policy"].startswith("sandbox")
+                for hidden in (f"{path}/files/xlsx", f"{path}/files/md", f"/api/jobs/{job['id']}/log"):
+                    assert (await stranger.get(at(hidden))).status == 404, hidden
+                # Only the owner can change sharing.
+                for method in ("post", "delete"):
+                    response = await getattr(stranger, method)(
+                        at(f"/api/jobs/{job['id']}/share"), json={}, headers=origin
+                    )
+                    assert response.status == 404
+                assert (await stranger.get(at("/shared/not-a-real-token-at-all-xxxxxx"))).status == 404
+
+                # Stop sharing: the link dies at once; a new link is a new secret.
+                off = await (await owner.delete(f"/api/jobs/{job['id']}/share", json={}, headers=origin)).json()
+                assert off["share_url"] == ""
+                assert (await stranger.get(at(path))).status == 404
+                fresh = await (await owner.post(f"/api/jobs/{job['id']}/share", json={}, headers=origin)).json()
+                assert fresh["share_url"] != url
+                path = fresh["share_url"][len(PUBLIC_URL):]
+
+        # Links survive a restart, and die with the report.
+        async with TestClient(TestServer(create_app(settings))) as visitor:
+            assert (await visitor.get(path)).status == 200
+            restored = create_app(settings)
+            manager = restored[MANAGER]
+            manager.delete(manager.jobs[job["id"]])
+            async with TestClient(TestServer(restored)) as late:
+                assert (await late.get(path)).status == 404
+
+        # Local mode has no public address, so it offers no links.
+        local = Settings(jobs_dir=tmp / "local", script=_fake(tmp))
+        async with TestClient(TestServer(create_app(local))) as client:
+            done = await _wait_until_finished(
+                client, (await (await client.post("/api/jobs", json=_payload("alice"))).json())["id"]
+            )
+            refused = await client.post(f"/api/jobs/{done['id']}/share", json={})
+            assert refused.status == 400 and "public" in (await refused.json())["error"]
+            assert (await client.get(f"/api/jobs/{done['id']}/linkedin")).status == 200
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(scenario(Path(tmp)))
+    print("ok  test_share_links_and_linkedin_summary")
 
 
 def test_job_timeout_and_retention():

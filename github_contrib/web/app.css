@@ -428,6 +428,72 @@ code { font: 12px/16px var(--mono); padding: 1px 4px; border-radius: 4px; backgr
 }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } }
 
+/* ---------- card actions: primary row + secondary row ---------- */
+
+.report-actions-secondary { margin-top: 8px; }
+.text-link {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; border-radius: 9999px;
+  color: var(--muted); font-size: 14px; font-weight: 700;
+  transition: background-color 0.2s, color 0.2s;
+}
+.text-link .icon { width: 16px; height: 16px; }
+.text-link:hover { background: var(--accent-soft); color: var(--accent); text-decoration: none; }
+.shared-flag { color: var(--accent); }
+.btn-danger-outline { border-color: var(--danger); color: var(--danger); }
+.btn-danger-outline:hover { background: var(--danger-soft); }
+
+/* ---------- dialogs (X-style modal sheets) ---------- */
+
+dialog.sheet {
+  width: min(600px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+  margin: auto; padding: 0; overflow: auto;
+  border: 0; border-radius: 16px;
+  background: var(--bg); color: var(--text);
+  box-shadow: var(--shadow);
+}
+dialog.sheet::backdrop { background: rgba(91, 112, 131, 0.4); }
+.sheet-inner { padding: 4px 16px 16px; }
+.sheet-head { display: flex; align-items: center; gap: 12px; height: 53px; }
+.sheet-head h2 { margin: 0; font-size: 20px; line-height: 24px; font-weight: 800; }
+.sheet-sub { margin: 0 0 12px; color: var(--muted); }
+.sheet-list { display: flex; flex-direction: column; margin: 0 -16px; }
+.sheet-row {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 12px 16px; border: 0; background: transparent;
+  color: var(--text); text-align: left; cursor: pointer;
+  transition: background-color 0.2s;
+}
+.sheet-row:hover { background: var(--bg-hover); text-decoration: none; }
+.sheet-row:disabled { opacity: 0.5; cursor: default; }
+.sheet-row > .icon { width: 20px; height: 20px; }
+.sheet-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sheet-row-text span { color: var(--muted); font-size: 13px; line-height: 16px; }
+.share-url { display: flex; gap: 8px; margin-top: 12px; }
+.share-url input {
+  flex: 1; min-width: 0; padding: 8px 12px;
+  border: 1px solid var(--border-strong); border-radius: 9999px;
+  background: var(--bg-elev); color: var(--text); font: 13px var(--mono);
+}
+.sheet-note { margin-top: 12px; }
+.post-text {
+  display: block; width: 100%; min-height: 260px; padding: 12px;
+  border: 1px solid var(--border-strong); border-radius: 12px; outline: none;
+  background: transparent; color: var(--text);
+  font: 15px/20px var(--font); resize: vertical;
+}
+.post-text:focus { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.sheet-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.sheet-foot .spacer { flex: 1; }
+.over-limit { color: var(--danger); font-weight: 700; }
+
+/* ---------- shared report page ---------- */
+
+.shared { max-width: 600px; min-height: 100vh; margin: 0 auto; border-inline: 1px solid var(--border); }
+.shared-card { padding: 16px; }
+.shared-name { margin: 0; font-size: 23px; line-height: 28px; font-weight: 800; overflow-wrap: anywhere; }
+@media (max-width: 600px) { .shared { border-inline: 0; } }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

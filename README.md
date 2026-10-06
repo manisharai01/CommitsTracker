@@ -101,10 +101,12 @@ report and the Excel workbook).
   them to the report run through environment variables and forgets them when
   the run ends. They are never written to disk or to browser storage, and the
   server only accepts requests from its own page on `127.0.0.1`.
-- **`.env` still works.** The page pre-fills the logins that have a
-  `GITHUB_TOKEN_<LOGIN>` (plus `AUTHOR_EMAILS`, `EXTRA_REPOS`, `EXTRA_ORGS` and
-  `EXCLUDE_OWNERS`). Leave a token blank to use the one from `.env`. What you
-  submit replaces those `.env` lists for that run.
+- **The form always starts empty.** Nothing is filled in from `.env`, and the
+  page remembers only your options and time range — never usernames, emails or
+  tokens. In local mode you can still leave a token blank to use
+  `GITHUB_TOKEN_<LOGIN>` from `.env` (the page says so once you type that
+  username). Web runs use only what you type: `.env`'s `AUTHOR_EMAILS`,
+  `EXTRA_REPOS`, `EXTRA_ORGS` and `EXCLUDE_OWNERS` apply to the command line only.
 - **Several accounts.** Choose **One combined report** for accounts that belong
   to the same person, or **One report per account** to queue a separate report
   for each.

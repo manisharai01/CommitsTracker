@@ -29,6 +29,7 @@ import codecs
 import collections
 import csv
 import hashlib
+import html
 import json
 import os
 import re
@@ -57,6 +58,7 @@ from .config import (
     token_env_candidates,
 )
 from .htmlreport import REPORT_CSP
+from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
 from .pdfexport import find_browser
 
@@ -133,6 +135,7 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
 _EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_]{20,255}$")
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_SHARE_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NEWLINES = re.compile(r"\r\n|\r|\n")
 # tqdm progress line: "Commits:  45%|████▌     | 90/200 [00:30<00:40,  2.70item/s]"
@@ -487,13 +490,18 @@ def env_token_logins(env: Mapping[str, str]) -> list[str]:
     return sorted(login for login in logins if _LOGIN_RE.match(login) and not login.isdigit())
 
 
-def read_summary(out_dir: Path) -> dict[str, str]:
-    """The headline metrics of a finished run (empty when unavailable)."""
+def read_metrics(out_dir: Path) -> dict[str, str]:
+    """Every metric of a finished run's contribution_summary.csv (empty when unavailable)."""
     try:
         with (out_dir / "contribution_summary.csv").open(encoding="utf-8-sig", newline="") as fh:
-            rows = {row["metric"]: row["value"] for row in csv.DictReader(fh)}
+            return {row["metric"]: row["value"] for row in csv.DictReader(fh)}
     except (OSError, KeyError, csv.Error):
         return {}
+
+
+def read_summary(out_dir: Path) -> dict[str, str]:
+    """The headline metrics shown on a report card."""
+    rows = read_metrics(out_dir)
     return {key: rows[key] for key in SUMMARY_KEYS if rows.get(key)}
 
 
@@ -583,6 +591,8 @@ class Job:
     client: str = ""  # address that created it (rate limiting; never stored)
     # (secret or server path, replacement) applied to everything shown
     redactions: list[tuple[str, str]] = field(default_factory=list)
+    # Secret part of the read-only link the owner shared ("" = not shared).
+    share_token: str = ""
 
     @property
     def logins(self) -> list[str]:
@@ -616,11 +626,13 @@ class Job:
             "error": self.error,
             "warnings": self.warnings,
             "summary": self.summary,
+            "share_token": self.share_token,
         }
 
-    def to_json(self) -> dict:
+    def to_json(self, share_base: str = "") -> dict:
+        """What the owner's page sees (``share_base`` = public URL, if links are on)."""
         data = self.record()
-        del data["owner"]
+        del data["owner"], data["share_token"]
         return {
             **data,
             "logins": self.logins,
@@ -629,6 +641,7 @@ class Job:
             "message": self.message,
             "files": self.files(),
             "log_count": self.log_dropped + len(self.log),
+            "share_url": f"{share_base}/shared/{self.share_token}" if share_base and self.share_token else "",
         }
 
     @classmethod
@@ -647,6 +660,8 @@ class Job:
             warnings=list(data.get("warnings", [])),
             summary=dict(data.get("summary", {})),
         )
+        token = str(data.get("share_token") or "")
+        job.share_token = token if _SHARE_RE.match(token) else ""
         if job.active:  # the server stopped mid-run
             job.status = "failed"
             job.error = job.error or "The server stopped before this report finished."
@@ -811,6 +826,27 @@ class JobManager:
                 self._remove(job)  # it never started
             return
         self._remove(job)
+
+    def share(self, job: Job) -> str:
+        """Create (or reuse) the job's read-only link token."""
+        if not job.share_token:
+            job.share_token = secrets.token_urlsafe(24)
+            self._save(job)
+        return job.share_token
+
+    def unshare(self, job: Job) -> None:
+        if job.share_token:
+            job.share_token = ""
+            self._save(job)
+
+    def by_share_token(self, token: str) -> Job | None:
+        """The finished job a share link points to (constant-time comparison)."""
+        if not _SHARE_RE.match(token):
+            return None
+        for job in self.jobs.values():
+            if job.share_token and secrets.compare_digest(job.share_token, token):
+                return job if job.status == "done" else None
+        return None
 
     def _remove(self, job: Job) -> None:
         self.jobs.pop(job.id, None)
@@ -1011,7 +1047,8 @@ def _guard(settings: Settings):
             session = secrets.token_urlsafe(32)
         request[OWNER] = hashlib.sha256(session.encode("ascii")).hexdigest()
         response = await handler(request)
-        if fresh:
+        # People opening a shared link get no session: they own nothing here.
+        if fresh and not request.path.startswith("/shared/"):
             response.set_cookie(
                 settings.session_cookie,
                 session,
@@ -1039,9 +1076,11 @@ def _security_headers(settings: Settings):
             "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
         )
         headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-        headers.setdefault(
-            "Cache-Control", "no-store" if request.path.startswith("/api/") else "no-cache"
-        )
+        private = request.path.startswith(("/api/", "/shared/"))
+        headers.setdefault("Cache-Control", "no-store" if private else "no-cache")
+        if request.path.startswith("/shared/"):
+            # Shared reports are for the people given the link, not search engines.
+            headers.setdefault("X-Robots-Tag", "noindex, nofollow, noarchive")
         if settings.secure:
             headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 
@@ -1077,15 +1116,15 @@ async def _config(request: web.Request) -> web.Response:
     settings = request.app[SETTINGS]
     if settings.public:
         # Never reveal anything about the server's own environment.
-        local: dict[str, object] = {
-            "env_logins": [], "has_default_token": False, "defaults": {}, "output_dir": "",
-        }
+        local: dict[str, object] = {"env_logins": [], "has_default_token": False, "output_dir": ""}
     else:
+        # Which logins have a token in .env — only so the page can say "leave
+        # the token blank" once that username is typed. The form itself is
+        # never pre-filled, and .env emails / lists are never sent.
         env = effective_env()
         local = {
             "env_logins": env_token_logins(env),
             "has_default_token": bool((env.get("GITHUB_TOKEN") or "").strip()),
-            "defaults": {name: env.get(var, "") for name, var in FORM_ENV_VARS.items()},
             "output_dir": _display_path(request.app[MANAGER].jobs_dir),
         }
     return web.json_response(
@@ -1100,9 +1139,16 @@ async def _config(request: web.Request) -> web.Response:
     )
 
 
+def _share_base(request: web.Request) -> str:
+    """Share links exist only when the site has a public address."""
+    settings = request.app[SETTINGS]
+    return settings.public_url if settings.public else ""
+
+
 async def _list_jobs(request: web.Request) -> web.Response:
     jobs = request.app[MANAGER].listing(request[OWNER])
-    return web.json_response({"jobs": [job.to_json() for job in jobs]})
+    base = _share_base(request)
+    return web.json_response({"jobs": [job.to_json(base) for job in jobs]})
 
 
 async def _create_job(request: web.Request) -> web.Response:
@@ -1124,13 +1170,44 @@ async def _create_job(request: web.Request) -> web.Response:
         return _error(*refusal)
     job = manager.submit(job_request, owner=request[OWNER], client=client)
     log.info("queued report %s", job.id)
-    return web.json_response(job.to_json(), status=201)
+    return web.json_response(job.to_json(_share_base(request)), status=201)
 
 
 async def _cancel_job(request: web.Request) -> web.Response:
     job = _job(request)
     request.app[MANAGER].cancel(job)
-    return web.json_response(job.to_json())
+    return web.json_response(job.to_json(_share_base(request)))
+
+
+async def _share_job(request: web.Request) -> web.Response:
+    """Create the read-only link for a finished report (owner only)."""
+    job = _job(request)
+    if not _share_base(request):
+        return _error("Share links need the hosted (public) mode: run webui.py with --public-url.")
+    if job.status != "done":
+        return _error("Only a finished report can be shared.", 409)
+    request.app[MANAGER].share(job)
+    return web.json_response(job.to_json(_share_base(request)))
+
+
+async def _unshare_job(request: web.Request) -> web.Response:
+    """Turn the link off: everyone who had it loses access at once."""
+    job = _job(request)
+    request.app[MANAGER].unshare(job)
+    return web.json_response(job.to_json(_share_base(request)))
+
+
+async def _linkedin(request: web.Request) -> web.Response:
+    """A LinkedIn-ready draft built from the report's numbers (owner only)."""
+    job = _job(request)
+    if job.status != "done":
+        return _error("The LinkedIn summary is ready once the report has finished.", 409)
+    metrics = read_metrics(job.out_dir)
+    if not metrics:
+        return _error("This report has no summary to build a post from.", 409)
+    text = build_linkedin_post(metrics)
+    message = "" if text else "There's no activity in this report to post about."
+    return web.json_response({"text": text, "message": message, "limit": LINKEDIN_LIMIT})
 
 
 async def _delete_job(request: web.Request) -> web.Response:
@@ -1167,6 +1244,133 @@ async def _job_file(request: web.Request) -> web.FileResponse:
     return response
 
 
+# -- shared links (read-only, no session) -----------------------------------
+
+#: Files a shared link exposes — never the logs, the workbook or the data.
+SHARED_FILES = ("pdf", "html")
+
+_SHARED_CSP = (
+    "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _range_text(since: str, until: str) -> str:
+    """'1 Jul – 31 Jul 2026' for the dates of a report's period."""
+    def day(text: str, with_year: bool = True) -> str:
+        moment = datetime.strptime(text, "%Y-%m-%d")
+        label = f"{moment.day} {_MONTH_ABBR[moment.month - 1]}"
+        return f"{label} {moment.year}" if with_year else label
+
+    try:
+        if since and until:
+            return f"{day(since, since[:4] != until[:4])} – {day(until)}"
+        if since:
+            return f"From {day(since)}"
+        if until:
+            return f"Until {day(until)}"
+    except ValueError:
+        pass
+    return "All time"
+
+
+def _shared_job(request: web.Request) -> Job:
+    job = request.app[MANAGER].by_share_token(request.match_info["token"])
+    if job is None:
+        raise web.HTTPNotFound(text="This link doesn't work any more. Ask for a new one.")
+    return job
+
+
+async def _shared_page(request: web.Request) -> web.Response:
+    """The page someone opens from a shared link: what the report covers and
+    links to the PDF / HTML. No logs, emails or data files."""
+    job = _shared_job(request)
+    token = request.match_info["token"]
+    names = " + ".join(job.logins)
+    summary = read_summary(job.out_dir)
+    options = job.options
+    stats = [(summary.get("total_lifetime_commits"), "commit", "commits")]
+    if options.get("pull_requests", True):
+        stats.append((summary.get("total_pull_requests"), "pull request", "pull requests"))
+    stats += [
+        (summary.get("repositories_contributed_to"), "repository", "repositories"),
+        (summary.get("active_days"), "active day", "active days"),
+    ]
+    def number(value: object) -> int | None:
+        try:
+            return int(float(str(value)))
+        except (TypeError, ValueError):
+            return None
+
+    stat_html = "".join(
+        f"<span><b>{n:,}</b> {one if n == 1 else many}</span>"
+        for n, one, many in ((number(value), one, many) for value, one, many in stats)
+        if n is not None
+    )
+    added = number(summary.get("total_lines_added"))
+    if added:
+        deleted = number(summary.get("total_lines_deleted")) or 0
+        stat_html += f"<span><b>+{added:,}</b> / <b>−{deleted:,}</b> lines</span>"
+    period = _range_text(str(options.get("since") or ""), str(options.get("until") or ""))
+    zone = str(options.get("timezone") or summary.get("report_timezone") or "UTC")
+    files = job.files()
+    base = f"/shared/{token}/files"
+    buttons = []
+    if "pdf" in files:
+        buttons.append(f'<a class="btn btn-primary" href="{base}/pdf">Open PDF</a>')
+        buttons.append(f'<a class="btn btn-outline" href="{base}/pdf?download">Download</a>')
+    if "html" in files:
+        buttons.append(
+            f'<a class="btn btn-outline" href="{base}/html" target="_blank" '
+            'rel="noopener noreferrer">View online</a>'
+        )
+    esc = html.escape
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Contribution report · {esc(names)}</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main class="shared">
+  <header class="topbar">
+    <span class="brand" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h6M16 12h6"/></svg></span>
+    <h1>Contribution report</h1>
+  </header>
+  <article class="shared-card">
+    <h2 class="shared-name">{esc(names)}</h2>
+    <p class="report-sub">{esc(period)} · {esc(zone)}</p>
+    <div class="stats">{stat_html}</div>
+    <div class="report-actions">{''.join(buttons)}</div>
+    <p class="hint">Generated {esc(job.created_at[:10])}. Shared with you by link: only people who have the link can open it.</p>
+  </article>
+</main>
+</body>
+</html>"""
+    response = web.Response(text=page, content_type="text/html")
+    response.headers["Content-Security-Policy"] = _SHARED_CSP
+    return response
+
+
+async def _shared_file(request: web.Request) -> web.FileResponse:
+    job = _shared_job(request)
+    kind = request.match_info["kind"]
+    path = job.out_dir / REPORT_FILES[kind] if kind in SHARED_FILES else None
+    if path is None or not path.is_file():
+        raise web.HTTPNotFound(text="That file isn't available for this report.")
+    disposition = "attachment" if "download" in request.query else "inline"
+    response = web.FileResponse(path)
+    response.headers["Content-Disposition"] = f'{disposition}; filename="{job.download_name(kind)}"'
+    if kind == "html":
+        response.headers["Content-Security-Policy"] = _REPORT_HTML_CSP
+    return response
+
+
 def create_app(settings: Settings | None = None, **legacy) -> web.Application:
     """The aiohttp application. ``legacy`` keyword arguments build local
     :class:`Settings` (``jobs_dir``, ``python``, ``script``)."""
@@ -1189,6 +1393,11 @@ def create_app(settings: Settings | None = None, **legacy) -> web.Application:
     app.router.add_delete("/api/jobs/{job_id}", _delete_job)
     app.router.add_get("/api/jobs/{job_id}/log", _job_log)
     app.router.add_get("/api/jobs/{job_id}/files/{kind}", _job_file)
+    app.router.add_get("/api/jobs/{job_id}/linkedin", _linkedin)
+    app.router.add_post("/api/jobs/{job_id}/share", _share_job)
+    app.router.add_delete("/api/jobs/{job_id}/share", _unshare_job)
+    app.router.add_get("/shared/{token}", _shared_page)
+    app.router.add_get("/shared/{token}/files/{kind}", _shared_file)
     app.on_response_prepare.append(_security_headers(settings))
     app.on_shutdown.append(manager.shutdown)
 

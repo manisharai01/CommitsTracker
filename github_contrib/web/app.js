@@ -6,7 +6,8 @@ const LOGIN_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
 const EMAIL_RE = /^[^@\s,]+@[^@\s,]+$/;
 const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
 const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
-const FORM_KEY = "commitstracker.form.v2";
+const PREFS_KEY = "commitstracker.prefs.v1";
+const LEGACY_FORM_KEYS = ["commitstracker.form.v1", "commitstracker.form.v2"];
 const THEME_KEY = "commitstracker.theme";
 const ACTIVE = new Set(["queued", "running"]);
 const MAX_ACCOUNTS = 20;
@@ -47,6 +48,9 @@ const ICONS = {
   redo: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>',
+  share: '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/>',
+  link: '<path d="M10 14a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1 1"/><path d="M14 10a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1-1"/>',
+  pen: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
   lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
   chevron: '<path d="M6 9l6 6 6-6"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
@@ -71,7 +75,6 @@ const state = {
     retention_hours: 0,
     env_logins: [],
     has_default_token: false,
-    defaults: {},
     pdf_browser: true,
     output_dir: "",
   },
@@ -115,6 +118,14 @@ function storageSet(key, value) {
     localStorage.setItem(key, value);
   } catch {
     // Private window or blocked storage: the page works without it.
+  }
+}
+
+function storageRemove(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Nothing stored, or storage is blocked.
   }
 }
 
@@ -433,44 +444,33 @@ function updateOptionsSummary() {
   $("#options-summary").textContent = changed ? `${changed} customized` : "Defaults";
 }
 
+// Only preferences are remembered: usernames, emails and tokens are personal
+// and never stored, so every visit starts with an empty account form.
 function saveForm() {
-  const accounts = readAccounts().map(({ login, emails }) => ({ login, emails }));
   const key = currentPeriodKey();
   const period = key === "custom" ? { key, since: $("#period-from").value, until: $("#period-to").value } : { key };
-  storageSet(FORM_KEY, JSON.stringify({ accounts, options: readOptions(), mode: currentMode(), period }));
+  storageSet(PREFS_KEY, JSON.stringify({ options: readOptions(), mode: currentMode(), period }));
 }
 const saveFormSoon = debounce(saveForm, 300);
 
 function restoreForm() {
+  // Earlier versions saved usernames and emails; erase them.
+  for (const key of LEGACY_FORM_KEYS) storageRemove(key);
   let saved = null;
   try {
-    saved = JSON.parse(storageGet(FORM_KEY) || "null");
+    saved = JSON.parse(storageGet(PREFS_KEY) || "null");
   } catch {
     saved = null;
   }
-  if (Array.isArray(saved?.accounts) && saved.accounts.length) {
-    for (const account of saved.accounts.slice(0, MAX_ACCOUNTS)) {
-      addAccount({ login: String(account.login || ""), emails: String(account.emails || "") });
-    }
+  addAccount();
+  if (saved && typeof saved === "object") {
     applyOptions(saved.options);
     setMode(saved.mode);
     const period = saved.period || {};
     setPeriod(String(period.key || "all"), String(period.since || ""), String(period.until || ""));
-    return;
+  } else {
+    setPeriod("all");
   }
-  // First visit: start from what .env already holds (local mode only).
-  const { env_logins: envLogins, defaults } = state.config;
-  const logins = envLogins.length ? envLogins : [""];
-  for (const login of logins) {
-    // AUTHOR_EMAILS only maps unambiguously when .env names a single account.
-    addAccount({ login, emails: logins.length === 1 ? defaults.author_emails || "" : "" });
-  }
-  applyOptions({
-    extra_repos: defaults.extra_repos || "",
-    extra_orgs: defaults.extra_orgs || "",
-    exclude_owners: defaults.exclude_owners || "",
-  });
-  setPeriod("all");
 }
 
 // ---------- submit ----------
@@ -710,17 +710,26 @@ function warningsHTML(job) {
 
 function actionsHTML(job, logOpen) {
   const files = job.files || {};
+  // Finished reports get a row of main actions; files and tools sit below it.
+  let primary = "";
   const links = [];
   if (job.status === "done") {
+    const main = [];
     if (files.pdf) {
-      links.push(`<a class="btn btn-primary btn-sm" href="${esc(files.pdf)}" download>${icon("download")}Download PDF</a>`);
+      main.push(`<a class="btn btn-primary btn-sm" href="${esc(files.pdf)}" download>${icon("download")}Download PDF</a>`);
     }
+    if (files.pdf || files.html) {
+      main.push(`<button type="button" class="btn btn-outline btn-sm" data-action="share">${icon("share")}Share report</button>`);
+    }
+    main.push(`<button type="button" class="btn btn-outline btn-sm" data-action="linkedin">${icon("pen")}LinkedIn summary</button>`);
+    primary = `<div class="report-actions">${main.join("")}</div>`;
     if (files.html) {
-      links.push(`<a class="btn ${files.pdf ? "btn-outline" : "btn-primary"} btn-sm" href="${esc(files.html)}" ` +
-        `target="_blank" rel="noopener noreferrer" title="Open the HTML report in a new tab">${icon("external")}HTML</a>`);
+      links.push(`<a class="text-link" href="${esc(files.html)}" target="_blank" rel="noopener noreferrer" ` +
+        `title="Open the HTML report in a new tab">${icon("external")}HTML</a>`);
     }
     if (files.xlsx) {
-      links.push(`<a class="btn btn-outline btn-sm" href="${esc(files.xlsx)}" download>${icon("sheet")}Excel</a>`);
+      links.push(`<a class="text-link" href="${esc(files.xlsx)}" download title="Download the Excel workbook">` +
+        `${icon("sheet")}Excel</a>`);
     }
   }
   const logLabel = logOpen ? "Hide log" : "Show log";
@@ -739,7 +748,9 @@ function actionsHTML(job, logOpen) {
       : `<button type="button" class="icon-btn action action-danger" data-action="delete" ` +
         `aria-label="Delete report" title="Delete report">${icon("trash")}</button>`);
   }
-  return `<div class="report-actions">${links.join("")}<span class="spacer"></span>${tools.join("")}</div>`;
+  const secondary = primary ? " report-actions-secondary" : "";
+  return primary +
+    `<div class="report-actions${secondary}">${links.join("")}<span class="spacer"></span>${tools.join("")}</div>`;
 }
 
 function cardBody(job) {
@@ -747,11 +758,12 @@ function cardBody(job) {
   const options = job.options || {};
   const range = rangeText(options.since || "", options.until || "");
   const combined = job.logins.length > 1 ? ` · ${job.logins.length} accounts combined` : "";
+  const shared = job.share_url ? ' · <span class="shared-flag">Shared by link</span>' : "";
   return `<div class="report-head">` +
       `<span class="report-name" title="${esc(names)}">${esc(names)}</span>` +
       `<span class="report-meta">· <time datetime="${esc(job.created_at)}" title="${esc(fullDate(job.created_at))}">` +
       `${esc(relativeTime(job.created_at))}</time></span>${statusChip(job.status)}</div>` +
-    `<p class="report-sub report-period">${esc(range)}${esc(combined)}</p>` +
+    `<p class="report-sub report-period">${esc(range)}${esc(combined)}${shared}</p>` +
     statusHTML(job) + warningsHTML(job) + actionsHTML(job, state.logs.has(job.id));
 }
 
@@ -936,6 +948,201 @@ async function deleteJob(job) {
   }
 }
 
+// ---------- share & LinkedIn ----------
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Older browsers or no clipboard permission: copy through a hidden field.
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.setAttribute("readonly", "");
+    field.className = "sr-only";
+    document.body.append(field);
+    field.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    field.remove();
+    return copied;
+  }
+}
+
+function pdfFileName(job) {
+  return `github-report-${job.logins.slice(0, 3).join("+")}-${job.created_at.slice(0, 10)}.pdf`;
+}
+
+function canShareFiles() {
+  try {
+    return typeof navigator.canShare === "function" &&
+      navigator.canShare({ files: [new File(["x"], "x.pdf", { type: "application/pdf" })] });
+  } catch {
+    return false;
+  }
+}
+
+const share = { job: null, file: null };
+
+function showShareLink(job) {
+  const box = $("#share-url-box");
+  box.hidden = !job.share_url;
+  $("#share-url").value = job.share_url || "";
+  $("#share-link-title").textContent = job.share_url ? "Copy link" : "Create link";
+}
+
+function openShare(job) {
+  share.job = job;
+  share.file = null;
+  const files = job.files || {};
+  $("#share-sub").textContent = `${job.logins.join(" + ")} · ${rangeText(job.options?.since || "", job.options?.until || "")}`;
+  const download = $("#share-download");
+  download.hidden = !files.pdf;
+  if (files.pdf) download.href = files.pdf;
+
+  // The device's own share sheet (mail, chat apps…) needs the file ready
+  // before the click, so it is fetched as soon as the dialog opens.
+  const native = $("#share-native");
+  native.hidden = !(files.pdf && canShareFiles());
+  if (!native.hidden) {
+    native.disabled = true;
+    $("#share-native-title").textContent = "Preparing PDF…";
+    fetch(files.pdf)
+      .then((response) => (response.ok ? response.blob() : Promise.reject(new Error("download failed"))))
+      .then((blob) => {
+        if (share.job !== job) return;
+        share.file = new File([blob], pdfFileName(job), { type: "application/pdf" });
+        native.disabled = false;
+        $("#share-native-title").textContent = "Share PDF…";
+      })
+      .catch(() => {
+        native.hidden = true;
+      });
+  }
+
+  const linksOn = isPublic();
+  $("#share-link").hidden = !linksOn;
+  showShareLink(job);
+  const hours = Number(state.config.retention_hours) || 0;
+  $("#share-note").textContent = linksOn
+    ? "A link stops working when you stop sharing or delete the report" +
+      (hours ? `, and when the report expires (${hours} hours after it finished).` : ".")
+    : "Sharing by link is available when the app is hosted for your team (public mode).";
+  $("#share-dialog").showModal();
+}
+
+async function shareNative() {
+  const job = share.job;
+  if (!job || !share.file) return;
+  try {
+    await navigator.share({
+      files: [share.file],
+      title: "GitHub contribution report",
+      text: `GitHub contribution report · ${job.logins.join(" + ")}`,
+    });
+  } catch (error) {
+    if (error?.name !== "AbortError") toast("Couldn't open the share sheet. Download the PDF instead.");
+  }
+}
+
+async function shareLink() {
+  const job = share.job;
+  if (!job) return;
+  let url = job.share_url;
+  if (!url) {
+    try {
+      const updated = await api(`/api/jobs/${encodeURIComponent(job.id)}/share`, { method: "POST", body: {} });
+      mergeJobs([updated]);
+      share.job = updated;
+      url = updated.share_url;
+      showShareLink(updated);
+    } catch (error) {
+      toast(error.message);
+      return;
+    }
+  }
+  toast((await copyText(url)) ? "Link copied" : "Copy the link from the box below");
+  $("#share-url").select();
+}
+
+async function stopSharing() {
+  const job = share.job;
+  if (!job) return;
+  try {
+    const updated = await api(`/api/jobs/${encodeURIComponent(job.id)}/share`, { method: "DELETE", body: {} });
+    mergeJobs([updated]);
+    share.job = updated;
+    showShareLink(updated);
+    toast("Link turned off");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function updatePostCount() {
+  const text = $("#linkedin-text").value;
+  const limit = Number($("#linkedin-text").dataset.limit) || 3000;
+  const count = $("#linkedin-count");
+  count.textContent = `${text.length.toLocaleString()} / ${limit.toLocaleString()}`;
+  count.classList.toggle("over-limit", text.length > limit);
+}
+
+async function openLinkedIn(job) {
+  const area = $("#linkedin-text");
+  area.value = "";
+  area.placeholder = "Writing your summary…";
+  $("#linkedin-dialog").showModal();
+  try {
+    const { text, message, limit } = await api(`/api/jobs/${encodeURIComponent(job.id)}/linkedin`);
+    area.dataset.limit = String(limit || 3000);
+    area.value = text;
+    area.placeholder = message || "";
+  } catch (error) {
+    area.placeholder = error.message;
+  }
+  updatePostCount();
+}
+
+async function copyPost() {
+  const text = $("#linkedin-text").value.trim();
+  if (!text) return;
+  toast((await copyText(text)) ? "Copied. Paste it into a LinkedIn post." : "Select the text and copy it");
+}
+
+async function postOnLinkedIn() {
+  const text = $("#linkedin-text").value.trim();
+  if (!text) return;
+  // Copy first (the composer may not pick up the text), then open LinkedIn.
+  await copyText(text);
+  const url = `https://www.linkedin.com/feed/?shareActive=true&text=${encodeURIComponent(text)}`;
+  window.open(url, "_blank", "noopener,noreferrer");
+  toast("Text copied. If LinkedIn's post box is empty, paste it there.");
+}
+
+function initDialogs() {
+  for (const dialog of $$("dialog.sheet")) {
+    // A click on the dimmed backdrop closes the dialog.
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+  }
+  $("#share-dialog").addEventListener("close", () => {
+    share.job = null;
+    share.file = null;
+  });
+  $("#share-native").addEventListener("click", shareNative);
+  $("#share-link").addEventListener("click", shareLink);
+  $("#share-stop").addEventListener("click", stopSharing);
+  $("#share-url").addEventListener("focus", (event) => event.target.select());
+  $("#linkedin-text").addEventListener("input", updatePostCount);
+  $("#linkedin-copy").addEventListener("click", copyPost);
+  $("#linkedin-open").addEventListener("click", postOnLinkedIn);
+}
+
 // ---------- polling ----------
 
 function schedulePoll(ms) {
@@ -981,6 +1188,7 @@ function applyMode() {
 async function init() {
   initTheme();
   hydrateIcons(document);
+  initDialogs();
   try {
     state.config = { ...state.config, ...(await api("/api/config")) };
   } catch (error) {
@@ -1016,6 +1224,8 @@ async function init() {
     else if (action === "cancel") cancelJob(job);
     else if (action === "again") runAgain(job);
     else if (action === "delete") deleteJob(job);
+    else if (action === "share") openShare(job);
+    else if (action === "linkedin") openLinkedIn(job);
   });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {

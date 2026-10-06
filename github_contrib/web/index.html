@@ -176,6 +176,53 @@
 
   <div id="toast" class="toast" role="status" hidden></div>
 
+  <dialog id="share-dialog" class="sheet" aria-labelledby="share-title">
+    <form method="dialog" class="sheet-inner">
+      <div class="sheet-head">
+        <button class="icon-btn" value="close" aria-label="Close"><span data-icon="close"></span></button>
+        <h2 id="share-title">Share report</h2>
+      </div>
+      <p id="share-sub" class="sheet-sub"></p>
+      <div class="sheet-list">
+        <button type="button" id="share-native" class="sheet-row" hidden>
+          <span data-icon="share"></span>
+          <span class="sheet-row-text"><b id="share-native-title">Share PDF…</b><span>Send it with mail, chat or another app</span></span>
+        </button>
+        <button type="button" id="share-link" class="sheet-row" hidden>
+          <span data-icon="link"></span>
+          <span class="sheet-row-text"><b id="share-link-title">Copy link</b><span>Anyone with the link can open and download this report</span></span>
+        </button>
+        <a id="share-download" class="sheet-row" download>
+          <span data-icon="download"></span>
+          <span class="sheet-row-text"><b>Download PDF</b><span>Attach it to an email or upload it anywhere</span></span>
+        </a>
+      </div>
+      <div id="share-url-box" class="share-url" hidden>
+        <input id="share-url" readonly aria-label="Share link" spellcheck="false">
+        <button type="button" id="share-stop" class="btn btn-sm btn-danger-outline">Stop sharing</button>
+      </div>
+      <p id="share-note" class="hint sheet-note"></p>
+    </form>
+  </dialog>
+
+  <dialog id="linkedin-dialog" class="sheet" aria-labelledby="linkedin-title">
+    <form method="dialog" class="sheet-inner">
+      <div class="sheet-head">
+        <button class="icon-btn" value="close" aria-label="Close"><span data-icon="close"></span></button>
+        <h2 id="linkedin-title">LinkedIn summary</h2>
+      </div>
+      <p class="sheet-sub">A draft built from this report's numbers. Edit it before you post. Repository names and pull-request titles are left out, so no private company work is revealed.</p>
+      <label class="sr-only" for="linkedin-text">Post text</label>
+      <textarea id="linkedin-text" class="post-text" rows="13" spellcheck="true"></textarea>
+      <div class="sheet-foot">
+        <span id="linkedin-count" class="muted"></span>
+        <span class="spacer"></span>
+        <button type="button" id="linkedin-open" class="btn btn-outline btn-sm">Open LinkedIn</button>
+        <button type="button" id="linkedin-copy" class="btn btn-primary btn-sm">Copy text</button>
+      </div>
+    </form>
+  </dialog>
+
   <template id="account-template">
     <div class="account">
       <span class="avatar" data-initial="?" aria-hidden="true"></span>

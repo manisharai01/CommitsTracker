@@ -49,6 +49,7 @@ from .exporters import export_csvs, export_excel, export_summary_report
 from .filters import ReportScope, prepare_report_data
 from .htmlreport import export_reports
 from .insights import compute_insights
+from .linkedin import build_linkedin_post
 from .logging_config import get_logger
 from .models import (
     CollectedData,
@@ -67,6 +68,8 @@ log = get_logger("report")
 
 #: Collection metadata and completeness notes, saved next to the CSVs.
 COLLECTION_FILE = "collection.json"
+#: A first-person LinkedIn post drafted from the report's numbers.
+LINKEDIN_FILE = "linkedin_post.txt"
 
 
 def _tqdm():
@@ -517,10 +520,36 @@ def _period_label(scope: ReportScope) -> str:
 def _scope_summary(scope: ReportScope) -> dict[str, object]:
     return {
         "report_period": _period_label(scope),
+        "report_period_start": scope.since.date().isoformat() if scope.since else "",
+        "report_period_end": scope.until.date().isoformat() if scope.until else "",
         "report_timezone": scope.timezone,
         "merge_commits": scope.merge_commits,
         "duplicate_commits_counted_once": scope.duplicates.total,
         "data_completeness_warnings": len(scope.notes),
+    }
+
+
+def _project_summary(data: CollectedData, config: AppConfig) -> dict[str, object]:
+    """How many engineering projects (and private repositories) the work spans.
+
+    An organization or a colleague's account holds one project's repositories
+    (e.g. an app and its admin panel); each of the tracked user's own
+    repositories counts as a project of its own.
+    """
+    contributed = {c.full_name for c in data.commits} | {p.full_name for p in data.pull_requests}
+    repos = {r.full_name: r for r in data.repos}
+    own = {login.lower() for login in config.target_logins} or {
+        c.author_login.lower() for c in data.commits if c.author_login
+    }
+    projects = set()
+    for full in contributed:
+        owner = full.split("/", 1)[0].lower()
+        projects.add(full.lower() if owner in own else owner)
+    return {
+        "projects_contributed_to": len(projects),
+        "private_repositories_contributed_to": sum(
+            1 for full in contributed if full in repos and repos[full].is_private
+        ),
     }
 
 
@@ -565,7 +594,7 @@ def generate_outputs(
     # Fold the activity insights and the report scope into the headline
     # summary so they also appear in contribution_summary.csv, the Summary
     # sheet and summary_report.txt.
-    extra = {**insights.to_summary_dict(), **_scope_summary(scope)}
+    extra = {**insights.to_summary_dict(), **_scope_summary(scope), **_project_summary(data, config)}
     stats.summary_dict.update(extra)
     stats.summary = pd.concat(
         [stats.summary, pd.DataFrame([{"metric": k, "value": v} for k, v in extra.items()])],
@@ -598,6 +627,10 @@ def generate_outputs(
         )
     except Exception as exc:  # noqa: BLE001 - reports are non-fatal
         log.warning("Report generation failed (continuing): %s", exc)
+
+    # A LinkedIn-ready draft built from the same numbers.
+    post = build_linkedin_post(stats.summary_dict)
+    (config.output_dir / LINKEDIN_FILE).write_text(post + "\n" if post else "", encoding="utf-8")
 
     return stats
 

@@ -1,4 +1,31 @@
 # GitHub Contribution Report
+CommitsTracker is a Python tool that produces accurate, shareable reports of a developer's GitHub contributions (commits, pull requests and repositories) for any time range. It was built for promotion reviews at Sheeraj CodeWorks. Company code there is spread across colleagues' accounts and organizations, so no single GitHub page shows a developer's full work.
+How it works. Using each account's GitHub personal access token, it:
+Discovers every repository the account can reach. It also finds upstream projects through GitHub search, by username, commit email and pull request. Searches are split by date to get past GitHub's 1,000-result limit.
+Collects commits from every branch and reads each pull request's commits, which recovers work on deleted branches. It also fetches lines added and deleted.
+Filters to the chosen time range and drops excluded owners.
+Counts each change once. The same commit in a fork and its upstream counts once, as do rebased or cherry-picked copies. The original commits of a squash-merged pull request are folded into the squash commit.
+Computes statistics in the user's time zone.
+What it produces. It writes a PDF report, an HTML report with charts built in, a Markdown report, an Excel workbook and CSV files. The report includes:
+headline numbers and a dashboard for each repository;
+an executive summary written from the data;
+activity insights and a breakdown of work in each repository;
+a complete commit timeline.
+Two sections explain the numbers. Data completeness lists anything that could not be read, and How this report was compiled states the period, branches, filters and de-duplication used.
+Accuracy. Nothing is dropped silently: every repository, branch, search or request that fails becomes a visible note. On real data, every commit that GitHub's own search knew about appeared in the report. Each option (default branch only, time range, owner exclusions) matched a count made separately.
+Two ways to use it.
+Command line: python github_report.py --user LOGIN --since 2026-01-01 --until 2026-06-30 --timezone Asia/Kolkata --pdf. The --regen option rebuilds reports offline from saved data.
+Web page: python webui.py opens a clean page styled like X/Twitter. Enter one or more usernames, tokens and optional commit emails, choose a time range and options, and download the PDF. Progress shows live, and past reports can be run again or deleted.
+Hosting for other people. Public mode (--public-url https://…) serves the page to many users behind an HTTPS proxy:
+Each browser session sees only its own reports.
+Every user must enter a token. Tokens are never stored or logged, and the server's own .env file is never used.
+Requests from other websites are rejected, and users and addresses have rate limits. Runs time out, and reports are deleted after 24 hours.
+Reports open in a sandbox, and strict security headers are set. Spreadsheet downloads can't run hidden formulas.
+Technology and quality. It uses Python 3.12+ with asyncio and aiohttp (for the GitHub API and the web server), plus pandas, matplotlib and openpyxl. The front end is plain JavaScript with no build step. 41 automated tests cover collection edge cases, reports and web security. The tool was also checked against live GitHub data and in a real browser, with no console errors.
+Known limits. It cannot see:
+commits where the user is only a co-author (GitHub has no API for this);
+private repositories the token cannot read;
+commits made with an email that was not entered.
 
 A production-quality, async Python tool that exports **every commit, pull
 request, repository contribution and organization contribution** accessible to

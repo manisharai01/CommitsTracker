@@ -3,6 +3,7 @@
 
 # Generated output
 output/
+output-web/
 
 # Python
 __pycache__/

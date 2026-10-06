@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Contribution Reports</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <main class="column">
+      <header class="topbar">
+        <span class="brand" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h6M16 12h6"/></svg>
+        </span>
+        <h1>Contribution reports</h1>
+        <button id="theme-toggle" class="icon-btn" type="button"></button>
+      </header>
+
+      <form id="composer" class="composer" novalidate autocomplete="off">
+        <div class="composer-intro">
+          <h2>New report</h2>
+          <p>Add the GitHub accounts to report on. Tokens are used for this run only and never saved.</p>
+        </div>
+
+        <div id="accounts" class="accounts"></div>
+        <button type="button" id="add-account" class="btn btn-link"><span data-icon="plus"></span>Add account</button>
+
+        <fieldset id="mode" class="mode" hidden>
+          <legend class="sr-only">Report layout</legend>
+          <div class="segmented">
+            <label><input type="radio" name="mode" value="combined" checked><span>One combined report</span></label>
+            <label><input type="radio" name="mode" value="separate"><span>One report per account</span></label>
+          </div>
+          <p class="hint">Combine accounts that belong to the same person.</p>
+        </fieldset>
+
+        <details id="options" class="options">
+          <summary>
+            <span>Options</span>
+            <span id="options-summary" class="options-summary">Defaults</span>
+            <span data-icon="chevron"></span>
+          </summary>
+          <div class="options-body">
+            <label class="toggle">
+              <span class="toggle-text">
+                <span>Include personal repositories</span>
+                <span class="toggle-desc">Repos owned by the account itself. Turn off to show only work in other accounts and organizations.</span>
+              </span>
+              <input id="opt-own" class="switch" type="checkbox" role="switch" checked>
+            </label>
+            <label class="toggle">
+              <span class="toggle-text">
+                <span>Scan every branch</span>
+                <span class="toggle-desc">Off is faster but misses commits that only live on unmerged branches.</span>
+              </span>
+              <input id="opt-branches" class="switch" type="checkbox" role="switch" checked>
+            </label>
+            <label class="toggle">
+              <span class="toggle-text">
+                <span>Line-level stats</span>
+                <span class="toggle-desc">Additions and deletions per commit. Costs one API request per commit.</span>
+              </span>
+              <input id="opt-stats" class="switch" type="checkbox" role="switch" checked>
+            </label>
+            <label class="toggle">
+              <span class="toggle-text">
+                <span>Pull requests</span>
+                <span class="toggle-desc">Collect pull requests opened by the accounts.</span>
+              </span>
+              <input id="opt-prs" class="switch" type="checkbox" role="switch" checked>
+            </label>
+            <label class="toggle">
+              <span class="toggle-text">
+                <span>Include forks</span>
+                <span class="toggle-desc">Scan commits and pull requests in forked repositories.</span>
+              </span>
+              <input id="opt-forks" class="switch" type="checkbox" role="switch" checked>
+            </label>
+
+            <div class="options-fields">
+              <div class="field">
+                <input id="opt-repos" placeholder=" " spellcheck="false" autocapitalize="off" aria-describedby="opt-repos-hint">
+                <label for="opt-repos">Extra repositories</label>
+              </div>
+              <p id="opt-repos-hint" class="hint">owner/name, comma-separated. Private repos that discovery can't find.</p>
+              <div class="field">
+                <input id="opt-orgs" placeholder=" " spellcheck="false" autocapitalize="off" aria-describedby="opt-orgs-hint">
+                <label for="opt-orgs">Extra organizations</label>
+              </div>
+              <p id="opt-orgs-hint" class="hint">Scan every repository these organizations let the tokens see.</p>
+              <div class="field">
+                <input id="opt-owners" placeholder=" " spellcheck="false" autocapitalize="off" aria-describedby="opt-owners-hint">
+                <label for="opt-owners">Exclude owners</label>
+              </div>
+              <p id="opt-owners-hint" class="hint">Leave out every repository owned by these logins.</p>
+            </div>
+          </div>
+        </details>
+
+        <div id="pdf-notice" class="notice" hidden>
+          <span data-icon="alert"></span>
+          <span>No Microsoft Edge or Google Chrome found, so reports can't be saved as PDF. You'll get the HTML report, which you can print to PDF.</span>
+        </div>
+        <div id="form-error" class="alert" role="alert" hidden></div>
+
+        <div class="composer-footer">
+          <span class="privacy"><span data-icon="lock"></span>Runs on this computer</span>
+          <button type="submit" id="submit" class="btn btn-primary btn-submit" disabled>Generate report</button>
+        </div>
+      </form>
+
+      <h2 id="feed-title" class="section-title">Recent reports</h2>
+      <div id="feed" class="feed"></div>
+      <div id="feed-empty" class="empty" hidden>
+        <h3>No reports yet</h3>
+        <p>Reports you generate show up here, with the PDF ready to download.</p>
+      </div>
+    </main>
+
+    <aside class="sidebar" aria-label="Help">
+      <section class="panel">
+        <h2>Token checklist</h2>
+        <div class="panel-item">
+          <b>Use a classic token</b>
+          <span>It starts with ghp_. Fine-grained tokens (github_pat_) can't see repos owned by other accounts or organizations.</span>
+        </div>
+        <div class="panel-item">
+          <b>Scopes: repo and read:org</b>
+          <span>Needed for private, collaborator and organization repositories.</span>
+        </div>
+        <a class="panel-link" href="https://github.com/settings/tokens/new?scopes=repo,read:org&amp;description=CommitsTracker%20report" target="_blank" rel="noopener">Create a classic token</a>
+      </section>
+      <section class="panel">
+        <h2>Missing commits?</h2>
+        <div class="panel-item">
+          <b>Add commit emails</b>
+          <span>Commits made with an email that isn't on the GitHub profile can only be found by that email.</span>
+        </div>
+        <div class="panel-item">
+          <b>Name private repositories</b>
+          <span>Options → Extra repositories includes repos that automatic discovery can't reach.</span>
+        </div>
+      </section>
+      <p id="sidebar-footer" class="sidebar-footer"></p>
+    </aside>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <template id="account-template">
+    <div class="account">
+      <span class="avatar" data-initial="?"><img alt="" hidden></span>
+      <div class="account-fields">
+        <div class="field-row">
+          <div class="field">
+            <input name="login" placeholder=" " spellcheck="false" autocapitalize="off" maxlength="40">
+            <label data-for="login">GitHub username</label>
+          </div>
+          <div class="field has-action">
+            <input name="token" type="password" placeholder=" " spellcheck="false" autocapitalize="off" autocomplete="off">
+            <label data-for="token">Personal access token</label>
+            <button type="button" class="icon-btn field-action" data-role="reveal" aria-label="Show token" aria-pressed="false"><span data-icon="eye"></span></button>
+          </div>
+        </div>
+        <p class="hint token-hint"></p>
+        <div class="field">
+          <input name="emails" placeholder=" " spellcheck="false" autocapitalize="off">
+          <label data-for="emails">Commit emails (optional)</label>
+        </div>
+        <p class="hint">Emails used in git commits that aren't on the GitHub profile, comma-separated.</p>
+        <p class="row-error" role="alert" hidden></p>
+      </div>
+      <button type="button" class="icon-btn icon-btn-danger" data-role="remove" aria-label="Remove account"><span data-icon="close"></span></button>
+    </div>
+  </template>
+</body>
+</html>

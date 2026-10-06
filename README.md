@@ -81,6 +81,37 @@ Open `output/report.html` in your browser — done.
 
 ---
 
+## Web UI
+
+Prefer a browser to the command line? Start the local web page:
+
+```bash
+python webui.py                 # opens http://127.0.0.1:8765
+python webui.py --port 9000 --no-browser
+```
+
+Add one or more GitHub usernames with their tokens (and, optionally, the commit
+emails each account uses), adjust the options and press **Generate report**.
+Progress streams into the page, and the finished report is ready to download as
+a PDF (plus the HTML report and the Excel workbook).
+
+- **Tokens stay local.** The page sends them only to this server, which hands
+  them to the report run through environment variables and forgets them when
+  the run ends. They are never written to disk or to browser storage, and the
+  server only accepts requests from its own page on `127.0.0.1`.
+- **`.env` still works.** The page pre-fills the logins that have a
+  `GITHUB_TOKEN_<LOGIN>` (plus `AUTHOR_EMAILS`, `EXTRA_REPOS`, `EXTRA_ORGS` and
+  `EXCLUDE_OWNERS`). Leave a token blank to use the one from `.env`. What you
+  submit replaces those `.env` lists for that run.
+- **Several accounts.** Choose **One combined report** for accounts that belong
+  to the same person, or **One report per account** to queue a separate report
+  for each. Runs execute one at a time.
+- **History.** Each run is saved in `output-web/<run id>/` and stays listed
+  after a restart. **Run again** refills the form with a past run's settings.
+- PDF export uses Edge or Chrome, exactly like `--pdf`.
+
+---
+
 ## Features
 
 | Area | What it does |
@@ -111,6 +142,7 @@ Open `output/report.html` in your browser — done.
 ```
 CommitsTracker/
 ├── github_report.py            # CLI entry point
+├── webui.py                    # web UI entry point (python webui.py)
 ├── github_contrib/             # the package
 │   ├── __init__.py
 │   ├── config.py               # env / token loading, AppConfig
@@ -126,9 +158,14 @@ CommitsTracker/
 │   ├── charts.py               # matplotlib charts + dashboard
 │   ├── insights.py             # deterministic work narrative + activity insights
 │   ├── htmlreport.py           # styled HTML + Markdown report generation
-│   └── report.py               # orchestration (collect → compute → export)
+│   ├── report.py               # orchestration (collect → compute → export)
+│   ├── pdfexport.py            # report.html → report.pdf via headless Edge/Chrome
+│   ├── offline.py              # --regen: reload a previous run's CSVs
+│   ├── webapp.py               # web UI server: form → queued report runs
+│   └── web/                    # web UI page (HTML, CSS, JS; no build step)
 ├── tests/
-│   └── test_offline.py         # offline tests (no network needed)
+│   ├── test_offline.py         # offline tests (no network needed)
+│   └── test_webapp.py          # web UI tests (fake CLI, no network needed)
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
@@ -336,8 +373,9 @@ charts and the async pagination/rate-limit logic:
 
 ```bash
 python tests/test_offline.py
+python tests/test_webapp.py     # web UI: validation, job pipeline, downloads
 # or, if pytest is installed:
-pytest -q
+pytest -q tests
 ```
 
 ---

@@ -24,7 +24,7 @@
       <form id="composer" class="composer" novalidate autocomplete="off">
         <div class="composer-intro">
           <h2>New report</h2>
-          <p>Add the GitHub accounts to report on. Tokens are used for this run only and never saved.</p>
+          <p id="intro-text">Add the GitHub accounts to report on. Tokens are used for this run only and never saved.</p>
         </div>
 
         <div id="accounts" class="accounts"></div>
@@ -37,6 +37,30 @@
             <label><input type="radio" name="mode" value="separate"><span>One report per account</span></label>
           </div>
           <p class="hint">Combine accounts that belong to the same person.</p>
+        </fieldset>
+
+        <fieldset class="period">
+          <legend class="period-title">Time range</legend>
+          <div class="chips" id="period-chips">
+            <label class="chip-option"><input type="radio" name="period" value="all" checked><span>All time</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="30d"><span>Last 30 days</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="6m"><span>Last 6 months</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="12m"><span>Last 12 months</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="year"><span>This year</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="lastyear"><span>Last year</span></label>
+            <label class="chip-option"><input type="radio" name="period" value="custom"><span>Custom</span></label>
+          </div>
+          <div id="period-custom" class="field-row period-custom" hidden>
+            <div class="field field-static">
+              <input id="period-from" type="date" min="1970-01-01">
+              <label for="period-from">From</label>
+            </div>
+            <div class="field field-static">
+              <input id="period-to" type="date" min="1970-01-01">
+              <label for="period-to">To</label>
+            </div>
+          </div>
+          <p id="period-hint" class="hint" aria-live="polite"></p>
         </fieldset>
 
         <details id="options" class="options">
@@ -56,14 +80,14 @@
             <label class="toggle">
               <span class="toggle-text">
                 <span>Scan every branch</span>
-                <span class="toggle-desc">Off is faster but misses commits that only live on unmerged branches.</span>
+                <span class="toggle-desc">Includes work on feature branches and in pull requests, even deleted ones. Off counts only what landed on each default branch.</span>
               </span>
               <input id="opt-branches" class="switch" type="checkbox" role="switch" checked>
             </label>
             <label class="toggle">
               <span class="toggle-text">
                 <span>Line-level stats</span>
-                <span class="toggle-desc">Additions and deletions per commit. Costs one API request per commit.</span>
+                <span class="toggle-desc">Lines added and deleted (merge commits excluded). Costs one API request per commit.</span>
               </span>
               <input id="opt-stats" class="switch" type="checkbox" role="switch" checked>
             </label>
@@ -109,7 +133,7 @@
         <div id="form-error" class="alert" role="alert" hidden></div>
 
         <div class="composer-footer">
-          <span class="privacy"><span data-icon="lock"></span>Runs on this computer</span>
+          <span class="privacy"><span data-icon="lock"></span><span id="privacy-text">Runs on this computer</span></span>
           <button type="submit" id="submit" class="btn btn-primary btn-submit" disabled>Generate report</button>
         </div>
       </form>
@@ -154,7 +178,7 @@
 
   <template id="account-template">
     <div class="account">
-      <span class="avatar" data-initial="?"><img alt="" hidden></span>
+      <span class="avatar" data-initial="?" aria-hidden="true"></span>
       <div class="account-fields">
         <div class="field-row">
           <div class="field">

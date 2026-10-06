@@ -2,16 +2,24 @@
 
 The HTML report embeds the chart PNGs as base64 data URIs so the single file is
 fully portable (no external assets) and easy to share with non-technical users.
+
+Every value from GitHub (commit messages, repository names, ...) is escaped,
+and a Content-Security-Policy in the page only lets the report's own script
+run and loads nothing from the network — also while the server renders the
+PDF in a headless browser.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
+from .filters import ReportScope
 from .insights import ExecSummary, Insights, RepoWork, build_exec_summary
 from .logging_config import get_logger
 from .statistics import Statistics
@@ -37,10 +45,13 @@ def _fmt_date(value: object) -> str:
     return text[:10] if "T" in text else text
 
 
-def _metric_pairs(summary: dict[str, object], insights: Insights) -> list[tuple[str, object]]:
+def _metric_pairs(
+    summary: dict[str, object], insights: Insights, scope: ReportScope | None = None
+) -> list[tuple[str, object]]:
     ins = insights.to_summary_dict()
+    commits_label = "Commits in period" if scope is not None and scope.has_period else "Lifetime commits"
     pairs: list[tuple[str, object]] = [
-        ("Lifetime commits", summary.get("total_lifetime_commits", 0)),
+        (commits_label, summary.get("total_lifetime_commits", 0)),
         ("Pull requests", summary.get("total_pull_requests", 0)),
         ("Merged PRs", summary.get("merged_pull_requests", 0)),
         ("Repos contributed", summary.get("repositories_contributed_to", 0)),
@@ -58,7 +69,106 @@ def _metric_pairs(summary: dict[str, object], insights: Insights) -> list[tuple[
             ("Net lines", f"{int(summary.get('net_lines', 0)):+,}"),  # type: ignore[arg-type]
             ("Files touched", f"{int(summary.get('total_files_changed', 0)):,}"),  # type: ignore[arg-type]
         ]
+    if summary.get("merge_commits"):
+        pairs.append(("Merge commits", summary["merge_commits"]))
     return pairs
+
+
+# ---------------------------------------------------------------------------
+# Report scope: period, completeness, method
+# ---------------------------------------------------------------------------
+
+def _day(moment: datetime) -> str:
+    return f"{moment.day} {moment.strftime('%b %Y')}"
+
+
+def period_text(scope: ReportScope | None) -> str:
+    """'1 Jan 2026 – 31 Mar 2026 (Asia/Kolkata)', or 'All time'."""
+    if scope is None or not scope.has_period:
+        return "All time" + (f" ({scope.timezone})" if scope and scope.timezone != "UTC" else "")
+    if scope.since and scope.until:
+        span = f"{_day(scope.since)} – {_day(scope.until)}"
+    elif scope.since:
+        span = f"From {_day(scope.since)}"
+    else:
+        span = f"Until {_day(scope.until)}"  # type: ignore[arg-type]
+    return f"{span} ({scope.timezone})"
+
+
+def method_items(scope: ReportScope | None) -> list[str]:
+    """How the data was collected and counted, in plain sentences."""
+    if scope is None:
+        return []
+    meta = scope.collection
+    items: list[str] = [f"Reporting period: {period_text(scope)}. Commits count by author date, pull requests by the date they were opened."]
+    if meta.get("scan_all_branches", True) and meta.get("collect_prs", True):
+        items.append(
+            "Every branch of every repository the accounts can access was scanned, plus "
+            "the default branch of upstream projects and the commits of each pull "
+            "request (which recovers work on deleted branches)."
+        )
+    elif meta.get("scan_all_branches", True):
+        items.append(
+            "Every branch of every repository the accounts can access was scanned, plus "
+            "the default branch of upstream projects. Pull requests were not read, so "
+            "commits that exist only in a pull request (for example on a deleted branch) "
+            "are not included."
+        )
+    else:
+        items.append("Only each repository's default branch was scanned.")
+    emails = meta.get("author_emails") or []
+    if emails:
+        items.append(f"Commits were also matched by {len(emails)} commit email address(es) not linked to the GitHub account.")
+    items.append("Forked repositories were skipped." if meta.get("skip_forks") else "Forked repositories were included.")
+    if not meta.get("collect_prs", True):
+        items.append("Pull requests were not collected.")
+    if meta.get("fetch_commit_stats", True):
+        line = "Line counts exclude merge commits, whose diff repeats work from the merged branch."
+        if scope.commits_without_line_stats:
+            line += f" {scope.commits_without_line_stats} commit(s) have no line statistics (see Data completeness)."
+        items.append(line)
+    else:
+        items.append("Line statistics were not collected.")
+    if scope.excluded_owners:
+        items.append("Repositories owned by " + ", ".join(scope.excluded_owners) + " are excluded.")
+    dup = scope.duplicates
+    if dup.total:
+        parts = []
+        if dup.same_commit:
+            parts.append(f"{dup.same_commit} copy/copies of the same commit in another repository (fork or mirror)")
+        if dup.rebased_copies:
+            parts.append(f"{dup.rebased_copies} rebased or cherry-picked copy/copies")
+        if dup.squashed:
+            parts.append(f"{dup.squashed} original commit(s) of squash-merged pull requests")
+        items.append("Each change is counted once: " + "; ".join(parts) + " were not counted again.")
+    if meta.get("collected_at"):
+        items.append(f"Data collected {str(meta['collected_at'])[:16].replace('T', ' ')} UTC.")
+    return items
+
+
+def _render_completeness(scope: ReportScope | None) -> str:
+    if scope is None:
+        return ""
+    if not scope.notes:
+        return (
+            "<section id='completeness'><h2>Data completeness</h2>"
+            "<p class='note'>No gaps detected: every repository, branch and request was read successfully.</p></section>"
+        )
+    items = "".join(f"<li>{_esc(note)}</li>" for note in scope.notes)
+    return (
+        "<section id='completeness'><h2>Data completeness</h2>"
+        "<div class='gaps'><p><strong>Some data could not be read, so this report may be "
+        "missing contributions:</strong></p>"
+        f"<ul>{items}</ul></div></section>"
+    )
+
+
+def _render_method(scope: ReportScope | None) -> str:
+    items = method_items(scope)
+    if not items:
+        return ""
+    lis = "".join(f"<li>{_esc(item)}</li>" for item in items)
+    return f"<section id='method'><h2>How this report was compiled</h2><ul class='method'>{lis}</ul></section>"
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +189,17 @@ def _md_table(df: pd.DataFrame, columns: list[str] | None = None, limit: int | N
     return f"{head}\n{sep}\n{body}\n"
 
 
-def render_markdown(stats: Statistics, insights: Insights, summary: dict[str, object]) -> str:
+def render_markdown(
+    stats: Statistics,
+    insights: Insights,
+    summary: dict[str, object],
+    scope: ReportScope | None = None,
+) -> str:
     ins = insights.to_summary_dict()
     out: list[str] = []
     out.append("# GitHub Contribution Report\n")
     out.append(f"**Users:** {summary.get('tracked_users', '')}  ")
+    out.append(f"**Period:** {period_text(scope)}  ")
     out.append(f"**Generated:** {_fmt_date(summary.get('generated_at'))}  ")
     out.append(
         f"**Activity:** {_fmt_date(summary.get('first_contribution_date'))} "
@@ -91,9 +207,15 @@ def render_markdown(stats: Statistics, insights: Insights, summary: dict[str, ob
     )
 
     out.append("## At a glance\n")
-    for label, value in _metric_pairs(summary, insights):
+    for label, value in _metric_pairs(summary, insights, scope):
         out.append(f"- **{label}:** {value}")
     out.append("")
+
+    if scope is not None and scope.notes:
+        out.append("## Data completeness\n")
+        out.append("Some data could not be read, so this report may be missing contributions:\n")
+        out.extend(f"- {note}" for note in scope.notes)
+        out.append("")
 
     exec_summary = build_exec_summary(insights, summary)
     out.append("## Executive summary — contribution highlights\n")
@@ -165,7 +287,14 @@ def render_markdown(stats: Statistics, insights: Insights, summary: dict[str, ob
     out.append("## Top repositories by commits\n")
     out.append(_md_table(stats.top_repositories, limit=25))
 
-    return "\n".join(out) + "\n"
+    method = method_items(scope)
+    if method:
+        out.append("\n## How this report was compiled\n")
+        out.extend(f"- {item}" for item in method)
+
+    # GitHub text could carry HTML that a Markdown viewer would render.
+    text = "\n".join(out) + "\n"
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +346,11 @@ tr:nth-child(even) td { background:#fafbfe; }
 .istat.files { color:var(--muted); }
 .bigcommit { font-size:12.5px; color:var(--muted); margin-bottom:8px; }
 footer { color:var(--muted); font-size:12.5px; margin-top:40px; text-align:center; }
+.gaps { background:#fff8e1; border:1px solid #f3d27a; border-radius:12px; padding:12px 18px; font-size:14px; }
+.gaps ul { margin:6px 0 0; padding-left:20px; }
+.gaps li { margin:3px 0; }
+ul.method { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 18px 14px 36px; font-size:14px; }
+ul.method li { margin:4px 0; }
 /* Executive summary */
 .exec { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:12px; padding:20px 22px; }
 .exec p.lead { font-size:15px; margin:8px 0; }
@@ -291,9 +425,24 @@ _SCRIPT = """
 })();
 """
 
+#: The only script the report may run (anything injected would not match).
+SCRIPT_HASH = "sha256-" + base64.b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode("ascii")
+#: Content-Security-Policy of report.html: no network access at all (charts
+#: are data URIs), inline styles, and only the script above.
+REPORT_CSP = (
+    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+    f"script-src '{SCRIPT_HASH}'; base-uri 'none'; form-action 'none'"
+)
+
 
 def _esc(value: object) -> str:
     return html.escape(str(value if value is not None else ""))
+
+
+def _safe_url(value: object) -> str:
+    """Only https links (GitHub's own) may become clickable."""
+    url = str(value or "")
+    return url if url.startswith("https://") else ""
 
 
 def _html_table(df: pd.DataFrame, columns: list[str] | None = None, limit: int | None = None) -> str:
@@ -328,7 +477,7 @@ def _render_commit_list(rows: list[dict]) -> str:
     body: list[str] = []
     for r in rows:
         sha = str(r.get("sha") or "")[:7]
-        url = str(r.get("url") or "")
+        url = _safe_url(r.get("url"))
         sha_html = (
             f"<a href='{_esc(url)}' target='_blank' rel='noopener'>{_esc(sha)}</a>"
             if url else _esc(sha)
@@ -425,7 +574,7 @@ def _render_commit_timeline(commits_df: pd.DataFrame) -> str:
             current_month = month
             body.append(f"<tr class='month'><th colspan='7'>{_esc(month)}</th></tr>")
         sha = str(r.get("sha") or "")[:7]
-        url = str(r.get("url") or "")
+        url = _safe_url(r.get("url"))
         sha_html = (
             f"<a href='{_esc(url)}' target='_blank' rel='noopener'>{_esc(sha)}</a>"
             if url else _esc(sha)
@@ -519,6 +668,7 @@ def render_html(
     summary: dict[str, object],
     charts_dir: Path,
     include_charts: bool = True,
+    scope: ReportScope | None = None,
 ) -> str:
     ins = insights.to_summary_dict()
     exec_summary = build_exec_summary(insights, summary)
@@ -529,6 +679,7 @@ def render_html(
     parts.append("<h1>GitHub Contribution Report</h1>")
     parts.append(
         f"<div class='meta'>Users: <strong>{_esc(summary.get('tracked_users'))}</strong> · "
+        f"Period: <strong>{_esc(period_text(scope))}</strong> · "
         f"Activity {_esc(_fmt_date(summary.get('first_contribution_date')))} → "
         f"{_esc(_fmt_date(summary.get('latest_contribution_date')))} · "
         f"Generated {_esc(_fmt_date(summary.get('generated_at')))}</div>"
@@ -539,9 +690,13 @@ def render_html(
 
     # Metric cards
     parts.append("<section><h2>At a glance</h2><div class='cards'>")
-    for label, value in _metric_pairs(summary, insights):
+    for label, value in _metric_pairs(summary, insights, scope):
         parts.append(f"<div class='card'><div class='v'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>")
     parts.append("</div></section>")
+
+    # Gaps are shown up front: a reader must know before trusting the numbers.
+    if scope is not None and scope.notes:
+        parts.append(_render_completeness(scope))
 
     # Repository dashboard — the per-repo numbers, before any narrative.
     parts.append(_render_repo_dashboard(insights))
@@ -605,6 +760,10 @@ def render_html(
         parts.append(_render_repo_card(work, commits_by_repo.get(work.full_name, [])))
     parts.append("</section>")
 
+    if scope is not None and not scope.notes:
+        parts.append(_render_completeness(scope))
+    parts.append(_render_method(scope))
+
     # Appendix: the raw commit data, last, in chronological order.
     parts.append(_render_commit_timeline(stats.commits))
 
@@ -614,6 +773,7 @@ def render_html(
     body = "\n".join(parts)
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<meta http-equiv='Content-Security-Policy' content=\"{REPORT_CSP}\">"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>GitHub Contribution Report</title>"
         f"<style>{_CSS}</style></head><body>{body}"
@@ -665,15 +825,17 @@ def export_reports(
     summary: dict[str, object],
     charts_dir: Path,
     include_charts: bool = True,
+    scope: ReportScope | None = None,
 ) -> list[Path]:
     """Write report.md and report.html. Returns the paths written."""
     output_dir.mkdir(parents=True, exist_ok=True)
     md_path = output_dir / "report.md"
     html_path = output_dir / "report.html"
-    md_path.write_text(render_markdown(stats, insights, summary), encoding="utf-8")
+    md_path.write_text(render_markdown(stats, insights, summary, scope), encoding="utf-8", newline="\n")
     html_path.write_text(
-        render_html(stats, insights, summary, charts_dir, include_charts),
+        render_html(stats, insights, summary, charts_dir, include_charts, scope),
         encoding="utf-8",
+        newline="\n",
     )
     log.info("wrote %s and %s", md_path.name, html_path.name)
     return [md_path, html_path]

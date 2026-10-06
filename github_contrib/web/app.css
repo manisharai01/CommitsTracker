@@ -230,6 +230,9 @@ code { font: 12px/16px var(--mono); padding: 1px 4px; border-radius: 4px; backgr
 .field.invalid input { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
 .field.invalid label { color: var(--danger); }
 .field-action { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); color: var(--muted); }
+/* Date inputs always show their format, so their label stays at the top. */
+.field-static label { top: 6px; font-size: 13px; line-height: 16px; }
+.field input[type="date"] { min-width: 0; }
 
 .hint {
   display: flex; align-items: flex-start; gap: 6px;
@@ -258,6 +261,23 @@ code { font: 12px/16px var(--mono); padding: 1px 4px; border-radius: 4px; backgr
 .segmented input:checked + span { background: var(--raised); color: var(--text); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
 .segmented input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mode .hint { margin-top: 8px; }
+
+.period { min-width: 0; margin: 16px 0 0; padding: 0; border: 0; }
+.period-title { margin-bottom: 8px; padding: 0; font-weight: 700; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip-option { position: relative; cursor: pointer; }
+.chip-option input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.chip-option span {
+  display: inline-block; padding: 6px 14px;
+  border: 1px solid var(--border-strong); border-radius: 9999px;
+  font-size: 14px; line-height: 18px; font-weight: 700;
+  transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+}
+.chip-option:hover span { background: var(--hover); }
+.chip-option input:checked + span { border-color: var(--primary-bg); background: var(--primary-bg); color: var(--primary-fg); }
+.chip-option input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.period-custom { margin-top: 12px; }
+.period .hint { margin-top: 8px; }
 
 .options { margin-top: 16px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
 .options summary {
@@ -367,6 +387,9 @@ code { font: 12px/16px var(--mono); padding: 1px 4px; border-radius: 4px; backgr
 .action { color: var(--muted); }
 .action:hover, .action[aria-expanded="true"] { background: var(--accent-soft); color: var(--accent); }
 .action-danger:hover { background: var(--danger-soft); color: var(--danger); }
+.btn-confirm { min-height: 34px; padding: 0 14px; background: var(--danger); color: #ffffff; font-size: 14px; }
+.btn-confirm:hover { background: #d81b29; }
+.report-period { color: var(--muted); }
 
 .log {
   max-height: 300px; margin-top: 12px; padding: 10px 12px; overflow: auto;

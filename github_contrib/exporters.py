@@ -1,7 +1,16 @@
-"""CSV, Excel and text-report exporters."""
+"""CSV, Excel and text-report exporters.
+
+Commit messages, pull-request titles, branch names and repository descriptions
+are text other people can write. A spreadsheet runs any cell starting with
+``=``, ``+``, ``-`` or ``@`` as a formula (CSV / formula injection), so text
+cells starting with those characters are neutralized: CSV cells get a leading
+``'`` (removed again by the ``--regen`` loader) and Excel cells are stored as
+plain text.
+"""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -41,6 +50,32 @@ _CSV_FILES: list[tuple[str, str]] = [
 ]
 
 
+#: First characters that make a spreadsheet treat a cell as a formula.
+FORMULA_PREFIXES = ("=", "+", "-", "@", chr(9), chr(13))  # chr(9)/chr(13): tab, carriage return
+_NUMBER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
+
+
+def _neutralize(value: object) -> object:
+    if isinstance(value, str) and value.startswith(FORMULA_PREFIXES) and not _NUMBER_RE.match(value):
+        return "'" + value
+    return value
+
+
+def neutralize_formulas(df: pd.DataFrame) -> pd.DataFrame:
+    """A copy of ``df`` whose text cells cannot run as spreadsheet formulas."""
+    # pandas 3 stores text with the "str" dtype; older data uses object.
+    text_columns = [
+        c for c in df.columns
+        if pd.api.types.is_object_dtype(df[c].dtype) or pd.api.types.is_string_dtype(df[c].dtype)
+    ]
+    if not text_columns:
+        return df
+    out = df.copy()
+    for column in text_columns:
+        out[column] = out[column].map(_neutralize)
+    return out
+
+
 def export_csvs(output_dir: Path, stats: Statistics) -> list[Path]:
     """Write the required CSV files. Returns the paths written."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -48,7 +83,7 @@ def export_csvs(output_dir: Path, stats: Statistics) -> list[Path]:
     for filename, attr in _CSV_FILES:
         df: pd.DataFrame = getattr(stats, attr)
         path = output_dir / filename
-        df.to_csv(path, index=False, encoding="utf-8-sig")
+        neutralize_formulas(df).to_csv(path, index=False, encoding="utf-8-sig")
         written.append(path)
         log.info("wrote %s (%d rows)", path.name, len(df))
     return written
@@ -78,8 +113,11 @@ def export_summary_report(output_dir: Path, stats: Statistics, filename: str = "
     lines.append("GITHUB CONTRIBUTION SUMMARY REPORT")
     lines.append("=" * 64)
     lines.append("")
+    period = stats.summary_dict.get("report_period")
     for key, value in stats.summary_dict.items():
         label = key.replace("_", " ").title()
+        if key == "total_lifetime_commits" and period and period != "all time":
+            label = "Total Commits (Period)"
         lines.append(f"{label:<34}: {value}")
     lines.append("")
 
@@ -129,6 +167,12 @@ def _format_workbook(writer: "pd.ExcelWriter") -> None:
         max_row = worksheet.max_row
         if max_col == 0 or max_row == 0:
             continue
+        # openpyxl stores any text starting with "=" as a live formula; the
+        # workbook never contains formulas of its own, so keep it all text.
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    cell.data_type = "s"
         # Style the header row.
         for col_idx in range(1, max_col + 1):
             cell = worksheet.cell(row=1, column=col_idx)

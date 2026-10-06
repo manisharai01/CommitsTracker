@@ -10,9 +10,11 @@ expensive collection run.
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
+from .exporters import FORMULA_PREFIXES
 from .logging_config import get_logger
 from .models import (
     CollectedData,
@@ -36,7 +38,12 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
 
 
 def _s(row: dict[str, str], key: str) -> str:
-    return (row.get(key) or "").strip()
+    text = (row.get(key) or "").strip()
+    # Undo the quote the exporters put before text that a spreadsheet would
+    # run as a formula (see exporters.neutralize_formulas).
+    if len(text) > 1 and text[0] == "'" and text[1] in FORMULA_PREFIXES:
+        return text[1:]
+    return text
 
 
 def _i(row: dict[str, str], key: str) -> int:
@@ -72,6 +79,9 @@ def _commit(row: dict[str, str]) -> CommitRecord:
         additions=_i(row, "additions"),
         deletions=_i(row, "deletions"),
         files_changed=_i(row, "files_changed"),
+        # Older runs did not record these: stats count as fetched when present.
+        stats_fetched=_b(row, "stats_fetched") or bool(_i(row, "additions") or _i(row, "deletions")),
+        parent_count=_i(row, "parent_count"),
     )
 
 
@@ -92,6 +102,8 @@ def _pr(row: dict[str, str]) -> PullRequestRecord:
         base_branch=_s(row, "base_branch"),
         head_branch=_s(row, "head_branch"),
         url=_s(row, "url"),
+        merge_commit_sha=_s(row, "merge_commit_sha"),
+        commit_shas=_s(row, "commit_shas").split(),
     )
 
 
@@ -114,6 +126,8 @@ def _repo(row: dict[str, str]) -> RepoRecord:
         pushed_at=parse_github_datetime(_s(row, "pushed_at")),
         created_at=parse_github_datetime(_s(row, "created_at")),
         discovered_via=discovered,
+        # Older runs scanned every repository fully.
+        affiliated=_s(row, "affiliated").lower() != "false",
     )
 
 
@@ -131,6 +145,24 @@ def _org(row: dict[str, str]) -> OrgRecord:
     )
 
 
+def _load_collection_file(output_dir: Path) -> tuple[dict[str, Any], list[str]]:
+    """Collection metadata and completeness notes saved by the original run."""
+    path = output_dir / "collection.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, []
+    except (OSError, ValueError) as exc:
+        log.warning("%s is unreadable (%s) — continuing without it.", path.name, exc)
+        return {}, []
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    notes = payload.get("notes") if isinstance(payload, dict) else None
+    return (
+        meta if isinstance(meta, dict) else {},
+        [str(n) for n in notes] if isinstance(notes, list) else [],
+    )
+
+
 def load_collected_from_csv(output_dir: Path) -> CollectedData:
     """Load a previous run's CSVs back into a :class:`CollectedData`."""
     mappers: list[tuple[str, Any]] = [
@@ -145,11 +177,14 @@ def load_collected_from_csv(output_dir: Path) -> CollectedData:
         loaded[filename] = [mapper(row) for row in rows]
         log.info("loaded %d row(s) from %s", len(rows), filename)
 
+    meta, notes = _load_collection_file(output_dir)
     data = CollectedData(
         repos=loaded["repositories.csv"],
         commits=loaded["commits.csv"],
         pull_requests=loaded["pull_requests.csv"],
         organizations=loaded["organizations.csv"],
+        notes=notes,
+        meta=meta,
     )
     if not data.commits and not data.pull_requests:
         log.warning(

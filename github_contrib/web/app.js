@@ -5,12 +5,14 @@
 const LOGIN_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
 const EMAIL_RE = /^[^@\s,]+@[^@\s,]+$/;
 const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
-const FORM_KEY = "commitstracker.form.v1";
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
+const FORM_KEY = "commitstracker.form.v2";
 const THEME_KEY = "commitstracker.theme";
 const ACTIVE = new Set(["queued", "running"]);
 const MAX_ACCOUNTS = 20;
 const POLL_ACTIVE_MS = 1200;
 const POLL_IDLE_MS = 30000;
+const CONFIRM_MS = 4000;
 const NEW_TOKEN_URL =
   "https://github.com/settings/tokens/new?scopes=repo,read:org&description=CommitsTracker%20report";
 const BASE_TITLE = document.title;
@@ -44,6 +46,7 @@ const ICONS = {
   log: '<path d="M5 6h14M5 12h14M5 18h9"/>',
   redo: '<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>',
   lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
   chevron: '<path d="M6 9l6 6 6-6"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
@@ -64,6 +67,8 @@ const STATUS_LABELS = {
 const state = {
   config: {
     version: "",
+    mode: "local",
+    retention_hours: 0,
     env_logins: [],
     has_default_token: false,
     defaults: {},
@@ -73,6 +78,8 @@ const state = {
   jobs: [],
   cards: new Map(), // job id -> { el, body, log, html }
   logs: new Map(), // job id -> { next, busy } for open log panels
+  confirming: null, // job id whose delete button awaits confirmation
+  confirmTimer: 0,
   pollTimer: 0,
   unseen: 0,
 };
@@ -85,6 +92,7 @@ const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ESCAPES[c]);
 const splitList = (text) => text.split(/[\s,]+/).filter(Boolean);
 const envSuffix = (login) => login.replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
+const isPublic = () => state.config.mode === "public";
 
 function debounce(fn, ms) {
   let timer = 0;
@@ -142,8 +150,28 @@ function relativeTime(iso) {
 }
 
 const fullDate = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-const shortDate = (iso) =>
-  new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+
+// "2026-07-01" as a calendar day (no time-zone shift).
+function dayFromYmd(ymd) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function formatDay(day, withYear = true) {
+  const options = { month: "short", day: "numeric" };
+  if (withYear) options.year = "numeric";
+  return day.toLocaleDateString(undefined, options);
+}
+
+function rangeText(since, until) {
+  if (!since && !until) return "All time";
+  if (since && until) {
+    const a = dayFromYmd(since);
+    const b = dayFromYmd(until);
+    return `${formatDay(a, a.getFullYear() !== b.getFullYear())} – ${formatDay(b)}`;
+  }
+  return since ? `From ${formatDay(dayFromYmd(since))}` : `Until ${formatDay(dayFromYmd(until))}`;
+}
 
 let toastTimer = 0;
 function toast(message) {
@@ -179,23 +207,92 @@ function initTheme() {
   });
 }
 
-// ---------- avatars ----------
+// ---------- time range ----------
 
-const avatarUrl = (login) => `https://github.com/${encodeURIComponent(login)}.png?size=96`;
-
-function avatarHTML(login, extra = 0) {
-  const more = extra > 0 ? `<span class="avatar-more">+${extra}</span>` : "";
-  return `<span class="avatar" data-initial="${esc(login.charAt(0).toUpperCase() || "?")}">` +
-    `<img src="${esc(avatarUrl(login))}" alt="" loading="lazy">${more}</span>`;
+function ymd(day) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}`;
 }
 
-// Images reveal themselves once loaded and hide again (showing the initial) on failure.
-document.addEventListener("load", (event) => {
-  if (event.target instanceof HTMLImageElement && event.target.closest(".avatar")) event.target.hidden = false;
-}, true);
-document.addEventListener("error", (event) => {
-  if (event.target instanceof HTMLImageElement && event.target.closest(".avatar")) event.target.hidden = true;
-}, true);
+function today() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function addDays(day, n) {
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate() + n);
+}
+
+// Same day n months earlier/later, clamped to the end of shorter months.
+function addMonths(day, n) {
+  const first = new Date(day.getFullYear(), day.getMonth() + n, 1);
+  const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+  return new Date(first.getFullYear(), first.getMonth(), Math.min(day.getDate(), last));
+}
+
+// Preset -> [since, until] as YYYY-MM-DD ("" = open-ended), computed when used.
+const PERIODS = {
+  all: () => ["", ""],
+  "30d": () => [ymd(addDays(today(), -29)), ymd(today())],
+  "6m": () => [ymd(addDays(addMonths(today(), -6), 1)), ymd(today())],
+  "12m": () => [ymd(addDays(addMonths(today(), -12), 1)), ymd(today())],
+  year: () => [`${today().getFullYear()}-01-01`, ymd(today())],
+  lastyear: () => [`${today().getFullYear() - 1}-01-01`, `${today().getFullYear() - 1}-12-31`],
+  custom: () => [$("#period-from").value, $("#period-to").value],
+};
+
+function browserTimezone() {
+  let name = "";
+  try {
+    name = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    name = "";
+  }
+  const minutes = -new Date().getTimezoneOffset();
+  const abs = Math.abs(minutes);
+  const offset = `${minutes < 0 ? "-" : "+"}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+  return { name: name || offset, offset };
+}
+
+const currentPeriodKey = () => $("input[name=period]:checked")?.value || "all";
+
+function readPeriod() {
+  const [since, until] = (PERIODS[currentPeriodKey()] || PERIODS.all)();
+  const zone = browserTimezone();
+  return { since, until, timezone: zone.name, timezone_offset: zone.offset };
+}
+
+function updatePeriodHint() {
+  const key = currentPeriodKey();
+  $("#period-custom").hidden = key !== "custom";
+  const { since, until } = readPeriod();
+  const zone = browserTimezone().name;
+  const hint = $("#period-hint");
+  if (key === "custom" && !since && !until) {
+    hint.textContent = "Pick a start date, an end date, or both.";
+    return;
+  }
+  hint.textContent = `${rangeText(since, until)} · ${zone}. Commits count by the date they were written, ` +
+    "pull requests by the date they were opened.";
+}
+
+function setPeriod(key, since = "", until = "") {
+  const input = $(`input[name=period][value="${PERIODS[key] ? key : "all"}"]`);
+  input.checked = true;
+  if (key === "custom") {
+    $("#period-from").value = since;
+    $("#period-to").value = until;
+  }
+  updatePeriodHint();
+}
+
+function periodProblem() {
+  if (currentPeriodKey() !== "custom") return "";
+  const { since, until } = readPeriod();
+  if (!since && !until) return "Pick a start date, an end date, or both.";
+  if (since && until && since > until) return "The start date is after the end date.";
+  return "";
+}
 
 // ---------- accounts ----------
 
@@ -203,7 +300,7 @@ let rowSeq = 0;
 const loginOf = (row) => $("[name=login]", row).value.trim().replace(/^@/, "");
 
 function envTokenName(login) {
-  if (!login) return null;
+  if (!login || isPublic()) return null;
   const suffix = envSuffix(login);
   if (state.config.env_logins.some((envLogin) => envSuffix(envLogin) === suffix)) return `GITHUB_TOKEN_${suffix}`;
   return state.config.has_default_token ? "GITHUB_TOKEN" : null;
@@ -232,9 +329,8 @@ function addAccount({ login = "", emails = "", token = "" } = {}) {
   inputs.token.value = token;
   inputs.emails.value = emails;
 
-  const refreshAvatar = debounce(() => updateAvatar(row), 350);
   inputs.login.addEventListener("input", () => {
-    refreshAvatar();
+    updateInitial(row);
     updateTokenHint(row);
     clearRowError(row);
     updateSubmit();
@@ -252,7 +348,7 @@ function addAccount({ login = "", emails = "", token = "" } = {}) {
   });
 
   $("#accounts").append(row);
-  updateAvatar(row);
+  updateInitial(row);
   updateTokenHint(row);
   afterAccountsChange();
   return row;
@@ -267,16 +363,11 @@ function afterAccountsChange() {
   saveFormSoon();
 }
 
-function updateAvatar(row) {
+// The form shows the first letter only: loading avatars for half-typed
+// usernames would request other people's pictures (and log 404s).
+function updateInitial(row) {
   const login = loginOf(row);
-  const avatar = $(".avatar", row);
-  const img = $("img", avatar);
-  avatar.dataset.initial = login ? login.charAt(0).toUpperCase() : "?";
-  const url = LOGIN_RE.test(login) ? avatarUrl(login) : "";
-  if ((img.getAttribute("src") || "") === url) return;
-  img.hidden = true;
-  if (url) img.src = url;
-  else img.removeAttribute("src");
+  $(".avatar", row).dataset.initial = login ? login.charAt(0).toUpperCase() : "?";
 }
 
 function updateTokenHint(row) {
@@ -293,7 +384,7 @@ function updateTokenHint(row) {
     hint.innerHTML = `${icon("check")}<span>Leave blank to use <code>${esc(envName)}</code> from .env.</span>`;
   } else {
     hint.innerHTML = `<span>Classic token with <b>repo</b> and <b>read:org</b> scopes. ` +
-      `<a href="${NEW_TOKEN_URL}" target="_blank" rel="noopener">Create one</a></span>`;
+      `<a href="${NEW_TOKEN_URL}" target="_blank" rel="noopener noreferrer">Create one</a></span>`;
   }
 }
 
@@ -344,7 +435,9 @@ function updateOptionsSummary() {
 
 function saveForm() {
   const accounts = readAccounts().map(({ login, emails }) => ({ login, emails }));
-  storageSet(FORM_KEY, JSON.stringify({ accounts, options: readOptions(), mode: currentMode() }));
+  const key = currentPeriodKey();
+  const period = key === "custom" ? { key, since: $("#period-from").value, until: $("#period-to").value } : { key };
+  storageSet(FORM_KEY, JSON.stringify({ accounts, options: readOptions(), mode: currentMode(), period }));
 }
 const saveFormSoon = debounce(saveForm, 300);
 
@@ -361,9 +454,11 @@ function restoreForm() {
     }
     applyOptions(saved.options);
     setMode(saved.mode);
+    const period = saved.period || {};
+    setPeriod(String(period.key || "all"), String(period.since || ""), String(period.until || ""));
     return;
   }
-  // First visit: start from what .env already holds.
+  // First visit: start from what .env already holds (local mode only).
   const { env_logins: envLogins, defaults } = state.config;
   const logins = envLogins.length ? envLogins : [""];
   for (const login of logins) {
@@ -375,6 +470,7 @@ function restoreForm() {
     extra_orgs: defaults.extra_orgs || "",
     exclude_owners: defaults.exclude_owners || "",
   });
+  setPeriod("all");
 }
 
 // ---------- submit ----------
@@ -412,13 +508,26 @@ function validate(accounts) {
     else if (account.token && !TOKEN_RE.test(account.token)) {
       problems.push([account.row, "token", "That doesn't look like a GitHub token."]);
     } else if (!account.token && !envTokenName(account.login)) {
-      problems.push([account.row, "token", "Paste a token. There's none for this account in .env."]);
+      const message = isPublic()
+        ? "Paste a personal access token for this account."
+        : "Paste a token. There's none for this account in .env.";
+      problems.push([account.row, "token", message]);
     } else if (splitList(account.emails).some((email) => !EMAIL_RE.test(email))) {
       problems.push([account.row, "emails", "Separate email addresses with commas."]);
     }
     seen.add(key);
   }
   return problems;
+}
+
+function optionsProblem(options) {
+  const bad = splitList(options.extra_repos).find((repo) => !REPO_RE.test(repo));
+  if (bad) return `"${bad}" is not a repository. Use owner/name.`;
+  for (const key of ["extra_orgs", "exclude_owners"]) {
+    const login = splitList(options[key]).find((value) => !LOGIN_RE.test(value));
+    if (login) return `"${login}" is not a valid GitHub login.`;
+  }
+  return "";
 }
 
 function clearRowError(row) {
@@ -458,15 +567,21 @@ async function submit(event) {
   const problems = validate(accounts);
   showProblems(problems);
   if (problems.length) return;
+  const options = readOptions();
+  const problem = periodProblem() || optionsProblem(options);
+  if (problem) {
+    showFormError(problem);
+    return;
+  }
 
   const payload = accounts.map(({ login, token, emails }) => ({ login, token, emails: splitList(emails) }));
-  const options = readOptions();
+  const period = readPeriod();
   const batches = currentMode() === "separate" ? payload.map((account) => [account]) : [payload];
   const created = [];
   setBusy(true);
   try {
     for (const batch of batches) {
-      created.push(await api("/api/jobs", { method: "POST", body: { accounts: batch, options } }));
+      created.push(await api("/api/jobs", { method: "POST", body: { accounts: batch, options, period } }));
     }
   } catch (error) {
     showFormError(error.message);
@@ -495,8 +610,10 @@ function runAgain(job) {
     });
   }
   applyOptions(job.options);
+  const since = job.options?.since || "";
+  const until = job.options?.until || "";
+  setPeriod(since || until ? "custom" : "all", since, until);
   setMode("combined");
-  updateSubmit();
   saveFormSoon();
   window.scrollTo({ top: 0, behavior: "smooth" });
   const needsToken = $$("#accounts .account").find(
@@ -506,6 +623,22 @@ function runAgain(job) {
 }
 
 // ---------- feed ----------
+
+const avatarUrl = (login) => `https://github.com/${encodeURIComponent(login)}.png?size=96`;
+
+function avatarHTML(job) {
+  const login = job.logins[0] || "?";
+  const extra = job.logins.length - 1;
+  const more = extra > 0 ? `<span class="avatar-more">+${extra}</span>` : "";
+  // Only a finished report has proven the login exists; its picture is safe to load.
+  const img = job.status === "done" ? `<img src="${esc(avatarUrl(login))}" alt="">` : "";
+  return `<span class="avatar" data-initial="${esc(login.charAt(0).toUpperCase())}" aria-hidden="true">${img}${more}</span>`;
+}
+
+// A picture that fails to load is hidden so the initial shows instead.
+document.addEventListener("error", (event) => {
+  if (event.target instanceof HTMLImageElement && event.target.closest(".avatar")) event.target.hidden = true;
+}, true);
 
 function statusChip(status) {
   const lead = status === "running" ? '<span class="spinner"></span>'
@@ -530,33 +663,33 @@ function runningHTML(job) {
 
 function doneHTML(job) {
   const summary = job.summary || {};
-  const stats = [
-    [summary.total_lifetime_commits, "commit", "commits"],
-    [summary.total_pull_requests, "pull request", "pull requests"],
-    [summary.repositories_contributed_to, "repository", "repositories"],
-    [summary.active_days, "active day", "active days"],
-  ].filter(([value]) => value !== undefined && value !== "");
-  const statsHTML = stats.length
-    ? `<div class="stats">${stats.map(([value, one, many]) => {
+  const options = job.options || {};
+  const rows = [[summary.total_lifetime_commits, "commit", "commits"]];
+  if (options.pull_requests !== false) rows.push([summary.total_pull_requests, "pull request", "pull requests"]);
+  rows.push([summary.repositories_contributed_to, "repository", "repositories"]);
+  rows.push([summary.active_days, "active day", "active days"]);
+  const stats = rows
+    .filter(([value]) => value !== undefined && value !== "")
+    .map(([value, one, many]) => {
       const n = Number(value);
       return `<span><b>${esc(Number.isFinite(n) ? n.toLocaleString() : value)}</b> ${n === 1 ? one : many}</span>`;
-    }).join("")}</div>`
-    : "";
-  const first = summary.first_contribution_date;
-  const range = first
-    ? `<p class="report-sub">${esc(shortDate(first))} – ${esc(shortDate(summary.latest_contribution_date || first))}</p>`
-    : "";
+    });
+  if (summary.total_lines_added) {
+    const added = Number(summary.total_lines_added).toLocaleString();
+    const deleted = Number(summary.total_lines_deleted || 0).toLocaleString();
+    stats.push(`<span><b>+${esc(added)}</b> / <b>−${esc(deleted)}</b> lines</span>`);
+  }
   const none = Number(summary.total_lifetime_commits) === 0
-    ? `<div class="notice">${icon("alert")}<span>No commits found. If the account commits with an email that ` +
-      `isn't on its GitHub profile, add it under Commit emails and run again.</span></div>`
+    ? `<div class="notice">${icon("alert")}<span>No commits found in this time range. If the account commits ` +
+      `with an email that isn't on its GitHub profile, add it under Commit emails and run again.</span></div>`
     : "";
-  return statsHTML + range + none;
+  return (stats.length ? `<div class="stats">${stats.join("")}</div>` : "") + none;
 }
 
 function statusHTML(job) {
   switch (job.status) {
     case "queued":
-      return '<p class="report-text muted">Waiting for the report ahead of it to finish.</p>';
+      return '<p class="report-text muted">Waiting for the reports ahead of it to finish.</p>';
     case "running":
       return runningHTML(job);
     case "done":
@@ -584,7 +717,7 @@ function actionsHTML(job, logOpen) {
     }
     if (files.html) {
       links.push(`<a class="btn ${files.pdf ? "btn-outline" : "btn-primary"} btn-sm" href="${esc(files.html)}" ` +
-        `target="_blank" rel="noopener">${icon("external")}Open HTML</a>`);
+        `target="_blank" rel="noopener noreferrer" title="Open the HTML report in a new tab">${icon("external")}HTML</a>`);
     }
     if (files.xlsx) {
       links.push(`<a class="btn btn-outline btn-sm" href="${esc(files.xlsx)}" download>${icon("sheet")}Excel</a>`);
@@ -594,41 +727,53 @@ function actionsHTML(job, logOpen) {
   const tools = [
     `<button type="button" class="icon-btn action" data-action="log" aria-expanded="${logOpen}" ` +
       `aria-label="${logLabel}" title="${logLabel}">${icon("log")}</button>`,
-    ACTIVE.has(job.status)
-      ? `<button type="button" class="icon-btn action action-danger" data-action="cancel" aria-label="Cancel" ` +
-        `title="Cancel">${icon("stop")}</button>`
-      : `<button type="button" class="icon-btn action" data-action="again" aria-label="Run again" ` +
-        `title="Run again with these settings">${icon("redo")}</button>`,
   ];
+  if (ACTIVE.has(job.status)) {
+    tools.push(`<button type="button" class="icon-btn action action-danger" data-action="cancel" ` +
+      `aria-label="Cancel" title="Cancel">${icon("stop")}</button>`);
+  } else {
+    tools.push(`<button type="button" class="icon-btn action" data-action="again" aria-label="Run again" ` +
+      `title="Run again with these settings">${icon("redo")}</button>`);
+    tools.push(state.confirming === job.id
+      ? `<button type="button" class="btn btn-confirm" data-action="delete">Delete</button>`
+      : `<button type="button" class="icon-btn action action-danger" data-action="delete" ` +
+        `aria-label="Delete report" title="Delete report">${icon("trash")}</button>`);
+  }
   return `<div class="report-actions">${links.join("")}<span class="spacer"></span>${tools.join("")}</div>`;
 }
 
 function cardBody(job) {
   const names = job.logins.join(" + ");
-  const combined = job.logins.length > 1
-    ? `<p class="report-sub">Combined report · ${job.logins.length} accounts</p>`
-    : "";
+  const options = job.options || {};
+  const range = rangeText(options.since || "", options.until || "");
+  const combined = job.logins.length > 1 ? ` · ${job.logins.length} accounts combined` : "";
   return `<div class="report-head">` +
       `<span class="report-name" title="${esc(names)}">${esc(names)}</span>` +
       `<span class="report-meta">· <time datetime="${esc(job.created_at)}" title="${esc(fullDate(job.created_at))}">` +
       `${esc(relativeTime(job.created_at))}</time></span>${statusChip(job.status)}</div>` +
-    combined + statusHTML(job) + warningsHTML(job) + actionsHTML(job, state.logs.has(job.id));
+    `<p class="report-sub report-period">${esc(range)}${esc(combined)}</p>` +
+    statusHTML(job) + warningsHTML(job) + actionsHTML(job, state.logs.has(job.id));
 }
 
 function createCard(job) {
   const el = document.createElement("article");
   el.className = "report";
   el.dataset.id = job.id;
-  el.innerHTML = avatarHTML(job.logins[0] || "?", job.logins.length - 1) +
+  el.innerHTML = avatarHTML(job) +
     '<div class="report-main"><div class="report-body"></div><div class="log" role="log" hidden></div></div>';
-  const card = { el, body: $(".report-body", el), log: $(".log", el), html: "" };
+  const card = { el, body: $(".report-body", el), log: $(".log", el), html: "", status: job.status };
   state.cards.set(job.id, card);
   return card;
 }
 
 function renderCard(card, job) {
-  const html = cardBody(job);
+  if (card.status !== job.status) {
+    // The avatar picture appears once the report is done.
+    card.el.firstElementChild.outerHTML = avatarHTML(job);
+    card.status = job.status;
+  }
   card.el.dataset.status = job.status;
+  const html = cardBody(job);
   if (html === card.html) return;
   const focused = card.body.contains(document.activeElement) ? document.activeElement.dataset.action : null;
   card.body.innerHTML = html;
@@ -732,7 +877,7 @@ async function pullLog(id) {
   }
 }
 
-async function toggleLog(id) {
+function toggleLog(id) {
   const card = state.cards.get(id);
   if (!card) return;
   if (state.logs.has(id)) {
@@ -755,6 +900,40 @@ async function cancelJob(job) {
     toast(error.message);
   }
   schedulePoll(300);
+}
+
+function rerender(id) {
+  const job = state.jobs.find((j) => j.id === id);
+  const card = state.cards.get(id);
+  if (job && card) renderCard(card, job);
+}
+
+async function deleteJob(job) {
+  if (state.confirming !== job.id) {
+    // First click arms the button; a second click within a few seconds deletes.
+    const previous = state.confirming;
+    state.confirming = job.id;
+    if (previous) rerender(previous);
+    rerender(job.id);
+    clearTimeout(state.confirmTimer);
+    state.confirmTimer = setTimeout(() => {
+      state.confirming = null;
+      rerender(job.id);
+    }, CONFIRM_MS);
+    return;
+  }
+  clearTimeout(state.confirmTimer);
+  state.confirming = null;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(job.id)}`, { method: "DELETE", body: {} });
+    state.logs.delete(job.id);
+    state.jobs = state.jobs.filter((j) => j.id !== job.id);
+    renderFeed();
+    toast("Report deleted");
+  } catch (error) {
+    toast(error.message);
+    rerender(job.id);
+  }
 }
 
 // ---------- polling ----------
@@ -782,6 +961,23 @@ async function refresh() {
 
 // ---------- start ----------
 
+function applyMode() {
+  const hours = Number(state.config.retention_hours) || 0;
+  const kept = hours ? ` Reports are deleted ${hours} hours after they finish.` : "";
+  if (isPublic()) {
+    $("#intro-text").textContent =
+      "Add the GitHub accounts to report on. Your token is used for this run only and is never stored." + kept;
+    $("#privacy-text").textContent = "Private to this browser";
+    $("#sidebar-footer").textContent =
+      `Only this browser can see its reports.${kept}` + (state.config.version ? ` · v${state.config.version}` : "");
+  } else {
+    $("#sidebar-footer").textContent =
+      `Runs locally · reports are saved in ${state.config.output_dir || "output-web/"}` +
+      (state.config.version ? ` · v${state.config.version}` : "");
+  }
+  $("#pdf-notice").hidden = state.config.pdf_browser;
+}
+
 async function init() {
   initTheme();
   hydrateIcons(document);
@@ -790,20 +986,22 @@ async function init() {
   } catch (error) {
     showFormError(`Couldn't reach the report server: ${error.message}`);
   }
+  applyMode();
+  const max = ymd(today());
+  $("#period-from").max = max;
+  $("#period-to").max = max;
   restoreForm();
-  $("#pdf-notice").hidden = state.config.pdf_browser;
-  $("#sidebar-footer").textContent =
-    `Runs locally · reports are saved in ${state.config.output_dir || "output-web/"}` +
-    (state.config.version ? ` · v${state.config.version}` : "");
 
   const composer = $("#composer");
   composer.addEventListener("submit", submit);
   composer.addEventListener("input", () => {
     updateOptionsSummary();
+    updatePeriodHint();
     saveFormSoon();
   });
   composer.addEventListener("change", () => {
     updateOptionsSummary();
+    updatePeriodHint();
     updateSubmit();
     saveFormSoon();
   });
@@ -813,9 +1011,11 @@ async function init() {
     if (!button) return;
     const job = state.jobs.find((j) => j.id === button.closest(".report")?.dataset.id);
     if (!job) return;
-    if (button.dataset.action === "log") toggleLog(job.id);
-    else if (button.dataset.action === "cancel") cancelJob(job);
-    else if (button.dataset.action === "again") runAgain(job);
+    const action = button.dataset.action;
+    if (action === "log") toggleLog(job.id);
+    else if (action === "cancel") cancelJob(job);
+    else if (action === "again") runAgain(job);
+    else if (action === "delete") deleteJob(job);
   });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {

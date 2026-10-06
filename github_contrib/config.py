@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,12 @@ class AppConfig:
     # Fetch per-commit line stats (additions/deletions/files_changed).
     # Adds one API request per commit — disable with --no-commit-stats to save quota.
     fetch_commit_stats: bool = True
+    # Reporting period (inclusive, timezone aware; None = unbounded) and the
+    # time zone used for period boundaries and for days / weeks / months.
+    since: datetime | None = None
+    until: datetime | None = None
+    tz: tzinfo = timezone.utc
+    timezone_name: str = "UTC"
 
     @property
     def charts_dir(self) -> Path:
@@ -101,15 +108,92 @@ class AppConfig:
         return self.output_dir / "run.log"
 
 
+#: Set to 1 to ignore the ``.env`` file (the hosted web UI does this so a
+#: run only ever sees the token its user typed in).
+NO_DOTENV_ENV = "GITHUB_CONTRIB_NO_DOTENV"
+
+
 def _maybe_load_dotenv() -> None:
     """Populate ``os.environ`` from a local ``.env`` file if python-dotenv is
     installed.  This is entirely optional - real environment variables always
     take precedence and the tool works fine without the package."""
+    if os.environ.get(NO_DOTENV_ENV) == "1":
+        return
     try:
         from dotenv import load_dotenv  # type: ignore import-not-found
     except Exception:  # pragma: no cover - dotenv is an optional dependency
         return
     load_dotenv(override=False)
+
+
+# ---------------------------------------------------------------------------
+# Reporting period and time zone
+# ---------------------------------------------------------------------------
+
+_OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+_TZ_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]{0,30}(?:/[A-Za-z0-9_+-]{1,30}){0,2}$")
+
+
+def resolve_timezone(name: str | None) -> tuple[tzinfo, str]:
+    """``(tzinfo, display name)`` for an IANA name ("Asia/Kolkata"), "UTC" or
+    a fixed offset ("+05:30"). Raises :class:`ConfigError` for anything else."""
+    text = (name or "").strip()
+    if not text or text.upper() in ("UTC", "Z", "GMT"):
+        return timezone.utc, "UTC"
+    match = _OFFSET_RE.match(text)
+    if match:
+        sign, hours, minutes = match.group(1), int(match.group(2)), int(match.group(3) or 0)
+        if hours > 14 or minutes > 59:
+            raise ConfigError(f"Invalid UTC offset: {text!r}")
+        delta = timedelta(hours=hours, minutes=minutes) * (-1 if sign == "-" else 1)
+        return timezone(delta), f"UTC{sign}{hours:02d}:{minutes:02d}"
+    # Check the shape before touching the tz database: names become file
+    # paths there, and this text may come from a web form.
+    if not _TZ_NAME_RE.match(text):
+        raise ConfigError(f"Unknown time zone: {text!r}")
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        return ZoneInfo(text), text
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+        raise ConfigError(
+            f"Unknown time zone: {text!r} (use a name like Asia/Kolkata or an offset like +05:30)"
+        ) from exc
+
+
+def parse_period_bound(text: str, tz: tzinfo, *, end_of_day: bool) -> datetime:
+    """Parse ``--since`` / ``--until``.
+
+    ``YYYY-MM-DD`` means the whole day in ``tz``: midnight for the start of a
+    period, the last microsecond of the day for its end. A full ISO 8601
+    timestamp is taken as-is (``tz`` applies when it has no offset).
+    """
+    raw = text.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            day = datetime.strptime(raw, "%Y-%m-%d").date()
+            moment = datetime.combine(day, time.max if end_of_day else time.min, tzinfo=tz)
+        else:
+            moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=tz)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid date {text!r}: use YYYY-MM-DD or an ISO 8601 timestamp") from exc
+    if not 1970 <= moment.year <= 2100:
+        raise ConfigError(f"Date out of range: {text!r}")
+    return moment
+
+
+def resolve_period(
+    since: str | None, until: str | None, timezone_name: str | None
+) -> tuple[datetime | None, datetime | None, tzinfo, str]:
+    """Validate the reporting period options together."""
+    tz, name = resolve_timezone(timezone_name)
+    start = parse_period_bound(since, tz, end_of_day=False) if since else None
+    end = parse_period_bound(until, tz, end_of_day=True) if until else None
+    if start is not None and end is not None and start > end:
+        raise ConfigError(f"The period starts ({since}) after it ends ({until}).")
+    return start, end, tz, name
 
 
 def _sanitize_login_for_env(login: str) -> str:
@@ -193,6 +277,9 @@ def build_offline_config(
     log_level: str = "INFO",
     exclude_own_repos: bool = False,
     exclude_owners: list[str] | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    timezone_name: str | None = None,
 ) -> AppConfig:
     """An :class:`AppConfig` for ``--regen`` runs.
 
@@ -202,6 +289,7 @@ def build_offline_config(
     """
     _maybe_load_dotenv()
     excluded = list(dict.fromkeys([*(exclude_owners or []), *_parse_env_list("EXCLUDE_OWNERS")]))
+    start, end, tz, tz_name = resolve_period(since, until, timezone_name)
     return AppConfig(
         accounts=[],
         target_logins=list(selected_logins),
@@ -210,6 +298,10 @@ def build_offline_config(
         log_level=log_level,
         exclude_own_repos=exclude_own_repos,
         exclude_owners=excluded,
+        since=start,
+        until=end,
+        tz=tz,
+        timezone_name=tz_name,
     )
 
 
@@ -236,6 +328,9 @@ def build_config(
     max_retries: int = DEFAULT_MAX_RETRIES,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     user_token_env: dict[str, str] | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    timezone_name: str | None = None,
 ) -> AppConfig:
     """Build a fully validated :class:`AppConfig`.
 
@@ -243,6 +338,7 @@ def build_config(
     ``EXTRA_REPOS`` / ``EXTRA_ORGS`` environment variables (loaded from .env).
     """
     mapping = user_token_env or dict(DEFAULT_USER_TOKEN_ENV)
+    start, end, tz, tz_name = resolve_period(since, until, timezone_name)
     accounts = load_accounts(selected_logins, mapping)  # also loads .env
 
     repos = list(dict.fromkeys([*(extra_repos or []), *_parse_env_list("EXTRA_REPOS")]))
@@ -273,4 +369,8 @@ def build_config(
         max_retries=max_retries,
         request_timeout=request_timeout,
         user_token_env=mapping,
+        since=start,
+        until=end,
+        tz=tz,
+        timezone_name=tz_name,
     )

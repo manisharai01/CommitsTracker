@@ -169,6 +169,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--since",
+        metavar="DATE",
+        help=(
+            "Only report work from this date on (YYYY-MM-DD, inclusive, in --timezone; "
+            "or a full ISO 8601 timestamp). Commits count by author date, pull "
+            "requests by the date they were opened."
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        metavar="DATE",
+        help="Only report work up to this date (YYYY-MM-DD, inclusive, in --timezone).",
+    )
+    parser.add_argument(
+        "--timezone",
+        metavar="TZ",
+        default="UTC",
+        help=(
+            "Time zone for --since/--until and for days, weeks and months in the "
+            "report: an IANA name (Asia/Kolkata) or an offset (+05:30)."
+        ),
+    )
+    parser.add_argument(
         "--pdf",
         action="store_true",
         help=(
@@ -254,7 +277,8 @@ def _print_final_summary(stats, config: AppConfig) -> None:
     print("  GitHub contribution report complete")
     print("=" * 60)
     print(f"  Users               : {s.get('tracked_users') or ', '.join(config.target_logins)}")
-    print(f"  Lifetime commits    : {s.get('total_lifetime_commits', 0)}")
+    print(f"  Period              : {s.get('report_period', 'all time')} ({s.get('report_timezone', 'UTC')})")
+    print(f"  Commits             : {s.get('total_lifetime_commits', 0)}")
     print(f"  Pull requests       : {s.get('total_pull_requests', 0)} "
           f"(merged {s.get('merged_pull_requests', 0)})")
     print(f"  Repos accessible    : {s.get('repositories_accessible', 0)}")
@@ -262,6 +286,8 @@ def _print_final_summary(stats, config: AppConfig) -> None:
     print(f"  Orgs contributed    : {s.get('organizations_contributed_to', 0)}")
     print(f"  First contribution  : {s.get('first_contribution_date') or 'n/a'}")
     print(f"  Latest contribution : {s.get('latest_contribution_date') or 'n/a'}")
+    gaps = int(s.get("data_completeness_warnings") or 0)
+    print(f"  Data completeness   : {f'{gaps} warning(s) - see the report' if gaps else 'no gaps detected'}")
     print("-" * 60)
     print(f"  Output directory    : {config.output_dir.resolve()}")
     print(f"  HTML report         : {(config.output_dir / 'report.html').resolve()}")
@@ -300,6 +326,9 @@ def main(argv: list[str] | None = None) -> int:
                 log_level=args.log_level,
                 exclude_own_repos=args.exclude_own_repos,
                 exclude_owners=args.exclude_owner,
+                since=args.since,
+                until=args.until,
+                timezone_name=args.timezone,
             )
         else:
             config = build_config(
@@ -321,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
                 exclude_own_repos=args.exclude_own_repos,
                 exclude_owners=args.exclude_owner,
                 fetch_commit_stats=not args.no_commit_stats,
+                since=args.since,
+                until=args.until,
+                timezone_name=args.timezone,
             )
     except ConfigError as exc:
         # Logging may not be configured yet; print plainly to stderr.

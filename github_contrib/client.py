@@ -12,6 +12,7 @@ Features
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ import aiohttp
 
 from .config import API_BASE_URL, API_VERSION_HEADER
 from .logging_config import get_logger
+from .models import Coverage
 
 log = get_logger("client")
 
@@ -50,6 +52,9 @@ class GitHubClient:
     max_retries: int = 5
     per_page: int = 100
     request_timeout: float = 60.0
+    # Receives a note for every access-denied response, so permission gaps
+    # show up in the report's data-completeness section.
+    coverage: Coverage | None = None
     # Telemetry / discovered metadata
     request_count: int = field(default=0, init=False)
     rate_limit_waits: int = field(default=0, init=False)
@@ -179,16 +184,17 @@ class GitHubClient:
                             )
                             if not is_rate_limit:
                                 # Genuine permission / SSO problem - surface it
-                                # at WARNING so missing data is not mistaken for
-                                # an absence of contributions.
-                                log.warning(
-                                    "[%s] Access denied (%d) for %s - token may lack "
-                                    "scope or org SSO authorization: %s",
-                                    self.login or "client",
-                                    status,
-                                    url,
-                                    body[:200],
+                                # so missing data is not mistaken for an
+                                # absence of contributions.
+                                message = (
+                                    f"[{self.login or 'client'}] Access denied ({status}) for "
+                                    f"{_api_path(url)}: the token may lack a scope or "
+                                    f"organization SSO authorization ({_one_line(body)})."
                                 )
+                                if self.coverage is not None:
+                                    self.coverage.warn(message)
+                                else:
+                                    log.warning(message)
                                 return None, response.headers, status
                             if attempt > self.max_retries:
                                 raise GitHubError(
@@ -314,6 +320,50 @@ class GitHubClient:
             page_index += 1
             next_url = self._parse_next_link(headers.get("Link") if headers else None)
 
+    async def search(
+        self,
+        path: str,
+        query: str,
+        *,
+        accept: str = "application/vnd.github+json",
+        split_above: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Run one Search API query and return ``(items, total_count, incomplete)``.
+
+        The Search API serves at most 1000 results per query; callers compare
+        ``total_count`` with ``len(items)`` to detect truncation (see
+        :func:`discovery.search_all`). With ``split_above``, a query matching
+        more results than that returns after its first page so the caller can
+        split it instead of paging through results it will discard.
+        ``incomplete`` is GitHub's ``incomplete_results`` flag: the search
+        timed out and results may be missing.
+        """
+        items: list[dict[str, Any]] = []
+        total = 0
+        incomplete = False
+        next_url: str | None = self._full_url(path)
+        params: dict[str, Any] | None = {"q": query, "per_page": 100}
+        while next_url is not None:
+            data, headers, status = await self.request("GET", next_url, params=params, accept=accept)
+            params = None  # the next links already carry the query
+            if not isinstance(data, dict):
+                if items:
+                    raise GitHubError(
+                        f"Search interrupted at {next_url} (status {status}) after "
+                        f"{len(items)} result(s).",
+                        status=status,
+                    )
+                return items, total, incomplete
+            total = int(data.get("total_count") or 0)
+            incomplete = incomplete or bool(data.get("incomplete_results"))
+            items.extend(i for i in data.get("items") or [] if isinstance(i, dict))
+            if split_above is not None and total > split_above:
+                break
+            if len(items) >= min(total, 1000):
+                break  # page 11 would be refused (422)
+            next_url = self._parse_next_link(headers.get("Link") if headers else None)
+        return items, total, incomplete
+
     async def get_authenticated_login(self) -> str:
         """Return the login of the account the token belongs to."""
         login, _scopes = await self.get_viewer()
@@ -343,6 +393,23 @@ def _is_secondary_rate_limit(body: str) -> bool:
         return False
     text = body.lower()
     return "secondary rate limit" in text or "abuse" in text
+
+
+def _api_path(url: str) -> str:
+    """``https://api.github.com/repos/a/b/commits?x=1`` -> ``/repos/a/b/commits``."""
+    path = url.split("?", 1)[0]
+    return path[len(API_BASE_URL):] if path.startswith(API_BASE_URL) else path
+
+
+def _one_line(body: str, limit: int = 160) -> str:
+    """A short single-line excerpt of an error body (GitHub's JSON 'message')."""
+    try:
+        message = json.loads(body).get("message")
+        if isinstance(message, str):
+            body = message
+    except (ValueError, AttributeError):
+        pass
+    return " ".join(body.split())[:limit]
 
 
 async def _safe_text(response: aiohttp.ClientResponse) -> str:

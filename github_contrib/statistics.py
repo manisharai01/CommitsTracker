@@ -60,17 +60,18 @@ _COMMIT_COLS = [
     "author_login", "author_name", "author_email", "committer_name",
     "committer_email", "authored_date", "committed_date", "branch",
     "message_first_line", "message", "url",
-    "additions", "deletions", "files_changed",
+    "additions", "deletions", "files_changed", "stats_fetched", "parent_count",
 ]
 _PR_COLS = [
     "repository", "full_name", "organization", "number", "title",
     "author_login", "state", "effective_state", "merged", "created_at",
     "updated_at", "closed_at", "merged_at", "base_branch", "head_branch", "url",
+    "merge_commit_sha", "commit_shas",
 ]
 _REPO_COLS = [
     "full_name", "name", "owner", "organization", "is_private", "is_fork",
     "is_archived", "default_branch", "language", "stargazers", "forks",
-    "pushed_at", "created_at", "discovered_via", "description", "html_url",
+    "pushed_at", "created_at", "discovered_via", "affiliated", "description", "html_url",
 ]
 _ORG_COLS = [
     "login", "name", "is_member", "repos_contributed", "commit_count",
@@ -79,11 +80,17 @@ _ORG_COLS = [
 
 
 def _commit_datetimes(data: CollectedData) -> pd.Series:
-    """Series of timezone-aware authored datetimes (NaT for missing)."""
+    """Series of timezone-aware authored datetimes (NaT for missing).
+
+    Expressed in the time zone of the data (see filters.localize), so years,
+    months and weekdays follow the report's calendar rather than UTC.
+    """
     if not data.commits:
         return pd.Series([], dtype="datetime64[ns, UTC]")
     values = [c.authored_date for c in data.commits]
-    return pd.to_datetime(pd.Series(values), utc=True)
+    series = pd.to_datetime(pd.Series(values), utc=True)
+    tz = next((v.tzinfo for v in values if v is not None), None)
+    return series.dt.tz_convert(tz) if tz is not None else series
 
 
 def compute_statistics(data: CollectedData) -> Statistics:
@@ -343,8 +350,9 @@ def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]
         d["total_lines_deleted"] = total_deletions
         d["net_lines"] = total_additions - total_deletions
         d["total_files_changed"] = total_files_changed
-        avg = round(total_additions / len(data.commits), 1) if data.commits else 0.0
-        d["avg_lines_added_per_commit"] = avg
+        # Only commits whose lines were counted (merge commits never are).
+        measured = sum(1 for c in data.commits if c.stats_fetched and not c.is_merge)
+        d["avg_lines_added_per_commit"] = round(total_additions / measured, 1) if measured else 0.0
     return d
 
 

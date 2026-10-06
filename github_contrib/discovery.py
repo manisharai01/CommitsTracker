@@ -4,21 +4,36 @@ A single call to ``GET /user/repos`` with the right ``affiliation`` and
 ``visibility`` query parameters returns personal, private, organization and
 collaborator repositories for the authenticated user, so we lean on that and
 then enrich with organization metadata from ``GET /user/orgs``.
+
+The Search API then adds repositories the account is not affiliated with
+(upstream projects the user contributed to): those holding commits by the
+tracked logins or author emails, and those where they opened pull requests.
+Search serves at most 1000 results per query, so :func:`search_all` splits the
+date range until each slice fits — no result is dropped silently.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .client import GitHubClient, GitHubError
 from .config import Account
 from .logging_config import get_logger
-from .models import OrgRecord, RepoRecord, parse_github_datetime
+from .models import Coverage, OrgRecord, RepoRecord, parse_github_datetime
 
 log = get_logger("discovery")
 
+#: Search windows default to every possible git date: history imported from
+#: older systems can predate GitHub, and skewed clocks produce future dates.
+SEARCH_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
+SEARCH_END = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+SEARCH_CAP = 1000
 
-def _repo_from_payload(payload: dict[str, Any], discovered_by: str) -> RepoRecord:
+
+def _repo_from_payload(
+    payload: dict[str, Any], discovered_by: str, affiliated: bool = True
+) -> RepoRecord:
     owner = payload.get("owner") or {}
     owner_login = str(owner.get("login", ""))
     owner_type = str(owner.get("type", ""))
@@ -40,6 +55,7 @@ def _repo_from_payload(payload: dict[str, Any], discovered_by: str) -> RepoRecor
         pushed_at=parse_github_datetime(payload.get("pushed_at")),
         created_at=parse_github_datetime(payload.get("created_at")),
         discovered_via={discovered_by},
+        affiliated=affiliated,
     )
 
 
@@ -90,6 +106,8 @@ async def fetch_repo(
     client: GitHubClient,
     full_name: str,
     discovered_by: str,
+    *,
+    affiliated: bool = False,
 ) -> RepoRecord | None:
     """Fetch a single repository's metadata by ``owner/name``."""
     try:
@@ -99,43 +117,123 @@ async def fetch_repo(
         return None
     if not isinstance(payload, dict) or not payload.get("full_name"):
         return None
-    return _repo_from_payload(payload, discovered_by)
+    return _repo_from_payload(payload, discovered_by, affiliated)
 
 
-async def discover_via_search_commits(
+def _search_stamp(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+async def search_all(
     client: GitHubClient,
-    query_login: str,
-    *,
-    max_items: int = 1000,
-) -> list[str]:
-    """Return distinct repository ``full_name``s in which ``query_login``
-    authored commits *that this token can see*, via the commit Search API.
+    path: str,
+    base_query: str,
+    date_field: str,
+    start: datetime,
+    end: datetime,
+    coverage: Coverage,
+    what: str,
+) -> list[dict[str, Any]]:
+    """Every result of ``base_query`` with ``date_field`` in ``[start, end]``.
 
-    This catches repositories that ``/user/repos`` may not list (the Search
-    index is contribution-based). Search is rate-limited (~30 req/min) and
-    capped at 1000 results, so it augments — never replaces — repo listing.
+    A query matching more than 1000 results is split into two halves of its
+    date range, recursively, so every slice can be read completely. Gaps that
+    cannot be avoided (more than 1000 results within a single second, or
+    GitHub reporting a timed-out search) are recorded as completeness notes.
     """
-    seen: set[str] = set()
-    params = {"q": f"author:{query_login}", "sort": "author-date", "order": "desc"}
+    results: list[dict[str, Any]] = []
+    pending = [(start.replace(microsecond=0), end.replace(microsecond=0))]
+    while pending:
+        lo, hi = pending.pop()
+        query = f"{base_query} {date_field}:{_search_stamp(lo)}..{_search_stamp(hi)}"
+        items, total, incomplete = await client.search(path, query, split_above=SEARCH_CAP)
+        if total > SEARCH_CAP and hi - lo > timedelta(seconds=1):
+            mid = (lo + (hi - lo) / 2).replace(microsecond=0)
+            pending.append((mid + timedelta(seconds=1), hi))
+            pending.append((lo, mid))
+            continue
+        if incomplete:
+            coverage.warn(f"GitHub search timed out while listing {what}; some may be missing.")
+        if total > len(items):
+            coverage.warn(
+                f"GitHub search returned {len(items)} of {total} {what} between "
+                f"{_search_stamp(lo)} and {_search_stamp(hi)}; the rest could not be listed."
+            )
+        results.extend(items)
+    return results
+
+
+async def discover_repos_via_search(
+    client: GitHubClient,
+    logins: list[str],
+    emails: list[str],
+    start: datetime,
+    end: datetime,
+    coverage: Coverage,
+) -> set[str]:
+    """Repositories holding commits by ``logins`` or ``emails`` *that this token
+    can see*, via the commit Search API.
+
+    This catches repositories ``/user/repos`` does not list (upstream projects
+    the user contributed to). The Search API indexes default branches only;
+    other branches are covered by repository scanning and pull requests.
+    """
+    queries = [(f"author:{login}", f"commits by {login}") for login in logins]
+    queries += [(f"author-email:{email}", f"commits by {email}") for email in emails]
+    names: set[str] = set()
+    for base_query, what in queries:
+        try:
+            items = await search_all(
+                client, "/search/commits", base_query, "author-date", start, end, coverage, what
+            )
+        except GitHubError as exc:
+            coverage.warn(
+                f"Searching {what} failed ({exc}); repositories found only through "
+                "search may be missing."
+            )
+            continue
+        found = {str((item.get("repository") or {}).get("full_name") or "") for item in items}
+        found.discard("")
+        if found:
+            log.info("search found %d repo(s) with %s", len(found), what)
+        names |= found
+    return names
+
+
+async def search_pull_requests(
+    client: GitHubClient,
+    login: str,
+    start: datetime,
+    end: datetime,
+    coverage: Coverage,
+) -> list[dict[str, Any]]:
+    """Every pull request opened by ``login`` that this token can see, as
+    issue-search items (see :func:`issue_repo_full_name`)."""
     try:
-        async for item in client.paginate(
-            "/search/commits", params=params, max_items=max_items
-        ):
-            repo = (item or {}).get("repository") or {}
-            full = repo.get("full_name")
-            if full:
-                seen.add(str(full))
+        return await search_all(
+            client, "/search/issues", f"type:pr author:{login}", "created",
+            start, end, coverage, f"pull requests by {login}",
+        )
     except GitHubError as exc:
-        log.debug("search/commits failed for author=%s: %s", query_login, exc)
-    if seen:
-        log.info("search found %d repo(s) with commits by %s", len(seen), query_login)
-    return sorted(seen)
+        coverage.warn(
+            f"Searching pull requests by {login} failed ({exc}); pull requests in "
+            "repositories the account is not a member of may be missing."
+        )
+        return []
+
+
+def issue_repo_full_name(item: dict[str, Any]) -> str:
+    """``owner/name`` of an issue-search item, from its ``repository_url``."""
+    url = str(item.get("repository_url") or "")
+    marker = "/repos/"
+    return url.split(marker, 1)[1] if marker in url else ""
 
 
 async def discover_org_repos(
     client: GitHubClient,
     org_login: str,
     discovered_by: str,
+    coverage: Coverage | None = None,
 ) -> list[RepoRecord]:
     """Enumerate every repository in ``org_login`` the token can access."""
     repos: list[RepoRecord] = []
@@ -146,7 +244,11 @@ async def discover_org_repos(
             if isinstance(payload, dict) and payload.get("full_name"):
                 repos.append(_repo_from_payload(payload, discovered_by))
     except GitHubError as exc:
-        log.debug("could not list repos for org %s: %s", org_login, exc)
+        message = f"Could not list the repositories of organization {org_login} ({exc})."
+        if coverage is not None:
+            coverage.warn(message)
+        else:
+            log.warning(message)
     if repos:
         log.info("[%s] org '%s' contributed %d repo(s)", discovered_by, org_login, len(repos))
     return repos
@@ -166,3 +268,4 @@ def merge_repositories(
             existing[repo.full_name] = repo
         else:
             current.discovered_via |= repo.discovered_via
+            current.affiliated = current.affiliated or repo.affiliated

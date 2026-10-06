@@ -113,6 +113,19 @@ report and the Excel workbook).
 - **History.** Each run is saved in `output-web/<run id>/` and stays listed
   after a restart. **Run again** refills the form with a past run's settings;
   the trash icon deletes a report and its files.
+- **Share report.** Send the PDF through your device's share sheet (mail,
+  Teams, WhatsApp…) or download it. When the app is hosted (public mode) you
+  can also create a **read-only link**: whoever opens it sees a summary page
+  with the PDF and the HTML report — never the logs, the Excel/CSV data or the
+  commit emails — and gets no session. **Stop sharing** turns the link off at
+  once; deleting or expiring the report does too.
+- **LinkedIn summary.** A first-person post drafted from the report's numbers,
+  for example *"During H1 2026, I contributed to 18 repositories across 6
+  engineering projects, shipping 412 commits and 57 pull requests (51
+  merged)."* Edit it in place, then **Copy text** or **Open LinkedIn**.
+  Repository names and pull-request titles are never included, so a post
+  cannot reveal private company work. The command line writes the same draft
+  to `linkedin_post.txt`.
 - PDF export uses Edge or Chrome, exactly like `--pdf`.
 
 ### Hosting it for other people (production)
@@ -132,6 +145,7 @@ python webui.py --public-url https://reports.example.com --trust-proxy --no-brow
 | Cross-site requests | `POST`/`DELETE` must come from `--public-url` (Origin check) with a JSON body. |
 | Limits | 2 reports queued/running per session, 20 per client address per hour, 50 in total, 2 running at once, 2 h per run (process tree killed). All configurable. |
 | Retention | Reports are deleted 24 h after they finish (`--retention-hours`). |
+| Share links | Created only by a report's owner, 192-bit random, read-only (summary page, PDF, HTML), not indexed by search engines (`X-Robots-Tag: noindex`), no cookies for viewers; they stop working when sharing is turned off or the report is deleted or expires. |
 | Headers | Strict CSP (no inline script), HSTS, `X-Frame-Options: DENY`, COOP/CORP, `nosniff`, `no-referrer`, `no-store` on the API; the server version is hidden. |
 | Reports | `report.html` opens in a CSP **sandbox** (no cookies, storage or network), and the page's own CSP only allows its one script. Excel/CSV cells can never run as formulas. Logs shown to users hide server paths. |
 
@@ -190,6 +204,7 @@ CommitsTracker/
 │   ├── insights.py             # deterministic work narrative + activity insights
 │   ├── htmlreport.py           # styled HTML + Markdown report generation
 │   ├── filters.py              # exclusions, time range, count-once rules, time zone
+│   ├── linkedin.py             # LinkedIn post drafted from the report's numbers
 │   ├── report.py               # orchestration (collect → compute → export)
 │   ├── pdfexport.py            # report.html → report.pdf via headless Edge/Chrome
 │   ├── offline.py              # --regen: reload a previous run's CSVs
@@ -198,6 +213,7 @@ CommitsTracker/
 ├── tests/
 │   ├── test_offline.py         # offline tests (no network needed)
 │   ├── test_accuracy.py        # collection & counting edge cases (fake GitHub API)
+│   ├── test_linkedin.py        # LinkedIn summary wording and periods
 │   └── test_webapp.py          # web UI tests (fake CLI, no network needed)
 ├── requirements.txt
 ├── .env.example
@@ -447,6 +463,7 @@ charts and the async pagination/rate-limit logic:
 ```bash
 python tests/test_offline.py
 python tests/test_accuracy.py   # collection & counting edge cases (fake GitHub API)
+python tests/test_linkedin.py   # LinkedIn summary wording and periods
 python tests/test_webapp.py     # web UI: validation, job pipeline, sessions, security
 # or, if pytest is installed:
 pytest -q tests

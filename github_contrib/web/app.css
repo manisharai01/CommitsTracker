@@ -491,6 +491,7 @@ dialog.sheet::backdrop { background: rgba(91, 112, 131, 0.4); }
 
 .shared { max-width: 600px; min-height: 100vh; margin: 0 auto; border-inline: 1px solid var(--border); }
 .shared-card { padding: 16px; }
+.shared-card .hint { margin-top: 12px; }
 .shared-name { margin: 0; font-size: 23px; line-height: 28px; font-weight: 800; overflow-wrap: anywhere; }
 @media (max-width: 600px) { .shared { border-inline: 0; } }
 

@@ -386,6 +386,7 @@ function addAccount({ login = "", emails = "", token = "" } = {}) {
   inputs.token.addEventListener("input", () => {
     updateTokenHint(row);
     clearRowError(row);
+    updateSubmit();
   });
   inputs.emails.addEventListener("input", () => clearRowError(row));
   $("[data-role=reveal]", row).addEventListener("click", (event) => toggleReveal(row, event.currentTarget));
@@ -431,7 +432,11 @@ function updateTokenHint(row) {
     hint.classList.add("hint-success");
     hint.innerHTML = `${icon("check")}<span>Leave blank to use <code>${esc(envName)}</code> from .env.</span>`;
   } else {
-    hint.innerHTML = `<span>Classic token with <b>repo</b> and <b>read:org</b> scopes. ` +
+    // GitHub creates the token for whichever account is signed in on github.com.
+    const login = loginOf(row);
+    const owner = LOGIN_RE.test(login) ? `<b>@${esc(login)}</b>` : "this account";
+    hint.innerHTML = `<span>Classic token with <b>repo</b> and <b>read:org</b> scopes, created while ` +
+      `signed in to GitHub as ${owner}. ` +
       `<a href="${NEW_TOKEN_URL}" target="_blank" rel="noopener noreferrer">Create one</a></span>`;
   }
 }
@@ -512,21 +517,27 @@ function restoreForm() {
 
 // ---------- submit ----------
 
+// The accounts and tokens the user chose to run despite token warnings
+// (see checkTokens); any edit to them asks again.
+let confirmedRows = "";
+const rowsKey = (accounts) => JSON.stringify(accounts.map((a) => [a.login.toLowerCase(), a.token]));
+
 function updateSubmit() {
   const button = $("#submit");
   if (button.dataset.busy) return;
   const accounts = readAccounts();
   const separate = currentMode() === "separate" && accounts.length > 1;
-  button.textContent = separate ? `Generate ${accounts.length} reports` : "Generate report";
+  if (confirmedRows && confirmedRows === rowsKey(accounts)) button.textContent = "Generate anyway";
+  else button.textContent = separate ? `Generate ${accounts.length} reports` : "Generate report";
   button.disabled = !accounts.some((account) => account.login);
 }
 
-function setBusy(busy) {
+function setBusy(busy, label = "Starting…") {
   const button = $("#submit");
   if (busy) {
     button.dataset.busy = "1";
     button.disabled = true;
-    button.innerHTML = '<span class="spinner"></span>Starting…';
+    button.innerHTML = `<span class="spinner"></span>${esc(label)}`;
   } else {
     delete button.dataset.busy;
     updateSubmit();
@@ -597,6 +608,42 @@ function showFormError(message) {
   box.hidden = false;
 }
 
+// Asks GitHub about every typed token before a run. A token that belongs to
+// another account (easy to do: GitHub creates tokens for whichever account is
+// signed in on github.com), has expired, or can't read private repositories
+// would leave the report quietly incomplete. Returns whether to go ahead.
+async function checkTokens(accounts) {
+  const typed = accounts.filter((account) => account.token);
+  if (!typed.length || confirmedRows === rowsKey(accounts)) return true;
+  let problems = [];
+  setBusy(true, "Checking tokens…");
+  try {
+    const body = { accounts: typed.map(({ login, token }) => ({ login, token })) };
+    problems = (await api("/api/tokens/check", { method: "POST", body })).problems || [];
+  } catch (error) {
+    if (error.status === 401) return false; // signed out meanwhile
+    problems = []; // the check is a safety net: it never blocks a run by itself failing
+  } finally {
+    setBusy(false);
+  }
+  if (!problems.length) return true;
+
+  const rowOf = new Map(accounts.map((account) => [account.login.toLowerCase(), account.row]));
+  showProblems(
+    problems
+      .map((problem) => [rowOf.get(String(problem.login).toLowerCase()), "token", problem.message])
+      .filter(([row]) => row),
+  );
+  if (problems.some((problem) => problem.severity === "error")) {
+    showFormError("Fix the tokens marked above to generate the report.");
+  } else {
+    confirmedRows = rowsKey(accounts);
+    showFormError("These tokens would leave the report incomplete. Fix them, or choose Generate anyway.");
+    updateSubmit();
+  }
+  return false;
+}
+
 async function submit(event) {
   event.preventDefault();
   $("#form-error").hidden = true;
@@ -610,6 +657,8 @@ async function submit(event) {
     showFormError(problem);
     return;
   }
+  if (!(await checkTokens(accounts))) return;
+  confirmedRows = "";
 
   const payload = accounts.map(({ login, token, emails }) => ({ login, token, emails: splitList(emails) }));
   const period = readPeriod();

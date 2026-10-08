@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
+import aiohttp
 from aiohttp import web
 
 from . import __version__
@@ -529,6 +530,68 @@ def env_token_logins(env: Mapping[str, str]) -> list[str]:
         if name.upper().startswith(prefix) and (value or "").strip()
     }
     return sorted(login for login in logins if _LOGIN_RE.match(login) and not login.isdigit())
+
+
+# ---------------------------------------------------------------------------
+# Token check (before a run)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class TokenInfo:
+    """What GitHub says about a token: ``GET /user``'s status, the account that
+    owns it, and its scopes (``None`` for fine-grained tokens)."""
+
+    status: int
+    login: str = ""
+    scopes: str | None = None
+
+
+async def fetch_token_info(token: str) -> TokenInfo | None:
+    """Ask GitHub who owns ``token`` (``None`` when GitHub can't be reached)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "CommitsTracker",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10), trust_env=True) as http:
+            async with http.get("https://api.github.com/user", headers=headers) as response:
+                data = await response.json(content_type=None) if response.status == 200 else {}
+                login = str(data.get("login") or "") if isinstance(data, dict) else ""
+                return TokenInfo(response.status, login, response.headers.get("X-OAuth-Scopes"))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+
+
+def token_problem(login: str, token: str, info: TokenInfo | None) -> tuple[str, str] | None:
+    """``(severity, message)`` when ``token`` would leave @login's report
+    incomplete: "error" can't run, "warning" runs only if the user insists."""
+    if info is None or info.status not in (200, 401):
+        return None  # GitHub unreachable: the run itself reports any gap
+    if info.status == 401:
+        return "error", (
+            f"This token doesn't work (expired or revoked). Create a new one while "
+            f"signed in to GitHub as @{login}."
+        )
+    if info.login and info.login.lower() != login.lower():
+        return "warning", (
+            f"This token belongs to @{info.login}, not @{login}, so only repositories "
+            f"@{info.login} can open would be scanned: @{login}'s private and organization "
+            f"work would be missing. Create the token while signed in to GitHub as @{login}."
+        )
+    if token.startswith("github_pat_"):
+        return "warning", (
+            "Fine-grained tokens can't read repositories owned by other accounts or "
+            "organizations. Use a classic token (ghp_…) with repo and read:org."
+        )
+    granted = {scope.strip() for scope in (info.scopes or "").split(",")}
+    if info.scopes is not None and "repo" not in granted:
+        return "warning", (
+            "This token lacks the repo scope, so private repositories wouldn't be "
+            "counted. Use a classic token with repo and read:org."
+        )
+    return None
 
 
 def read_metrics(out_dir: Path) -> dict[str, str]:
@@ -1533,6 +1596,34 @@ async def _create_job(request: web.Request) -> web.Response:
     return web.json_response(job.to_json(_share_base(request)), status=201)
 
 
+async def _check_tokens(request: web.Request) -> web.Response:
+    """Before a run: does each typed token belong to its account and see
+    private repositories? Blank tokens (.env in local mode) are not checked."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        return _error("The request was not valid JSON.")
+    raw = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(raw, list) or len(raw) > MAX_ACCOUNTS:
+        return _error(f"Send a list of at most {MAX_ACCOUNTS} accounts.")
+    rows: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return _error("Each account must be an object.")
+        login = str(item.get("login") or "").strip().lstrip("@")
+        token = str(item.get("token") or "").strip()
+        if _LOGIN_RE.match(login) and _TOKEN_RE.match(token):
+            rows.append((login, token))
+    tokens = list(dict.fromkeys(token for _login, token in rows))
+    infos = dict(zip(tokens, await asyncio.gather(*(fetch_token_info(token) for token in tokens))))
+    problems = []
+    for login, token in rows:
+        found = token_problem(login, token, infos[token])
+        if found is not None:
+            problems.append({"login": login, "severity": found[0], "message": found[1]})
+    return web.json_response({"problems": problems})
+
+
 async def _cancel_job(request: web.Request) -> web.Response:
     job = _job(request)
     request.app[MANAGER].cancel(job)
@@ -1784,6 +1875,7 @@ def create_app(
         app.on_cleanup.append(manager.close_store)
     app.router.add_get("/api/jobs", _list_jobs)
     app.router.add_post("/api/jobs", _create_job)
+    app.router.add_post("/api/tokens/check", _check_tokens)
     app.router.add_post("/api/jobs/{job_id}/cancel", _cancel_job)
     app.router.add_delete("/api/jobs/{job_id}", _delete_job)
     app.router.add_get("/api/jobs/{job_id}/log", _job_log)

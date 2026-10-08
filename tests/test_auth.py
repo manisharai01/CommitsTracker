@@ -39,7 +39,7 @@ from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 from yarl import URL  # noqa: E402
 
 import webui  # noqa: E402
-from github_contrib import auth, pdfexport  # noqa: E402
+from github_contrib import auth, pdfexport, webapp  # noqa: E402
 from github_contrib.store import (  # noqa: E402
     SCHEMA_SQL,
     MemoryStore,
@@ -54,10 +54,12 @@ from github_contrib.webapp import (  # noqa: E402
     Job,
     RequestError,
     Settings,
+    TokenInfo,
     build_env,
     create_app,
     parse_job_request,
     public_settings,
+    token_problem,
 )
 
 PUBLIC_URL = "http://localhost:8765"  # public mode without TLS is allowed on loopback only
@@ -534,6 +536,69 @@ def test_reports_use_each_accounts_own_token():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(scenario(Path(tmp)))
     print("ok  test_reports_use_each_accounts_own_token")
+
+
+def test_token_problem_rules():
+    fine = TokenInfo(200, "manisharai01", "read:org, repo")
+    assert token_problem("manisharai01", PAT, fine) is None
+    assert token_problem("ManishaRai01", PAT, fine) is None, "logins compare without case"
+
+    # The real-world mistake: both tokens created while github.com was signed
+    # in as the other account.
+    severity, message = token_problem("manisharai01", PAT, TokenInfo(200, "manisharai21", "repo"))
+    assert severity == "warning" and "@manisharai21, not @manisharai01" in message
+    assert "signed in to GitHub as @manisharai01" in message
+
+    severity, message = token_problem("alice", PAT, TokenInfo(401))
+    assert severity == "error" and "expired or revoked" in message
+    fine_grained = "github_pat_" + "x1Y2z3" * 8
+    severity, message = token_problem("alice", fine_grained, TokenInfo(200, "alice", None))
+    assert severity == "warning" and "Fine-grained" in message
+    for scopes in ("public_repo, read:org", ""):
+        severity, message = token_problem("alice", PAT, TokenInfo(200, "alice", scopes))
+        assert severity == "warning" and "repo scope" in message, scopes
+    # GitHub unreachable or rate limited: never blocks a run.
+    assert token_problem("alice", PAT, None) is None
+    assert token_problem("alice", PAT, TokenInfo(403)) is None
+    print("ok  test_token_problem_rules")
+
+
+def test_token_check_endpoint():
+    asked: list[str] = []
+    other_pat = "ghp_" + "Z9y8X7w6V5" * 4
+    owners = {PAT: TokenInfo(200, "manisharai21", "repo"), other_pat: TokenInfo(200, "manisharai21", "repo")}
+
+    async def fake_info(token):
+        asked.append(token)
+        return owners[token]
+
+    async def scenario(tmp: Path) -> None:
+        app = create_app(_auth_settings(tmp), store=MemoryStore())
+        async with TestClient(TestServer(app)) as client:
+            body = {"accounts": [
+                {"login": "manisharai01", "token": PAT},
+                {"login": "manisharai21", "token": other_pat},
+                {"login": "blank-row", "token": ""},  # not checked
+                {"login": "other-row", "token": PAT},  # same token: asked once
+            ]}
+            assert (await client.post("/api/tokens/check", json=body, headers=ORIGIN)).status == 401
+            _sign_in(client.session.cookie_jar, client.make_url("/"))
+            assert (await client.post("/api/tokens/check", json=body)).status == 403, "Origin guard"
+            response = await client.post("/api/tokens/check", json=body, headers=ORIGIN)
+            assert response.status == 200
+            problems = (await response.json())["problems"]
+            assert [(p["login"], p["severity"]) for p in problems] == [
+                ("manisharai01", "warning"), ("other-row", "warning"),
+            ], problems
+            assert "belongs to @manisharai21, not @manisharai01" in problems[0]["message"]
+            assert sorted(asked) == sorted([PAT, other_pat]), "each distinct token is looked up once"
+            too_many = {"accounts": [{"login": f"u{i}", "token": PAT} for i in range(21)]}
+            assert (await client.post("/api/tokens/check", json=too_many, headers=ORIGIN)).status == 400
+
+    with patched(webapp, fetch_token_info=fake_info):
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(scenario(Path(tmp)))
+    print("ok  test_token_check_endpoint")
 
 
 def test_public_runs_need_a_token_per_account():

@@ -84,9 +84,11 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 
 ## Plans
 
-- **Starter** (`render.yaml` default) stays awake.
-- **Free** works too, but it sleeps after 15 idle minutes, and the next visit
-  waits about a minute while it wakes up.
+- **Free** (`render.yaml` default) needs no card. It sleeps after 15 idle
+  minutes, and the next visit waits about a minute while it wakes up. A
+  report in progress keeps it awake (the page checks on it every second).
+- **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
+  reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is
   wiped by each deploy, restart or sleep. The **history** (date, period,
   status) is in the database, so old entries stay listed as "expired" with a

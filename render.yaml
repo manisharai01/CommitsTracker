@@ -1,14 +1,14 @@
 # Render Blueprint: one Docker web service. See DEPLOY.md.
 #
-# Plan: "starter" keeps the service awake. "free" also works, but it sleeps
-# after 15 idle minutes (the next visit waits ~1 minute) and, like every
-# restart or deploy on any plan without a disk, loses the report files.
-# The report history stays in the database either way.
+# Plan: "free" needs no payment details. It sleeps after 15 idle minutes (the
+# next visit waits ~1 minute) and, like every restart or deploy on any plan
+# without a disk, loses the report files; the report history stays in the
+# database. "starter" (paid) stays awake and has more CPU.
 services:
   - type: web
     name: commitstracker
     runtime: docker
-    plan: starter
+    plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /healthz
     autoDeploy: true
@@ -24,7 +24,7 @@ services:
       # Encrypts the sign-in cookie; changing it signs everyone out.
       - key: SESSION_SECRET
         generateValue: true
-      # 512 MB (starter) fits one report run at a time: pandas + Chromium.
+      # 512 MB (free and starter) fits one report run at a time: pandas + Chromium.
       - key: PARALLEL
         value: "1"
       # Optional: only for a custom domain. Defaults to RENDER_EXTERNAL_URL

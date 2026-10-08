@@ -90,8 +90,11 @@ class AppConfig:
     exclude_own_repos: bool = False
     exclude_owners: list[str] = field(default_factory=list)
     # Fetch per-commit line stats (additions/deletions/files_changed).
-    # Adds one API request per commit — disable with --no-commit-stats to save quota.
+    # 25 commits per GraphQL query (one REST request per commit with --rest-api).
     fetch_commit_stats: bool = True
+    # Collect commits, pull requests and line stats through the GraphQL API
+    # (far fewer requests; anything it cannot read falls back to REST).
+    use_graphql: bool = True
     # Reporting period (inclusive, timezone aware; None = unbounded) and the
     # time zone used for period boundaries and for days / weeks / months.
     since: datetime | None = None
@@ -325,6 +328,7 @@ def build_config(
     exclude_own_repos: bool = False,
     exclude_owners: list[str] | None = None,
     fetch_commit_stats: bool = True,
+    use_graphql: bool = True,
     max_retries: int = DEFAULT_MAX_RETRIES,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     user_token_env: dict[str, str] | None = None,
@@ -366,6 +370,7 @@ def build_config(
         exclude_own_repos=exclude_own_repos,
         exclude_owners=excluded,
         fetch_commit_stats=fetch_commit_stats,
+        use_graphql=use_graphql,
         max_retries=max_retries,
         request_timeout=request_timeout,
         user_token_env=mapping,

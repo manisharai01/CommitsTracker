@@ -1,0 +1,33 @@
+# Render Blueprint: one Docker web service. See DEPLOY.md.
+#
+# Plan: "starter" keeps the service awake. "free" also works, but it sleeps
+# after 15 idle minutes (the next visit waits ~1 minute) and, like every
+# restart or deploy on any plan without a disk, loses the report files.
+# The report history stays in the database either way.
+services:
+  - type: web
+    name: commitstracker
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Supabase "Session pooler" connection string (see DEPLOY.md).
+      - key: DATABASE_URL
+        sync: false
+      # From your GitHub OAuth App.
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      # Encrypts the sign-in cookie; changing it signs everyone out.
+      - key: SESSION_SECRET
+        generateValue: true
+      # 512 MB (starter) fits one report run at a time: pandas + Chromium.
+      - key: PARALLEL
+        value: "1"
+      # Optional: only for a custom domain. Defaults to RENDER_EXTERNAL_URL
+      # (https://<service>.onrender.com).
+      # - key: PUBLIC_URL
+      #   value: https://reports.example.com

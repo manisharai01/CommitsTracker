@@ -21,7 +21,7 @@ Each browser session sees only its own reports.
 Every user must enter a token. Tokens are never stored or logged, and the server's own .env file is never used.
 Requests from other websites are rejected, and users and addresses have rate limits. Runs time out, and reports are deleted after 24 hours.
 Reports open in a sandbox, and strict security headers are set. Spreadsheet downloads can't run hidden formulas.
-Technology and quality. It uses Python 3.12+ with asyncio and aiohttp (for the GitHub API and the web server), plus pandas, matplotlib and openpyxl. The front end is plain JavaScript with no build step. 41 automated tests cover collection edge cases, reports and web security. The tool was also checked against live GitHub data and in a real browser, with no console errors.
+Technology and quality. It uses Python 3.12+ with asyncio and aiohttp (for the GitHub API and the web server), plus pandas, matplotlib and openpyxl. The front end is plain JavaScript with no build step. Automated tests cover collection edge cases (the GraphQL collector is checked against the REST one), reports, sign-in and web security. The tool was also checked against live GitHub data and in a real browser, with no console errors.
 Known limits. It cannot see:
 commits where the user is only a co-author (GitHub has no API for this);
 private repositories the token cannot read;
@@ -157,7 +157,12 @@ report and the Excel workbook).
 
 ### Hosting it for other people (production)
 
-Run the server in **public mode** behind an HTTPS reverse proxy (nginx, Caddy,
+**On Render with "Sign in with GitHub" and a report history in Postgres
+(Supabase): follow [DEPLOY.md](DEPLOY.md).** People sign in instead of pasting
+tokens, and their report history (only ids, dates, period and status) follows
+their account.
+
+Otherwise, run the server in **public mode** behind an HTTPS reverse proxy (nginx, Caddy,
 a cloud load balancer). Public mode is designed for untrusted, concurrent users:
 
 ```bash
@@ -204,7 +209,7 @@ See `python webui.py --help` for every limit.
 | **Outputs** | 5 CSV files + a 13-sheet formatted Excel workbook + HTML & Markdown reports. |
 | **Charts** | Per-year, per-month, day-of-week, top-repository and per-org bar charts, plus a combined dashboard PNG. |
 | **Branches** | Scans **every branch by default** (complete coverage); `--default-branch-only` for a faster run. |
-| **Performance** | Async (`aiohttp`) requests with a shared concurrency limiter, GitHub rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |
+| **Performance** | GraphQL collection (batched queries, branch comparison, 25 commits' line stats per query) with REST as the fallback; async (`aiohttp`) requests with a shared concurrency limiter, rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |
 | **Quality** | Python 3.12+, full type hints, structured logging, modular architecture, defensive error handling, offline test suite. |
 
 ---
@@ -222,8 +227,9 @@ CommitsTracker/
 │   ├── models.py               # typed dataclasses + datetime parsing
 │   ├── client.py               # async GitHub API client (auth, pagination, rate limit, retry)
 │   ├── discovery.py            # repository + organization discovery
-│   ├── commits.py              # commit collection
-│   ├── pull_requests.py        # pull request collection
+│   ├── graphql.py              # GraphQL collection (commits, PRs, line stats) with REST fallback
+│   ├── commits.py              # REST commit collection
+│   ├── pull_requests.py        # REST pull request collection
 │   ├── organizations.py        # org contribution aggregation
 │   ├── statistics.py           # pandas statistics
 │   ├── exporters.py            # CSV / Excel / text-report writers
@@ -236,15 +242,22 @@ CommitsTracker/
 │   ├── pdfexport.py            # report.html → report.pdf via headless Edge/Chrome
 │   ├── offline.py              # --regen: reload a previous run's CSVs
 │   ├── webapp.py               # web UI server: form → queued report runs
+│   ├── auth.py                 # "Sign in with GitHub" (OAuth App) + encrypted session cookie
+│   ├── store.py                # report history (Postgres / in memory)
 │   └── web/                    # web UI page (HTML, CSS, JS; no build step)
 ├── tests/
 │   ├── test_offline.py         # offline tests (no network needed)
 │   ├── test_accuracy.py        # collection & counting edge cases (fake GitHub API)
+│   ├── test_graphql.py         # GraphQL collector checked against the REST collector
 │   ├── test_linkedin.py        # LinkedIn summary wording and periods
+│   ├── test_auth.py            # sign-in, sessions, report history
 │   └── test_webapp.py          # web UI tests (fake CLI, no network needed)
+├── Dockerfile, render.yaml     # Render deployment (see DEPLOY.md)
+├── schema.sql                  # the two history tables
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
+├── DEPLOY.md
 └── README.md
 ```
 
@@ -346,6 +359,8 @@ python github_report.py --user YOUR_LOGIN \
 | `--no-prs` | Skip pull request collection. | off |
 | `--no-commits` | Skip commit collection. | off |
 | `--no-charts` | Skip chart/dashboard generation. | off |
+| `--no-commit-stats` | Skip line stats (additions/deletions/files changed). | off |
+| `--rest-api` | Collect with the REST API only (the previous, much slower engine). | GraphQL |
 | `--max-repos N` | Limit repositories scanned (testing). | unlimited |
 | `--exclude-own-repos` | Drop repos **owned by the tracked login(s)** from the outputs, so the report shows only work in other accounts/orgs (company work). | included |
 | `--exclude-owner LOGIN` | Exclude every repo owned by this login (repeatable). Also reads `EXCLUDE_OWNERS`. | — |
@@ -401,16 +416,25 @@ After that, `python github_report.py --all` runs for both without extra flags.
    by the tracked logins **or the extra commit emails**, and repositories where
    they opened pull requests. Search returns at most 1000 results per query, so
    the date range is split until every slice is read completely.
-3. **Collect commits** — for every repo and every branch (each distinct branch
-   head once, default branch first),
-   `GET /repos/{owner}/{repo}/commits?author={login|email}&sha={branch}`.
-   Upstream projects only have their default branch scanned.
-4. **Collect pull requests** — listed per repo (`state=all`) where the account
-   is a member; completed from search results elsewhere. When every branch is
-   scanned, each pull request's own commits are read too, which **recovers work
-   on deleted branches**.
-5. **Line statistics** — one request per commit inside the period (merge
-   commits are skipped: their diff repeats the merged branch).
+3. **Collect pull requests** (GraphQL) — each tracked user's own pull-request
+   list, with every pull request's commits. It covers private repositories the
+   token can read and upstream projects alike. When every branch is scanned,
+   those commits **recover work on deleted branches**.
+4. **Collect commits** (GraphQL) — the default branch's history is read once
+   per tracked login (and once for all extra emails); every other branch (each
+   distinct head once) is **compared with the default branch**, so only the
+   commits that exist on that branch alone are read. A branch more than 1,000
+   commits ahead, or with no history in common (`gh-pages`), is read per author
+   instead. Upstream projects only have their default branch scanned.
+5. **Line statistics** (GraphQL) — 25 commits per query, for the commits inside
+   the period (merge commits are skipped: their diff repeats the merged branch).
+
+Many repositories, branches or commits share one GraphQL query. A query GitHub
+can't finish in time is split, then its page shrunk, and retried; anything
+still unreadable is collected again with the REST endpoints
+(`GET /repos/{owner}/{repo}/commits?author=…&sha=…`, `/pulls`, `/commits/{sha}`),
+which also record the data-completeness notes. `--rest-api` uses only those
+REST endpoints (the previous engine).
 6. **Report** — owner exclusions, then the time range, then **each change is
    counted once** (below), then dates are expressed in the report time zone;
    statistics, Excel, charts, HTML/Markdown and PDF all use the same data.
@@ -439,11 +463,28 @@ After that, `python github_report.py --all` runs for both without extra flags.
 
 ### Rate limits & performance
 
-* The authenticated REST API allows **5,000 requests/hour**. A shared
+* GitHub gives each token **5,000 REST requests and 5,000 GraphQL points per
+  hour**. The REST engine needed one request per page of (repository × branch ×
+  author) plus one per commit for line stats: about 7,000 for an account with
+  2,000 commits, so it slept for most of an hour (or several) waiting for the
+  limit to reset. The GraphQL engine reads the same data in a few hundred
+  points, so reports finish in minutes and a token can run many per hour.
+* Measured on the same accounts, with identical CSVs from both engines:
+
+  | Run | REST engine | GraphQL engine |
+  | --- | --- | --- |
+  | 17 repos, 74 commits, 14 PRs | 342 requests, 28 s | 36 requests, 15 s |
+  | `cli/cli`, 266 branches, 1,385 commits | 1,559 requests, 163 s | 80 requests, 23 s |
+  | `nodejs/node`, 52 release branches | 544 requests, 93 s | 130 requests, 72 s |
+
+* Work is spread across every token that can see a repository. A shared
   `asyncio.Semaphore` bounds concurrency (`--concurrency`, default 8).
-* When `X-RateLimit-Remaining` hits 0, or a `Retry-After` header is returned,
-  the client sleeps until the reset time and resumes automatically.
-* Transient errors (timeouts, 5xx) are retried with exponential backoff.
+* When a limit is reached (REST headers, or GraphQL's `RATE_LIMITED` error) the
+  client sleeps until the reset time and resumes automatically. Transient
+  errors are retried with exponential backoff.
+* The commit Search API (repository discovery) allows 30 requests a minute and
+  pages through every matching commit. That costs seconds for most accounts,
+  but minutes for one with tens of thousands of commits; `--since` narrows it.
 
 ---
 
@@ -492,6 +533,8 @@ python tests/test_offline.py
 python tests/test_accuracy.py   # collection & counting edge cases (fake GitHub API)
 python tests/test_linkedin.py   # LinkedIn summary wording and periods
 python tests/test_webapp.py     # web UI: validation, job pipeline, sessions, security
+python tests/test_graphql.py    # GraphQL collector vs the REST collector, timeouts, fallbacks
+python tests/test_auth.py       # GitHub sign-in, sessions, report history
 # or, if pytest is installed:
 pytest -q tests
 ```
@@ -505,7 +548,7 @@ pytest -q tests
 | `No users specified` | Add `--user YOUR_LOGIN` to the command. |
 | `Configuration error: Missing GitHub token(s)` | Set `GITHUB_TOKEN_<LOGIN>` or `GITHUB_TOKEN` (env or `.env`). |
 | `Authentication failed (401)` | Token is invalid/expired or lacks scopes. Recreate it. |
-| Repeated "Rate limit reached; sleeping…" | Normal for large accounts; lower `--concurrency` or wait. |
+| Repeated "Rate limited; sleeping…" | The token's hourly budget is used up (other tools or runs share it). The run resumes by itself; make sure `--rest-api` isn't set. |
 | Private/org repos missing | Token lacks `repo` / `read:org` (classic) or the equivalent fine-grained permissions. |
 | `403` for specific repos | The token's account cannot access that repo; it is skipped. |
 

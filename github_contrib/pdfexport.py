@@ -84,6 +84,10 @@ def export_pdf(html_path: Path, pdf_path: Path | None = None) -> Path | None:
         f"--print-to-pdf={pdf_path.resolve()}",
         url,
     ]
+    if os.environ.get("PDF_NO_SANDBOX") == "1":
+        # Containers (the Docker image sets this) can't use Chromium's sandbox.
+        # Their /dev/shm is usually 64 MB, too small for a long report.
+        cmd[2:2] = ["--no-sandbox", "--disable-dev-shm-usage"]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=_BROWSER_TIMEOUT_S

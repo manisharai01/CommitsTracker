@@ -7,3 +7,7 @@ openpyxl>=3.1           # Excel (.xlsx) writer engine used by pandas
 matplotlib>=3.8         # contribution charts and dashboard PNGs
 tqdm>=4.66             # progress bars
 python-dotenv>=1.0     # loads tokens from a local .env file (env vars also work without it)
+
+# Hosted web app (webui.py --public-url with GitHub sign-in)
+asyncpg>=0.29          # report history in Postgres (Supabase)
+cryptography>=42       # encrypts the sign-in session cookie (Fernet)

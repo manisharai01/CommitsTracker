@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import zlib
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+from . import graphql
 from .client import GitHubClient, GitHubError
 from .commits import collect_commits_for_repo, collect_pr_commits, enrich_commits_with_stats
 from .config import AppConfig
@@ -196,6 +198,28 @@ async def _add_found_repos(
         log.info("[%s] search discovered new repo %s", account_login, full)
 
 
+async def _search_prs(
+    client: GitHubClient,
+    account_login: str,
+    config: AppConfig,
+    end: datetime,
+    coverage: Coverage,
+    pr_hits: dict[tuple[str, int], tuple[str, dict]],
+) -> set[str]:
+    """Search the pull requests the tracked logins opened (REST engine) into
+    ``pr_hits``; returns the repositories they live in."""
+    names: set[str] = set()
+    # Pull requests opened before the period can still hold commits authored
+    # inside it, so only the end is bounded.
+    for login in config.target_logins:
+        for item in await search_pull_requests(client, login, SEARCH_START, end, coverage):
+            full = issue_repo_full_name(item)
+            if full and item.get("number"):
+                names.add(full)
+                pr_hits.setdefault((full, int(item["number"])), (account_login, item))
+    return names
+
+
 async def _add_manual_includes(
     clients: dict[str, GitHubClient],
     config: AppConfig,
@@ -248,6 +272,12 @@ async def collect(config: AppConfig) -> CollectedData:
                 request_timeout=config.request_timeout,
                 coverage=coverage,
             )
+        # Accounts sharing a token (e.g. several logins using one sign-in
+        # token) see the same repositories: list and search with it once.
+        readers: dict[str, GitHubClient] = {}
+        for account in config.accounts:
+            if not any(clients[login].token == account.token for login in readers):
+                readers[account.login] = clients[account.login]
 
         # --- validate tokens + discover repositories/orgs -----------------
         repos: dict[str, RepoRecord] = {}
@@ -265,6 +295,9 @@ async def collect(config: AppConfig) -> CollectedData:
                     f"Only what '{actual}' can access was scanned for {account.login}'s work."
                 )
             _warn_about_token(client, account, scopes, coverage)
+            if account.login not in readers:
+                log.info("[%s] shares another account's token; its repositories are listed once.", account.login)
+                continue
 
             log.info("[%s] authenticated, discovering repositories…", account.login)
             # One account's discovery failure must never abort the whole run.
@@ -288,26 +321,43 @@ async def collect(config: AppConfig) -> CollectedData:
                     "repositories it would have listed may be missing."
                 )
 
-        await _add_manual_includes(clients, config, repos, member_orgs, coverage)
+        await _add_manual_includes(readers, config, repos, member_orgs, coverage)
 
         # --- search: upstream projects with commits or pull requests ---------
+        use_graphql = config.use_graphql
         pr_hits: dict[tuple[str, int], tuple[str, dict]] = {}
         if config.use_search_discovery:
-            for account in config.accounts:
-                client = clients[account.login]
+            for login, client in readers.items():
                 names = await discover_repos_via_search(
                     client, config.target_logins, config.author_emails, start, end, coverage
                 )
-                if config.collect_prs:
-                    # Pull requests opened before the period can still hold
-                    # commits authored inside it, so only the end is bounded.
-                    for login in config.target_logins:
-                        for item in await search_pull_requests(client, login, SEARCH_START, end, coverage):
-                            full = issue_repo_full_name(item)
-                            if full and item.get("number"):
-                                names.add(full)
-                                pr_hits.setdefault((full, int(item["number"])), (account.login, item))
-                await _add_found_repos(client, account.login, names, repos, coverage)
+                if config.collect_prs and not use_graphql:
+                    names |= await _search_prs(client, login, config, end, coverage, pr_hits)
+                await _add_found_repos(client, login, names, repos, coverage)
+
+        # --- pull requests through GraphQL: each user's own list ------------
+        # It covers private repositories and upstream projects alike, so it
+        # replaces both listing every repository's pull requests and the
+        # pull-request search (used again below if GraphQL fails).
+        graph_prs: graphql.PullRequestData | None = None
+        if config.collect_prs and use_graphql:
+            graph_prs = await graphql.collect_pull_requests(
+                readers, config.target_logins, inflight=config.concurrency
+            )
+            if graph_prs is None:
+                log.info("Pull requests could not be listed through GraphQL; using the REST API.")
+                if config.use_search_discovery:
+                    for login, client in readers.items():
+                        names = await _search_prs(client, login, config, end, coverage, pr_hits)
+                        await _add_found_repos(client, login, names, repos, coverage)
+            else:
+                for full, found in graph_prs.repos.items():
+                    known = repos.get(full)
+                    if known is not None:
+                        known.discovered_via |= found.discovered_via
+                    elif config.use_search_discovery:
+                        merge_repositories(repos, [found])
+                        log.info("pull requests discovered new repo %s", full)
 
         repo_list = list(repos.values())
         scan_repos = [r for r in repo_list if not (config.skip_forks and r.is_fork)]
@@ -324,6 +374,25 @@ async def collect(config: AppConfig) -> CollectedData:
         # --- commits ------------------------------------------------------
         commits: list[CommitRecord] = []
         if config.collect_commits and scan_repos:
+            rest_repos = scan_repos
+            if use_graphql:
+                found = await graphql.collect_commits(
+                    scan_repos,
+                    client_for,
+                    config.target_logins,
+                    config.author_emails,
+                    scan_all_branches=config.scan_all_branches,
+                    inflight=config.concurrency,
+                )
+                if found is None:
+                    log.info("Commits could not be read through GraphQL; using the REST API.")
+                else:
+                    commits, rest_repos = found
+                    if rest_repos:
+                        log.info(
+                            "%d repo(s) could not be read through GraphQL; using the REST API for them.",
+                            len(rest_repos),
+                        )
             coros = [
                 _guard(
                     collect_commits_for_repo(
@@ -337,7 +406,7 @@ async def collect(config: AppConfig) -> CollectedData:
                     repo.full_name,
                     coverage,
                 )
-                for repo in scan_repos
+                for repo in rest_repos
             ]
             for batch in await _gather_with_progress(coros, "Commits"):
                 commits.extend(batch)
@@ -346,7 +415,9 @@ async def collect(config: AppConfig) -> CollectedData:
 
         # --- pull requests ------------------------------------------------
         prs: list[PullRequestRecord] = []
-        if config.collect_prs and scan_repos:
+        if config.collect_prs and scan_repos and graph_prs is not None:
+            prs = [pr for pr in graph_prs.prs if pr.full_name in scan_by_name]
+        elif config.collect_prs and scan_repos:
             listed = [r for r in scan_repos if r.affiliated]
             listed_names = {r.full_name for r in listed}
             coros: list[Awaitable[list]] = [
@@ -388,9 +459,14 @@ async def collect(config: AppConfig) -> CollectedData:
 
             async def recover(pr: PullRequestRecord) -> list[CommitRecord]:
                 repo = scan_by_name[pr.full_name]
-                shas, records = await collect_pr_commits(
-                    client_for(repo), repo, pr, config.target_logins, config.author_emails, coverage
-                )
+                if graph_prs is not None and (pr.full_name, pr.number) not in graph_prs.incomplete:
+                    shas, records = graph_prs.commits_of(
+                        pr, repo, config.target_logins, config.author_emails, coverage
+                    )
+                else:
+                    shas, records = await collect_pr_commits(
+                        client_for(repo), repo, pr, config.target_logins, config.author_emails, coverage
+                    )
                 pr.commit_shas = shas
                 return records
 
@@ -416,27 +492,30 @@ async def collect(config: AppConfig) -> CollectedData:
                 repo.full_name: client_for(repo) for repo in repo_list
             }
             wanted_shas = len({c.sha for c in in_period if not c.is_merge})
-            log.info(
-                "Fetching line stats for %d commit(s) (%d extra API request(s)) — "
-                "use --no-commit-stats to skip.",
-                wanted_shas, wanted_shas,
-            )
-            await enrich_commits_with_stats(
-                repo_client,
-                in_period,
-                coverage,
-                gather=lambda coros: _gather_with_progress(coros, "Line stats"),
-            )
+            log.info("Fetching line stats for %d commit(s) — use --no-commit-stats to skip.", wanted_shas)
+            if use_graphql:
+                await graphql.enrich_commits_with_stats(
+                    repo_client, in_period, coverage, inflight=config.concurrency
+                )
+            else:
+                await enrich_commits_with_stats(
+                    repo_client,
+                    in_period,
+                    coverage,
+                    gather=lambda coros: _gather_with_progress(coros, "Line stats"),
+                )
 
         organizations = aggregate_organizations(
             repo_list, commits, prs, list(member_orgs.values())
         )
 
         total_requests = sum(c.request_count for c in clients.values())
+        graphql_queries = sum(c.graphql_count for c in clients.values())
         total_waits = sum(c.rate_limit_waits for c in clients.values())
         log.info(
-            "Finished collection: %d API requests, %d rate-limit wait(s).",
+            "Finished collection: %d API requests (%d GraphQL), %d rate-limit wait(s).",
             total_requests,
+            graphql_queries,
             total_waits,
         )
 
@@ -452,7 +531,9 @@ async def collect(config: AppConfig) -> CollectedData:
         "since": config.since.isoformat() if config.since else None,
         "until": config.until.isoformat() if config.until else None,
         "timezone": config.timezone_name,
+        "api": "graphql" if use_graphql else "rest",
         "api_requests": total_requests,
+        "graphql_queries": graphql_queries,
     }
     return CollectedData(
         repos=repo_list,
@@ -467,14 +548,15 @@ async def collect(config: AppConfig) -> CollectedData:
 def _make_client_selector(
     clients: dict[str, GitHubClient],
 ) -> Callable[[RepoRecord], GitHubClient]:
+    """The token to read a repository with: one of those that can see it,
+    spread evenly (and deterministically) so each token's budget is shared."""
     fallback = next(iter(clients.values()))
 
     def selector(repo: RepoRecord) -> GitHubClient:
-        for login in sorted(repo.discovered_via):
-            client = clients.get(login)
-            if client is not None:
-                return client
-        return fallback
+        usable = [clients[login] for login in sorted(repo.discovered_via) if login in clients]
+        if not usable:
+            return fallback
+        return usable[zlib.crc32(repo.full_name.encode("utf-8")) % len(usable)]
 
     return selector
 

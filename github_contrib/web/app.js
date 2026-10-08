@@ -58,7 +58,26 @@ const ICONS = {
   check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
   alert:
     '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/>',
 };
+// The GitHub mark is a filled 16x16 shape, unlike the stroked icons above.
+const GITHUB_MARK =
+  '<path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 ' +
+  "0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82" +
+  "-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 " +
+  "2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38" +
+  ".01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 " +
+  '3.58-8 8-8Z"/>';
+
+// ?auth_error=<code> after a failed sign-in -> what the page says.
+const AUTH_ERRORS = {
+  denied: "Sign-in was cancelled on GitHub. Sign in again whenever you're ready.",
+  state: "That sign-in attempt expired or was started in another tab. Please try again.",
+  exchange: "GitHub couldn't confirm the sign-in. Please try again.",
+  user: "GitHub couldn't confirm the sign-in. Please try again.",
+};
+const AUTH_ERROR_DEFAULT = "Sign-in didn't work. Please try again.";
 
 const STATUS_LABELS = {
   queued: "Queued",
@@ -72,12 +91,15 @@ const state = {
   config: {
     version: "",
     mode: "local",
+    auth: false,
     retention_hours: 0,
     env_logins: [],
     has_default_token: false,
     pdf_browser: true,
     output_dir: "",
   },
+  me: { signed_in: false }, // GitHub sign-in mode: who is signed in
+  signedOut: false, // the sign-in card is showing: no polling, no form
   jobs: [],
   cards: new Map(), // job id -> { el, body, log, html }
   logs: new Map(), // job id -> { next, busy } for open log panels
@@ -96,6 +118,8 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ESCAPES[c]
 const splitList = (text) => text.split(/[\s,]+/).filter(Boolean);
 const envSuffix = (login) => login.replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
 const isPublic = () => state.config.mode === "public";
+const isAuth = () => state.config.auth === true;
+const signedIn = () => isAuth() && state.me.signed_in === true;
 
 function debounce(fn, ms) {
   let timer = 0;
@@ -130,6 +154,9 @@ function storageRemove(key) {
 }
 
 function icon(name) {
+  if (name === "github") {
+    return `<svg class="icon icon-fill" viewBox="0 0 16 16" aria-hidden="true" focusable="false">${GITHUB_MARK}</svg>`;
+  }
   return `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICONS[name]}</svg>`;
 }
 
@@ -145,7 +172,13 @@ async function api(path, { method = "GET", body } = {}) {
   }
   const response = await fetch(path, init);
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    // The GitHub session ended (expired, or signed out in another tab).
+    if (response.status === 401 && isAuth()) showSignedOut("Your session has ended. Sign in again to continue.");
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -317,6 +350,10 @@ function envTokenName(login) {
   return state.config.has_default_token ? "GITHUB_TOKEN" : null;
 }
 
+// Whether a row may leave its token blank: signed in with GitHub, or (locally)
+// .env has a token for it.
+const blankTokenOk = (login) => signedIn() || Boolean(envTokenName(login));
+
 function readAccounts() {
   return $$("#accounts .account").map((row) => ({
     row,
@@ -336,6 +373,7 @@ function addAccount({ login = "", emails = "", token = "" } = {}) {
     $(`label[data-for="${input.name}"]`, row).htmlFor = input.id;
   }
   const inputs = { login: $("[name=login]", row), token: $("[name=token]", row), emails: $("[name=emails]", row) };
+  if (signedIn()) $('label[data-for="token"]', row).textContent = "Access token (optional)";
   inputs.login.value = login;
   inputs.token.value = token;
   inputs.emails.value = emails;
@@ -390,6 +428,18 @@ function updateTokenHint(row) {
     hint.classList.add("hint-warning");
     hint.innerHTML = `${icon("alert")}<span>Fine-grained tokens can't see repos owned by other accounts or ` +
       `organizations. Use a classic token (ghp_…) with <b>repo</b> and <b>read:org</b>.</span>`;
+  } else if (!token && signedIn()) {
+    const login = loginOf(row);
+    if (!login || login.toLowerCase() === state.me.login.toLowerCase()) {
+      hint.classList.add("hint-success");
+      hint.innerHTML = `${icon("check")}<span>Leave blank to use your GitHub sign-in.</span>`;
+    } else {
+      // Another account: the sign-in token only sees what the signed-in user can.
+      hint.classList.add("hint-warning");
+      hint.innerHTML = `${icon("alert")}<span>Blank uses your sign-in, so only repos <b>@${esc(state.me.login)}</b> ` +
+        `can see are scanned. To include <b>@${esc(login)}</b>'s private repos, paste a ` +
+        `<a href="${NEW_TOKEN_URL}" target="_blank" rel="noopener noreferrer">classic token</a> from that account.</span>`;
+    }
   } else if (!token && envName) {
     hint.classList.add("hint-success");
     hint.innerHTML = `${icon("check")}<span>Leave blank to use <code>${esc(envName)}</code> from .env.</span>`;
@@ -462,7 +512,8 @@ function restoreForm() {
   } catch {
     saved = null;
   }
-  addAccount();
+  // Signed in: the first row starts as the signed-in account.
+  addAccount(signedIn() ? { login: state.me.login } : {});
   if (saved && typeof saved === "object") {
     applyOptions(saved.options);
     setMode(saved.mode);
@@ -507,7 +558,7 @@ function validate(accounts) {
     } else if (seen.has(key)) problems.push([account.row, "login", "This account is already listed."]);
     else if (account.token && !TOKEN_RE.test(account.token)) {
       problems.push([account.row, "token", "That doesn't look like a GitHub token."]);
-    } else if (!account.token && !envTokenName(account.login)) {
+    } else if (!account.token && !blankTokenOk(account.login)) {
       const message = isPublic()
         ? "Paste a personal access token for this account."
         : "Paste a token. There's none for this account in .env.";
@@ -617,7 +668,7 @@ function runAgain(job) {
   saveFormSoon();
   window.scrollTo({ top: 0, behavior: "smooth" });
   const needsToken = $$("#accounts .account").find(
-    (row) => !$("[name=token]", row).value && !envTokenName(loginOf(row)),
+    (row) => !$("[name=token]", row).value && !blankTokenOk(loginOf(row)),
   );
   (needsToken ? $("[name=token]", needsToken) : $("#submit")).focus({ preventScroll: true });
 }
@@ -640,12 +691,21 @@ document.addEventListener("error", (event) => {
   if (event.target instanceof HTMLImageElement && event.target.closest(".avatar")) event.target.hidden = true;
 }, true);
 
-function statusChip(status) {
+function statusChip(status, expired = false) {
   const lead = status === "running" ? '<span class="spinner"></span>'
     : status === "done" ? icon("check")
     : status === "failed" ? icon("alert")
     : "";
-  return `<span class="chip chip-${esc(status)}">${lead}${esc(STATUS_LABELS[status] || status)}</span>`;
+  // An expired report finished fine but has nothing left to download.
+  const label = expired && status === "done" ? "Done" : STATUS_LABELS[status] || status;
+  return `<span class="chip chip-${esc(status)}">${lead}${esc(label)}</span>`;
+}
+
+function expiredHTML(job) {
+  const text = job.status === "done"
+    ? "The files for this report have expired. Run it again for a fresh copy."
+    : "The details of this run have expired.";
+  return `<p class="report-text expired-note">${icon("clock")}<span>${text}</span></p>`;
 }
 
 function runningHTML(job) {
@@ -687,6 +747,7 @@ function doneHTML(job) {
 }
 
 function statusHTML(job) {
+  if (job.expired) return expiredHTML(job);
   switch (job.status) {
     case "queued":
       return '<p class="report-text muted">Waiting for the reports ahead of it to finish.</p>';
@@ -713,7 +774,7 @@ function actionsHTML(job, logOpen) {
   // Finished reports get a row of main actions; files and tools sit below it.
   let primary = "";
   const links = [];
-  if (job.status === "done") {
+  if (job.status === "done" && !job.expired) {
     const main = [];
     if (files.pdf) {
       main.push(`<a class="btn btn-primary btn-sm" href="${esc(files.pdf)}" download>${icon("download")}Download PDF</a>`);
@@ -733,11 +794,12 @@ function actionsHTML(job, logOpen) {
     }
   }
   const logLabel = logOpen ? "Hide log" : "Show log";
-  const tools = [
+  // An expired history entry has no log or files: only "Run again" and delete.
+  const tools = job.expired ? [] : [
     `<button type="button" class="icon-btn action" data-action="log" aria-expanded="${logOpen}" ` +
       `aria-label="${logLabel}" title="${logLabel}">${icon("log")}</button>`,
   ];
-  if (ACTIVE.has(job.status)) {
+  if (ACTIVE.has(job.status) && !job.expired) {
     tools.push(`<button type="button" class="icon-btn action action-danger" data-action="cancel" ` +
       `aria-label="Cancel" title="Cancel">${icon("stop")}</button>`);
   } else {
@@ -762,7 +824,7 @@ function cardBody(job) {
   return `<div class="report-head">` +
       `<span class="report-name" title="${esc(names)}">${esc(names)}</span>` +
       `<span class="report-meta">· <time datetime="${esc(job.created_at)}" title="${esc(fullDate(job.created_at))}">` +
-      `${esc(relativeTime(job.created_at))}</time></span>${statusChip(job.status)}</div>` +
+      `${esc(relativeTime(job.created_at))}</time></span>${statusChip(job.status, job.expired)}</div>` +
     `<p class="report-sub report-period">${esc(range)}${esc(combined)}${shared}</p>` +
     statusHTML(job) + warningsHTML(job) + actionsHTML(job, state.logs.has(job.id));
 }
@@ -785,6 +847,7 @@ function renderCard(card, job) {
     card.status = job.status;
   }
   card.el.dataset.status = job.status;
+  card.el.classList.toggle("report-expired", Boolean(job.expired));
   const html = cardBody(job);
   if (html === card.html) return;
   const focused = card.body.contains(document.activeElement) ? document.activeElement.dataset.action : null;
@@ -1151,8 +1214,10 @@ function schedulePoll(ms) {
 }
 
 async function refresh() {
+  if (state.signedOut) return;
   try {
     const { jobs } = await api("/api/jobs");
+    if (state.signedOut) return;
     setJobs(jobs);
     const pulls = [];
     for (const [id, entry] of state.logs) {
@@ -1163,7 +1228,65 @@ async function refresh() {
   } catch {
     // The server may be restarting; keep trying on the normal schedule.
   }
+  if (state.signedOut) return; // a 401 switched to the sign-in card
   schedulePoll(state.jobs.some((job) => ACTIVE.has(job.status)) ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+}
+
+// ---------- GitHub sign-in ----------
+
+// Reads ?auth_error= (set by a failed sign-in) and removes it from the address bar.
+function takeAuthError() {
+  const params = new URLSearchParams(location.search);
+  if (!params.has("auth_error")) return "";
+  const code = params.get("auth_error");
+  params.delete("auth_error");
+  const query = params.toString();
+  history.replaceState(history.state, "", `${location.pathname}${query ? `?${query}` : ""}${location.hash}`);
+  return AUTH_ERRORS[code] || AUTH_ERROR_DEFAULT;
+}
+
+function showSignedIn() {
+  const me = state.me;
+  state.signedOut = false;
+  const avatar = $("#me-avatar");
+  avatar.dataset.initial = me.login.charAt(0).toUpperCase();
+  avatar.innerHTML = me.avatar_url ? `<img src="${esc(me.avatar_url)}" alt="">` : "";
+  $("#me-login").textContent = me.login;
+  $("#me").hidden = false;
+  $("#signin").hidden = true;
+  $("#workspace").hidden = false;
+}
+
+// The sign-in card replaces the form and the history. Typed tokens are dropped.
+function showSignedOut(message = "") {
+  state.me = { signed_in: false };
+  state.signedOut = true;
+  clearTimeout(state.pollTimer);
+  for (const dialog of $$("dialog.sheet")) if (dialog.open) dialog.close();
+  $("#accounts").replaceChildren();
+  state.jobs = [];
+  state.logs.clear();
+  renderFeed();
+  $("#workspace").hidden = true;
+  $("#me").hidden = true;
+  $("#signin").hidden = false;
+  const box = $("#signin-error");
+  box.hidden = !message;
+  box.innerHTML = message ? `${icon("alert")}<span>${esc(message)}</span>` : "";
+}
+
+async function signOut() {
+  const button = $("#sign-out");
+  button.disabled = true;
+  try {
+    await api("/auth/logout", { method: "POST", body: {} });
+    showSignedOut();
+    toast("Signed out");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // ---------- start ----------
@@ -1171,7 +1294,14 @@ async function refresh() {
 function applyMode() {
   const hours = Number(state.config.retention_hours) || 0;
   const kept = hours ? ` Reports are deleted ${hours} hours after they finish.` : "";
-  if (isPublic()) {
+  const version = state.config.version ? ` · v${state.config.version}` : "";
+  if (isAuth()) {
+    $("#intro-text").textContent =
+      "Add the GitHub accounts to report on. Leave a token blank to use your GitHub sign-in." + kept;
+    $("#privacy-text").textContent = "Private to your GitHub account";
+    const files = hours ? ` Files are deleted ${hours} hours after a report finishes; the history stays.` : "";
+    $("#sidebar-footer").textContent = `Only you can see your reports, from any device.${files}${version}`;
+  } else if (isPublic()) {
     $("#intro-text").textContent =
       "Add the GitHub accounts to report on. Your token is used for this run only and is never stored." + kept;
     $("#privacy-text").textContent = "Private to this browser";
@@ -1194,10 +1324,26 @@ async function init() {
   } catch (error) {
     showFormError(`Couldn't reach the report server: ${error.message}`);
   }
+  const authError = takeAuthError();
+  if (isAuth()) {
+    try {
+      state.me = { signed_in: false, ...(await api("/api/me")) };
+    } catch {
+      state.me = { signed_in: false };
+    }
+  }
   applyMode();
   const max = ymd(today());
   $("#period-from").max = max;
   $("#period-to").max = max;
+  $("#sign-out").addEventListener("click", signOut);
+  if (isAuth() && !signedIn()) {
+    showSignedOut(authError);
+    return; // signing in reloads the page
+  }
+  if (signedIn()) showSignedIn();
+  else $("#workspace").hidden = false;
+  if (authError && signedIn()) toast(authError);
   restoreForm();
 
   const composer = $("#composer");

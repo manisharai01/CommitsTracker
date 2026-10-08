@@ -211,9 +211,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-commit-stats",
         action="store_true",
+        help="Skip fetching per-commit line stats (additions/deletions/files changed).",
+    )
+    parser.add_argument(
+        "--rest-api",
+        action="store_true",
         help=(
-            "Skip fetching per-commit line stats (additions/deletions/files changed). "
-            "Saves one API request per commit — useful when rate-limited or for quick runs."
+            "Collect with the REST API only (the previous engine). Much slower: it "
+            "needs thousands of requests for an active account and usually waits "
+            "for GitHub's hourly limit. By default the GraphQL API is used, with "
+            "REST as the fallback for anything it cannot read."
         ),
     )
     parser.add_argument(
@@ -350,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 exclude_own_repos=args.exclude_own_repos,
                 exclude_owners=args.exclude_owner,
                 fetch_commit_stats=not args.no_commit_stats,
+                use_graphql=not args.rest_api,
                 since=args.since,
                 until=args.until,
                 timezone_name=args.timezone,

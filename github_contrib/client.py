@@ -41,6 +41,10 @@ class GitHubError(RuntimeError):
         self.status = status
 
 
+class GraphQLQueryError(GitHubError):
+    """A GraphQL query that failed as a whole (often: it took too long)."""
+
+
 @dataclass
 class GitHubClient:
     """A thin async wrapper around a single authenticated GitHub session."""
@@ -57,6 +61,7 @@ class GitHubClient:
     coverage: Coverage | None = None
     # Telemetry / discovered metadata
     request_count: int = field(default=0, init=False)
+    graphql_count: int = field(default=0, init=False)
     rate_limit_waits: int = field(default=0, init=False)
     scopes: str | None = field(default=None, init=False)
 
@@ -139,16 +144,22 @@ class GitHubClient:
         *,
         params: dict[str, Any] | None = None,
         accept: str = "application/vnd.github+json",
+        json_body: Any = None,
+        retries: int | None = None,
     ) -> tuple[Any, aiohttp.typedefs.CIMultiDictProxy[str] | None, int]:
         """Perform a single API request with retries and rate-limit handling.
 
         Returns ``(data, headers, status)``.  For "empty" statuses (404/409/451)
         and for genuine permission 403s, ``data`` is ``None`` and no exception is
         raised.  Sleeps (rate-limit and backoff) happen *outside* the concurrency
-        semaphore so a waiting request never occupies a slot.
+        semaphore so a waiting request never occupies a slot. ``retries`` caps
+        the retries of server errors and network failures for this call (a
+        GraphQL query that timed out is better split than repeated).
         """
         url = self._full_url(path)
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        max_retries = self.max_retries if retries is None else retries
+        send_json = {} if json_body is None else {"json": json_body}
         attempt = 0
 
         while True:
@@ -164,6 +175,7 @@ class GitHubClient:
                         params=params,
                         headers=self._headers(accept),
                         timeout=timeout,
+                        **send_json,
                     ) as response:
                         status = response.status
 
@@ -220,7 +232,7 @@ class GitHubClient:
                             )
 
                         elif status in _RETRY_STATUSES:
-                            if attempt > self.max_retries:
+                            if attempt > max_retries:
                                 body = await _safe_text(response)
                                 raise GitHubError(
                                     f"GitHub API error {status} for {url}: {body[:200]}",
@@ -236,13 +248,13 @@ class GitHubClient:
                             )
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt > self.max_retries:
+                if attempt > max_retries:
                     raise GitHubError(f"Network error for {url}: {exc}") from exc
                 log.debug(
                     "Transient error on %s (attempt %d/%d): %s",
                     url,
                     attempt,
-                    self.max_retries,
+                    max_retries,
                     exc,
                 )
                 sleep_seconds = self._backoff_delay(attempt)
@@ -363,6 +375,43 @@ class GitHubClient:
                 break  # page 11 would be refused (422)
             next_url = self._parse_next_link(headers.get("Link") if headers else None)
         return items, total, incomplete
+
+    async def graphql(self, query: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Run one GraphQL query; returns ``(data, errors)``.
+
+        ``errors`` lists the parts of the query GitHub could not resolve (each
+        error's ``path`` starts with the alias it belongs to); the rest of
+        ``data`` is still valid. Raises :class:`GraphQLQueryError` when the
+        query as a whole failed — typically GitHub's 10-second limit, so the
+        caller can split it — and waits out GraphQL rate limits, which arrive
+        as errors in a 200 response.
+        """
+        for attempt in range(1, self.max_retries + 2):
+            data, headers, status = await self.request(
+                "POST", "/graphql", json_body={"query": query}, retries=0
+            )
+            self.graphql_count += 1
+            if not isinstance(data, dict):
+                raise GraphQLQueryError(f"GraphQL request failed (status {status})", status=status)
+            errors = [e for e in data.get("errors") or [] if isinstance(e, dict)]
+            if any(e.get("type") == "RATE_LIMITED" for e in errors):
+                if attempt > self.max_retries:
+                    raise GitHubError("GraphQL rate limit exceeded and out of retries.", status=403)
+                wait = self._rate_limit_wait(headers) if headers is not None else None
+                self.rate_limit_waits += 1
+                sleep_seconds = min((wait if wait is not None else self._backoff_delay(attempt)) + 1.0, 3600.0)
+                log.warning(
+                    "[%s] GraphQL rate limited; sleeping %.0fs before retry %d/%d.",
+                    self.login or "client", sleep_seconds, attempt, self.max_retries,
+                )
+                await asyncio.sleep(sleep_seconds)
+                continue
+            payload = data.get("data")
+            if not isinstance(payload, dict):
+                message = _one_line(json.dumps(errors[0])) if errors else "no data"
+                raise GraphQLQueryError(f"GraphQL query failed: {message}", status=status)
+            return payload, errors
+        raise GitHubError("GraphQL query could not be completed.")  # pragma: no cover
 
     async def get_authenticated_login(self) -> str:
         """Return the login of the account the token belongs to."""

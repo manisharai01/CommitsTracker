@@ -11,6 +11,10 @@ the time range, and download the finished report. It runs in one of two modes:
   its own reports, tokens must be typed in (``.env`` is never read), runs are
   limited per user and per address, and reports are deleted after
   ``--retention-hours``.
+* **Public with GitHub sign-in** — public mode plus ``GITHUB_CLIENT_ID`` /
+  ``GITHUB_CLIENT_SECRET`` / ``SESSION_SECRET``: people sign in with GitHub
+  (see :mod:`.auth`), a blank token uses their sign-in, and their report
+  history follows their account across browsers (see :mod:`.store`).
 
 Each submitted form becomes a *job* that runs ``github_report.py --pdf`` in a
 subprocess:
@@ -39,16 +43,18 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Awaitable, Callable, Mapping
 from urllib.parse import urlsplit
 
 from aiohttp import web
 
 from . import __version__
+from . import auth as gh_auth
 from .config import (
     NO_DOTENV_ENV,
     ConfigError,
@@ -61,6 +67,7 @@ from .htmlreport import REPORT_CSP
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
 from .pdfexport import find_browser
+from .store import ReportRow, Store, make_store
 
 log = get_logger("webapp")
 
@@ -120,6 +127,9 @@ CHILD_ENV_ALLOWLIST = frozenset(
         "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
         "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "FONTCONFIG_PATH",
+        "FONTCONFIG_FILE",
+        # Chromium in a container needs --no-sandbox (see pdfexport.export_pdf).
+        "PDF_NO_SANDBOX",
     )
 )
 
@@ -129,6 +139,7 @@ MAX_ACCOUNTS = 20
 MAX_LOG_LINES = 5000
 MAX_WARNINGS = 10
 SESSION_MAX_AGE = 30 * 24 * 3600
+HISTORY_CACHE_SECONDS = 20.0
 
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -147,6 +158,7 @@ _LOG_LINE_RE = re.compile(
 
 #: Progress-bar labels (see report._gather_with_progress) -> phase shown in the UI.
 _PROGRESS_PHASES: dict[str, str] = {
+    "Branches": "Listing branches",
     "Commits": "Collecting commits",
     "Pull requests": "Collecting pull requests",
     "PR commits": "Reading pull-request commits",
@@ -194,14 +206,38 @@ class Settings:
     retention_hours: float = 0.0  # 0 = keep reports until deleted
     max_active_per_user: int = 5
     max_queue: int = 100
-    max_jobs_per_hour: int = 0  # per client address; 0 = unlimited
+    max_jobs_per_hour: int = 0  # per client address (per account when signed in); 0 = unlimited
     trust_proxy: bool = False  # take the client address from X-Forwarded-For
     python: str = sys.executable
     script: Path = CLI_SCRIPT
+    # GitHub sign-in (public mode only): an OAuth App's credentials, the secret
+    # that encrypts session cookies, and the report-history database.
+    github_client_id: str = ""
+    github_client_secret: str = field(default="", repr=False)
+    session_secret: str = field(default="", repr=False)
+    oauth_scopes: str = gh_auth.DEFAULT_SCOPES
+    database_url: str = field(default="", repr=False)
 
     @property
     def public(self) -> bool:
         return bool(self.public_url)
+
+    @property
+    def auth(self) -> bool:
+        """Sign in with GitHub: public mode with an OAuth App configured."""
+        return self.public and bool(self.github_client_id and self.github_client_secret)
+
+    @property
+    def auth_cookie(self) -> str:
+        return "__Host-ct_auth" if self.secure else "ct_auth"
+
+    @property
+    def state_cookie(self) -> str:
+        return "__Host-ct_oauth_state" if self.secure else "ct_oauth_state"
+
+    @property
+    def redirect_uri(self) -> str:
+        return f"{self.public_url}/auth/callback"
 
     @property
     def public_origin(self) -> str:
@@ -347,13 +383,19 @@ def _parse_period(raw: object) -> tuple[str, str, str]:
 
 
 def parse_job_request(
-    payload: object, env: Mapping[str, str], *, require_tokens: bool = False
+    payload: object,
+    env: Mapping[str, str],
+    *,
+    require_tokens: bool = False,
+    default_token: str = "",
 ) -> JobRequest:
     """Validate a form submission.
 
     ``env`` is what the CLI child will see (see :func:`effective_env`): an
     account may leave its token blank when ``env`` already holds one — unless
     ``require_tokens`` (public mode), where every account brings its own.
+    ``default_token`` (the signed-in user's GitHub token) fills every blank
+    token instead, whatever login the row names.
     """
     if not isinstance(payload, dict):
         raise RequestError("The request must be a JSON object.")
@@ -377,6 +419,8 @@ def parse_job_request(
         token = str(raw.get("token") or "").strip()
         if token and not _TOKEN_RE.match(token):
             raise RequestError(f"The token for {login} doesn't look like a GitHub token.")
+        if not token and default_token:
+            token = default_token
         if not token and require_tokens:
             raise RequestError(f"Enter a personal access token for {login}.")
         if not token and not has_env_token(login, env):
@@ -563,6 +607,47 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+#: Owner of the jobs of a signed-in GitHub user (anonymous sessions use a sha256).
+OWNER_PREFIX = "gh:"
+
+
+def _owner_uid(owner: str) -> int | None:
+    if owner.startswith(OWNER_PREFIX) and owner[len(OWNER_PREFIX):].isdigit():
+        return int(owner[len(OWNER_PREFIX):])
+    return None
+
+
+def _split_period(period: str) -> tuple[str, str]:
+    since, _, until = period.partition("..")
+    since, until = since.strip(), until.strip()
+    return (since if _DATE_RE.match(since) else "", until if _DATE_RE.match(until) else "")
+
+
+def expired_report_json(row: ReportRow, login: str) -> dict:
+    """A history row whose files are gone, shaped like a job for the page."""
+    since, until = _split_period(row.period)
+    status = row.status if row.status not in ACTIVE_STATUSES else "failed"  # its run died elsewhere
+    created = row.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return {
+        "id": row.id,
+        "status": status,
+        "created_at": created.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+        "finished_at": "",
+        "options": {"since": since, "until": until, "timezone": "UTC"},
+        "accounts": [{"login": login, "emails": []}],
+        "logins": [login],
+        "files": {},
+        "summary": {},
+        "warnings": [],
+        "error": "",
+        "share_url": "",
+        "log_count": 0,
+        "expired": True,
+    }
+
+
 @dataclass(eq=False)
 class Job:
     """One report run, from queued to finished."""
@@ -593,10 +678,29 @@ class Job:
     redactions: list[tuple[str, str]] = field(default_factory=list)
     # Secret part of the read-only link the owner shared ("" = not shared).
     share_token: str = ""
+    # Report-history row (GitHub sign-in mode): what was last written, and
+    # whether the owner deleted the report (the row must go too).
+    db_added: bool = False
+    db_status: str = ""
+    forgotten: bool = False
+    db_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def logins(self) -> list[str]:
         return [a["login"] for a in self.accounts]
+
+    @property
+    def user_id(self) -> int | None:
+        """The GitHub user id of a signed-in owner ("gh:<id>"), else ``None``."""
+        return _owner_uid(self.owner)
+
+    @property
+    def period(self) -> str:
+        """The time range as stored in the history: "<since>..<until>"."""
+        return f"{self.options.get('since') or ''}..{self.options.get('until') or ''}"
+
+    def uses_token(self, token: str) -> bool:
+        return self.request is not None and any(a.token == token for a in self.request.accounts)
 
     @property
     def active(self) -> bool:
@@ -662,6 +766,8 @@ class Job:
         )
         token = str(data.get("share_token") or "")
         job.share_token = token if _SHARE_RE.match(token) else ""
+        # Its history row was written by the server that ran it.
+        job.db_added, job.db_status = job.user_id is not None, job.status
         if job.active:  # the server stopped mid-run
             job.status = "failed"
             job.error = job.error or "The server stopped before this report finished."
@@ -723,13 +829,21 @@ class Job:
 class JobManager:
     """Owns every job: admits and queues them, runs them, keeps history."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, store: Store | None = None) -> None:
         self.settings = settings
+        #: Report history (GitHub sign-in mode only); ``None`` otherwise.
+        self.store = store
         self.jobs_dir = Path(settings.jobs_dir).resolve()
         self.jobs: dict[str, Job] = {}
         self._slots = asyncio.Semaphore(max(1, settings.parallel))
         self._tasks: set[asyncio.Task] = set()
         self._recent: dict[str, collections.deque[float]] = {}
+        #: Report ids deleted while this server runs (never listed again, even
+        #: if deleting the history row failed).
+        self.forgotten: set[str] = set()
+        # user id -> (fetched at, rows): the page polls every second or so
+        # while a report runs; the history only changes on delete or expiry.
+        self._history_cache: dict[int, tuple[float, list[ReportRow]]] = {}
 
     # -- visibility & admission -------------------------------------------
 
@@ -754,13 +868,18 @@ class JobManager:
                 429,
             )
         if self.settings.max_jobs_per_hour:
-            window = self._recent.setdefault(client, collections.deque())
+            window = self._recent.setdefault(self._rate_key(owner, client), collections.deque())
             cutoff = time.monotonic() - 3600
             while window and window[0] < cutoff:
                 window.popleft()
             if len(window) >= self.settings.max_jobs_per_hour:
-                return "Too many reports from this address in the last hour. Try again later.", 429
+                who = "you" if self.settings.auth else "this address"
+                return f"Too many reports from {who} in the last hour. Try again later.", 429
         return None
+
+    def _rate_key(self, owner: str, client: str) -> str:
+        """Hourly limits count per account when signed in, else per client address."""
+        return owner if self.settings.auth else client
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -781,11 +900,25 @@ class JobManager:
             out_dir, self.jobs_dir, PROJECT_ROOT, Path(sys.prefix), Path(sys.base_prefix), Path.home()
         )
 
-    def submit(self, request: JobRequest, *, owner: str = "", client: str = "") -> Job:
-        names = "+".join(request.logins[:3])
-        job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{names}-{secrets.token_hex(8)}"
+    def submit(
+        self,
+        request: JobRequest,
+        *,
+        owner: str = "",
+        client: str = "",
+        hide: tuple[str, ...] = (),
+    ) -> Job:
+        """Queue a run. ``hide`` lists extra values to hide from everything
+        shown (the signed-in user's token, even when every row typed its own)."""
+        if self.store is not None:
+            # The history row's id: a uuid, with no login in it.
+            job_id = str(uuid.uuid4())
+        else:
+            names = "+".join(request.logins[:3])
+            job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{names}-{secrets.token_hex(8)}"
         out_dir = self.jobs_dir / job_id
-        secrets_ = [(a.token, "••••") for a in request.accounts if a.token]
+        hidden = dict.fromkeys([*(a.token for a in request.accounts), *hide])
+        secrets_ = [(value, "••••") for value in hidden if value]
         job = Job(
             id=job_id,
             out_dir=out_dir,
@@ -798,7 +931,9 @@ class JobManager:
         )
         self.jobs[job.id] = job
         if self.settings.max_jobs_per_hour:
-            self._recent.setdefault(client, collections.deque()).append(time.monotonic())
+            key = self._rate_key(owner, client)
+            self._recent.setdefault(key, collections.deque()).append(time.monotonic())
+        self._sync_soon(job)  # the history row, as "queued" (never delays the run)
         self._spawn(self._run(job))
         return job
 
@@ -814,11 +949,16 @@ class JobManager:
         if job.status == "queued":
             job.status = "cancelled"
             job.request = None  # _run skips it once it gets a slot
+            self._sync_soon(job)
         elif job.process is not None:
             _kill_tree(job.process)
 
     def delete(self, job: Job) -> None:
-        """Remove a report and its files (an active run is cancelled first)."""
+        """Remove a report, its files and its history row (an active run is
+        cancelled first). Await :meth:`sync` afterwards to know the row is gone."""
+        job.forgotten = True
+        self.forgotten.add(job.id)
+        self._sync_soon(job)
         if job.active:
             job.delete_requested = True
             self.cancel(job)
@@ -826,6 +966,100 @@ class JobManager:
                 self._remove(job)  # it never started
             return
         self._remove(job)
+
+    # -- report history (GitHub sign-in mode) ------------------------------
+
+    def _sync_soon(self, job: Job) -> None:
+        if self.store is not None and job.user_id is not None:
+            self._spawn(self.sync(job))
+
+    async def sync(self, job: Job) -> None:
+        """Bring the job's history row up to date: insert it, update its
+        status, or delete it. Writes for one job never overlap, and each
+        writes the job's state at that moment. Errors are logged, never raised."""
+        store, user_id = self.store, job.user_id
+        if store is None or user_id is None:
+            return
+        async with job.db_lock:
+            try:
+                if job.forgotten:
+                    await store.delete_report(job.id, user_id)
+                    job.db_added = False
+                elif not job.db_added:
+                    status = job.status
+                    await store.add_report(job.id, user_id, job.period, status)
+                    job.db_added, job.db_status = True, status
+                elif job.db_status != job.status:
+                    status = job.status
+                    await store.set_status(job.id, status)
+                    job.db_status = status
+            except Exception as exc:  # noqa: BLE001 - history is best effort
+                log.warning("report history: could not update %s (%s)", job.id, exc.__class__.__name__)
+
+    async def history(self, user_id: int, max_age: float = HISTORY_CACHE_SECONDS) -> list[ReportRow]:
+        """The user's history rows ([] when the database is unavailable)."""
+        if self.store is None:
+            return []
+        cached = self._history_cache.get(user_id)
+        if cached is not None and time.monotonic() - cached[0] < max_age:
+            return cached[1]
+        try:
+            rows = await self.store.list_reports(user_id, limit=100)
+        except Exception as exc:  # noqa: BLE001 - the page works without it
+            log.warning("report history: could not list reports (%s)", exc.__class__.__name__)
+            # Serve what we had (or nothing) until the next try, not on every poll.
+            rows = cached[1] if cached is not None else []
+        if len(self._history_cache) > 10_000:
+            self._history_cache.clear()
+        self._history_cache[user_id] = (time.monotonic(), rows)
+        return rows
+
+    async def forget_row(self, report_id: str, user_id: int) -> bool | None:
+        """Delete a history row with no job behind it (None = database unavailable)."""
+        if self.store is None:
+            return False
+        try:
+            deleted = await self.store.delete_report(report_id, user_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("report history: could not delete a report (%s)", exc.__class__.__name__)
+            return None
+        if deleted:
+            self.forgotten.add(report_id)
+            self._history_cache.pop(user_id, None)
+        return deleted
+
+    async def start_store(self, _app: web.Application | None = None) -> None:
+        """Connect, and mark rows whose runs died with the previous server as failed."""
+        if self.store is None:
+            return
+        try:
+            await self.store.start()
+            stale = await self.store.fail_unfinished()
+            if stale:
+                log.info("report history: marked %d unfinished report(s) as failed", stale)
+        except Exception as exc:  # noqa: BLE001 - the app runs without history
+            log.warning("report history unavailable at startup (%s)", exc.__class__.__name__)
+
+    async def close_store(self, _app: web.Application | None = None) -> None:
+        if self.store is not None:
+            try:
+                await self.store.close()
+            except Exception:  # noqa: BLE001 - shutting down anyway
+                pass
+
+    def token_in_use(self, token: str) -> bool:
+        return any(job.active and job.uses_token(token) for job in self.jobs.values())
+
+    def after_runs_using(self, token: str, action: Callable[[], Awaitable[None]]) -> None:
+        """Run ``action`` once no active report uses ``token`` (sign-out revokes
+        the token only after the user's running reports have finished)."""
+
+        async def wait_then_act() -> None:
+            while self.token_in_use(token):
+                await asyncio.sleep(2)
+            await action()
+
+        self._spawn(wait_then_act())
 
     def share(self, job: Job) -> str:
         """Create (or reuse) the job's read-only link token."""
@@ -871,8 +1105,9 @@ class JobManager:
             if not job.active and moment < cutoff:
                 expired.append(job)
         for job in expired:
-            self._remove(job)
+            self._remove(job)  # the history row stays: the page lists it as expired
         if expired:
+            self._history_cache.clear()
             log.info("deleted %d report(s) older than %g hour(s)", len(expired), hours)
         return len(expired)
 
@@ -911,12 +1146,14 @@ class JobManager:
                 self._remove(job)
             else:
                 self._save(job)
+            await self.sync(job)
 
     async def _execute(self, job: Job) -> None:
         request = job.request
         assert request is not None
         settings = self.settings
         job.status, job.phase = "running", "Starting"
+        self._sync_soon(job)
         job.out_dir.mkdir(parents=True, exist_ok=True)
         process = await asyncio.create_subprocess_exec(
             *build_command(request, job.out_dir, settings.python, settings.script),
@@ -993,8 +1230,15 @@ class JobManager:
 MANAGER = web.AppKey("manager", JobManager)
 SETTINGS = web.AppKey("settings", Settings)
 EXPIRY_TASK = web.AppKey("expiry_task", asyncio.Task)
-#: The session's owner id (sha256 of the session cookie) on each request.
+CODEC = web.AppKey("session_codec", gh_auth.SessionCodec)
+#: The session's owner id on each request: sha256 of the anonymous session
+#: cookie, or "gh:<GitHub user id>" when signed in with GitHub.
 OWNER = web.RequestKey("owner", str) if hasattr(web, "RequestKey") else "owner"
+#: The signed-in GitHub session (GitHub sign-in mode), or None.
+AUTH = web.RequestKey("auth_session", gh_auth.AuthSession) if hasattr(web, "RequestKey") else "auth_session"
+#: API routes that answer without signing in.
+_OPEN_API = frozenset({"/api/config", "/api/me"})
+_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
 _INDEX_CSP = "; ".join(
     (
@@ -1041,6 +1285,9 @@ def _guard(settings: Settings):
             if request.content_type != "application/json":
                 raise web.HTTPUnsupportedMediaType(text="Send JSON.")
 
+        if settings.auth:
+            return await _signed_in_only(request, handler, settings)
+
         session = request.cookies.get(settings.session_cookie, "")
         fresh = not _SESSION_RE.match(session)
         if fresh:
@@ -1048,7 +1295,7 @@ def _guard(settings: Settings):
         request[OWNER] = hashlib.sha256(session.encode("ascii")).hexdigest()
         response = await handler(request)
         # People opening a shared link get no session: they own nothing here.
-        if fresh and not request.path.startswith("/shared/"):
+        if fresh and not request.path.startswith(("/shared/", "/healthz")):
             response.set_cookie(
                 settings.session_cookie,
                 session,
@@ -1061,6 +1308,25 @@ def _guard(settings: Settings):
         return response
 
     return guard
+
+
+async def _signed_in_only(request: web.Request, handler, settings: Settings) -> web.StreamResponse:
+    """GitHub sign-in mode: who is signed in, and 401 for the API without a session."""
+    raw = request.cookies.get(settings.auth_cookie, "")
+    session = request.app[CODEC].decode(raw) if raw else None
+    request[AUTH] = session
+    request[OWNER] = f"{OWNER_PREFIX}{session.uid}" if session else ""
+    if session is None and request.path.startswith("/api/") and request.path not in _OPEN_API:
+        response: web.StreamResponse = _error("Sign in with GitHub first.", 401)
+    else:
+        response = await handler(request)
+    if raw and session is None and settings.auth_cookie not in response.cookies:
+        _clear_cookie(response, settings.auth_cookie, settings)  # forged or expired
+    return response
+
+
+def _clear_cookie(response: web.StreamResponse, name: str, settings: Settings) -> None:
+    response.del_cookie(name, path="/", secure=settings.secure, httponly=True, samesite="Lax")
 
 
 def _security_headers(settings: Settings):
@@ -1076,7 +1342,7 @@ def _security_headers(settings: Settings):
             "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
         )
         headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-        private = request.path.startswith(("/api/", "/shared/"))
+        private = request.path.startswith(("/api/", "/shared/", "/auth/"))
         headers.setdefault("Cache-Control", "no-store" if private else "no-cache")
         if request.path.startswith("/shared/"):
             # Shared reports are for the people given the link, not search engines.
@@ -1131,12 +1397,137 @@ async def _config(request: web.Request) -> web.Response:
         {
             "version": __version__,
             "mode": "public" if settings.public else "local",
+            "auth": settings.auth,
             "retention_hours": settings.retention_hours,
             "max_active_per_user": settings.max_active_per_user,
             "pdf_browser": find_browser() is not None,
             **local,
         }
     )
+
+
+async def _healthz(_request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def _me(request: web.Request) -> web.Response:
+    session = request.get(AUTH)
+    if session is None:
+        return web.json_response({"signed_in": False})
+    return web.json_response(
+        {
+            "signed_in": True,
+            "login": session.login,
+            "id": session.uid,
+            "avatar_url": gh_auth.avatar_url(session.uid),
+        }
+    )
+
+
+# -- GitHub sign-in (OAuth App web flow) -------------------------------------
+
+
+def _redirect(location: str) -> web.Response:
+    return web.Response(status=302, headers={"Location": location})
+
+
+async def _auth_login(request: web.Request) -> web.Response:
+    """Send the browser to GitHub, with a one-time state tied to this browser."""
+    settings = request.app[SETTINGS]
+    state = secrets.token_urlsafe(32)
+    response = _redirect(
+        gh_auth.authorize_url(
+            settings.github_client_id, settings.redirect_uri, settings.oauth_scopes, state
+        )
+    )
+    # Lax, not Strict: it must come back with the redirect from github.com.
+    response.set_cookie(
+        settings.state_cookie,
+        state,
+        max_age=gh_auth.STATE_TTL,
+        path="/",
+        httponly=True,
+        secure=settings.secure,
+        samesite="Lax",
+    )
+    return response
+
+
+async def _auth_callback(request: web.Request) -> web.Response:
+    """GitHub sends the browser back here with ?code&state. Every failure ends
+    on "/?auth_error=<code>" — GitHub's own error text is never shown."""
+    settings = request.app[SETTINGS]
+    manager = request.app[MANAGER]
+    query = request.query
+
+    def finish(location: str) -> web.Response:
+        response = _redirect(location)
+        _clear_cookie(response, settings.state_cookie, settings)
+        return response
+
+    expected = request.cookies.get(settings.state_cookie, "")
+    state = query.get("state", "")
+    if not expected or not state or not secrets.compare_digest(state.encode(), expected.encode()):
+        return finish("/?auth_error=state")
+    if query.get("error"):
+        return finish("/?auth_error=" + ("denied" if query["error"] == "access_denied" else "github"))
+    code = query.get("code", "")
+    if not _CODE_RE.match(code):
+        return finish("/?auth_error=code")
+    try:
+        token = await gh_auth.exchange_code(
+            settings.github_client_id, settings.github_client_secret, code, settings.redirect_uri
+        )
+        uid, login = await gh_auth.fetch_user(token)
+    except gh_auth.AuthError as exc:
+        log.warning("GitHub sign-in failed: %s", exc)
+        return finish(f"/?auth_error={exc.code}")
+    except Exception as exc:  # noqa: BLE001 - network trouble, bad JSON...
+        log.warning("GitHub sign-in failed (%s)", exc.__class__.__name__)
+        return finish("/?auth_error=github")
+    if manager.store is not None:
+        try:
+            await manager.store.ensure_user(uid)
+        except Exception as exc:  # noqa: BLE001 - sign-in works without the history
+            log.warning("report history: could not record a user (%s)", exc.__class__.__name__)
+    response = finish("/")
+    response.set_cookie(
+        settings.auth_cookie,
+        request.app[CODEC].encode(uid, login, token),
+        max_age=gh_auth.SESSION_TTL,
+        path="/",
+        httponly=True,
+        secure=settings.secure,
+        # Strict would drop the cookie on the first page load after GitHub's redirect.
+        samesite="Lax",
+    )
+    return response
+
+
+async def _auth_logout(request: web.Request) -> web.Response:
+    """Sign out: clear the cookie and revoke the token (after the user's
+    running reports finish, so they aren't cut short)."""
+    settings = request.app[SETTINGS]
+    manager = request.app[MANAGER]
+    session = request.get(AUTH)
+    response = web.json_response({"ok": True})
+    _clear_cookie(response, settings.auth_cookie, settings)
+    if session is not None:
+        token = session.token
+
+        async def revoke() -> None:
+            try:
+                await gh_auth.revoke_token(
+                    settings.github_client_id, settings.github_client_secret, token
+                )
+            except Exception as exc:  # noqa: BLE001 - best effort
+                log.warning("could not revoke a GitHub token on sign-out (%s)", exc.__class__.__name__)
+
+        if manager.token_in_use(token):
+            manager.after_runs_using(token, revoke)
+        else:
+            await revoke()
+    return response
 
 
 def _share_base(request: web.Request) -> str:
@@ -1146,21 +1537,36 @@ def _share_base(request: web.Request) -> str:
 
 
 async def _list_jobs(request: web.Request) -> web.Response:
-    jobs = request.app[MANAGER].listing(request[OWNER])
+    manager = request.app[MANAGER]
     base = _share_base(request)
-    return web.json_response({"jobs": [job.to_json(base) for job in jobs]})
+    items = [job.to_json(base) for job in manager.listing(request[OWNER])]
+    session = request.get(AUTH)
+    if session is not None and manager.store is not None:
+        # History rows whose files are gone (expired, or lost with a restart).
+        rows = await manager.history(session.uid)
+        items += [
+            expired_report_json(row, session.login)
+            for row in rows
+            if row.id not in manager.jobs and row.id not in manager.forgotten
+        ]
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+    return web.json_response({"jobs": items})
 
 
 async def _create_job(request: web.Request) -> web.Response:
     settings = request.app[SETTINGS]
     manager = request.app[MANAGER]
+    session = request.get(AUTH)
     try:
         payload = await request.json()
     except ValueError:
         return _error("The request was not valid JSON.")
     try:
         job_request = parse_job_request(
-            payload, {} if settings.public else effective_env(), require_tokens=settings.public
+            payload,
+            {} if settings.public else effective_env(),
+            require_tokens=settings.public,
+            default_token=session.token if session is not None else "",
         )
     except RequestError as exc:
         return _error(str(exc))
@@ -1168,7 +1574,12 @@ async def _create_job(request: web.Request) -> web.Response:
     refusal = manager.admit(request[OWNER], client)
     if refusal is not None:
         return _error(*refusal)
-    job = manager.submit(job_request, owner=request[OWNER], client=client)
+    job = manager.submit(
+        job_request,
+        owner=request[OWNER],
+        client=client,
+        hide=(session.token,) if session is not None else (),
+    )
     log.info("queued report %s", job.id)
     return web.json_response(job.to_json(_share_base(request)), status=201)
 
@@ -1211,8 +1622,20 @@ async def _linkedin(request: web.Request) -> web.Response:
 
 
 async def _delete_job(request: web.Request) -> web.Response:
+    manager = request.app[MANAGER]
+    session = request.get(AUTH)
+    job_id = request.match_info["job_id"]
+    if session is not None and manager.store is not None and job_id not in manager.jobs:
+        # An expired history entry: only its row is left.
+        deleted = await manager.forget_row(job_id, session.uid)
+        if deleted is None:
+            return _error("The report history is unavailable right now. Try again in a minute.", 503)
+        if not deleted:
+            raise web.HTTPNotFound(text="No such report.")
+        return web.json_response({"deleted": job_id})
     job = _job(request)
-    request.app[MANAGER].delete(job)
+    manager.delete(job)
+    await manager.sync(job)  # the row is gone before the page lists reports again
     return web.json_response({"deleted": job.id})
 
 
@@ -1371,22 +1794,45 @@ async def _shared_file(request: web.Request) -> web.FileResponse:
     return response
 
 
-def create_app(settings: Settings | None = None, **legacy) -> web.Application:
+def create_app(
+    settings: Settings | None = None, *, store: Store | None = None, **legacy
+) -> web.Application:
     """The aiohttp application. ``legacy`` keyword arguments build local
-    :class:`Settings` (``jobs_dir``, ``python``, ``script``)."""
+    :class:`Settings` (``jobs_dir``, ``python``, ``script``).
+
+    In GitHub sign-in mode (``settings.auth``) the report history lives in
+    ``store`` (default: Postgres at ``settings.database_url``, else memory).
+    Raises ``ValueError`` when sign-in is configured without SESSION_SECRET.
+    """
     if settings is None:
         jobs_dir = legacy.pop("jobs_dir", DEFAULT_JOBS_DIR)
         legacy.pop("loopback_only", None)
         settings = Settings(jobs_dir=Path(jobs_dir), **legacy)
-    manager = JobManager(settings)
+    codec = None
+    if settings.auth:
+        codec = gh_auth.SessionCodec(settings.session_secret)  # ValueError without a secret
+        if store is None:
+            store = make_store(settings.database_url)
+    else:
+        store = None  # history needs a GitHub user id
+    manager = JobManager(settings, store)
     manager.load_history()
     manager.expire()
     app = web.Application(middlewares=[_guard(settings)], client_max_size=256 * 1024)
     app[MANAGER] = manager
     app[SETTINGS] = settings
     app.router.add_get("/", _index)
+    app.router.add_get("/healthz", _healthz)
     app.router.add_static("/static/", WEB_DIR)
     app.router.add_get("/api/config", _config)
+    app.router.add_get("/api/me", _me)
+    if codec is not None:
+        app[CODEC] = codec
+        app.router.add_get("/auth/login", _auth_login)
+        app.router.add_get("/auth/callback", _auth_callback)
+        app.router.add_post("/auth/logout", _auth_logout)
+        app.on_startup.append(manager.start_store)
+        app.on_cleanup.append(manager.close_store)
     app.router.add_get("/api/jobs", _list_jobs)
     app.router.add_post("/api/jobs", _create_job)
     app.router.add_post("/api/jobs/{job_id}/cancel", _cancel_job)
@@ -1441,5 +1887,9 @@ def serve(
 
         app.on_startup.append(_open_browser)
     mode = "public" if settings.public else "local"
-    print(f"Contribution report UI ({mode} mode) running at {url}  (Ctrl+C to stop)", flush=True)
+    if settings.auth:
+        mode += " mode, GitHub sign-in"
+    else:
+        mode += " mode"
+    print(f"Contribution report UI ({mode}) running at {url}  (Ctrl+C to stop)", flush=True)
     web.run_app(app, host=host, port=port, access_log=None, print=None, ssl_context=ssl_context)

@@ -495,6 +495,56 @@ dialog.sheet::backdrop { background: rgba(91, 112, 131, 0.4); }
 .shared-name { margin: 0; font-size: 23px; line-height: 28px; font-weight: 800; overflow-wrap: anywhere; }
 @media (max-width: 600px) { .shared { border-inline: 0; } }
 
+/* ---------- GitHub sign-in ---------- */
+
+.icon.icon-fill { fill: currentColor; stroke: none; }
+.topbar h1 { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.me { display: flex; align-items: center; gap: 8px; flex: none; min-width: 0; }
+.avatar-sm { width: 32px; height: 32px; font-size: 14px; }
+.me-login { max-width: 160px; overflow: hidden; font-weight: 700; white-space: nowrap; text-overflow: ellipsis; }
+.btn-signout { padding: 0 14px; }
+.btn-signout .icon { display: none; }
+@media (max-width: 520px) {
+  .topbar { gap: 8px; }
+  .topbar h1 { font-size: 17px; }
+  .me-login { display: none; }
+  /* On phones "Sign out" becomes an icon button (its aria-label still says it). */
+  .btn-signout { width: 34px; min-height: 34px; padding: 0; border-color: transparent; }
+  .btn-signout .icon { display: block; }
+  .btn-signout .btn-label { display: none; }
+}
+
+.signin {
+  display: flex; flex-direction: column; align-items: center;
+  max-width: 440px; margin: 0 auto; padding: 48px 24px 56px;
+  text-align: center;
+}
+.signin .alert { align-self: stretch; margin: 0 0 24px; text-align: left; }
+.signin-mark {
+  display: grid; place-items: center; width: 64px; height: 64px; margin-bottom: 20px;
+  border-radius: 50%; background: var(--bg-elev); color: var(--text);
+}
+.signin-mark .icon { width: 36px; height: 36px; }
+.signin h2 { margin: 0 0 8px; font-size: 31px; line-height: 36px; font-weight: 800; }
+.signin-lead { margin: 0 0 24px; color: var(--muted); }
+.btn-github { gap: 10px; min-height: 44px; padding: 0 24px; font-size: 16px; }
+.btn-github .icon { width: 20px; height: 20px; }
+.signin-points {
+  display: grid; gap: 12px; margin: 32px 0 0; padding: 0; list-style: none;
+  color: var(--muted); font-size: 13px; line-height: 18px; text-align: left;
+}
+.signin-points li { display: flex; align-items: flex-start; gap: 10px; }
+.signin-points .icon { width: 16px; height: 16px; margin-top: 1px; color: var(--text); }
+.signin-points b { color: var(--text); }
+@media (max-width: 560px) {
+  .signin { padding: 32px 16px 40px; }
+  .signin h2 { font-size: 26px; line-height: 32px; }
+}
+
+.expired-note { display: flex; align-items: flex-start; gap: 6px; color: var(--muted); }
+.expired-note .icon { width: 16px; height: 16px; margin-top: 2px; }
+.report-expired > .avatar { opacity: 0.6; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

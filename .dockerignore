@@ -1,0 +1,27 @@
+# Secrets and local state never go into the image.
+.git
+.gitignore
+.env
+.env.*
+.venv
+venv
+.deps
+.claude
+.vscode
+.idea
+run.ps1
+
+# A Windows virtualenv committed by mistake.
+Lib/
+Scripts/
+share/
+Include/
+pyvenv.cfg
+
+# Generated output and caches.
+output*/
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+tests/

@@ -158,9 +158,11 @@ report and the Excel workbook).
 ### Hosting it for other people (production)
 
 **On Render with "Sign in with GitHub" and a report history in Postgres
-(Supabase): follow [DEPLOY.md](DEPLOY.md).** People sign in instead of pasting
-tokens, and their report history (only ids, dates, period and status) follows
-their account.
+(Supabase): follow [DEPLOY.md](DEPLOY.md).** Signing in only identifies the
+user (it asks GitHub for no permissions), so their report history (only ids,
+dates, period and status) follows their account. Reports work exactly as in
+public mode: any accounts, the user's own included or not, each with its own
+token.
 
 Otherwise, run the server in **public mode** behind an HTTPS reverse proxy (nginx, Caddy,
 a cloud load balancer). Public mode is designed for untrusted, concurrent users:

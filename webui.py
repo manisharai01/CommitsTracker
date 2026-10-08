@@ -54,7 +54,6 @@ DOTENV_SETTINGS = (
     "GITHUB_CLIENT_ID",
     "GITHUB_CLIENT_SECRET",
     "SESSION_SECRET",
-    "GITHUB_OAUTH_SCOPES",
 )
 
 
@@ -198,7 +197,6 @@ def configure(
                 github_client_id=client_id,
                 github_client_secret=client_secret,
                 session_secret=(env.get("SESSION_SECRET") or "").strip(),
-                oauth_scopes=_env(env, "GITHUB_OAUTH_SCOPES") or None,
                 database_url=_env(env, "DATABASE_URL"),
             )
         except ValueError as exc:

@@ -155,8 +155,8 @@ def _auth_settings(tmp: Path, **overrides) -> Settings:
     return settings
 
 
-def _cookie(uid: int = UID, login: str = LOGIN, token: str = OAUTH_TOKEN, now: float | None = None) -> str:
-    return auth.SessionCodec(SECRET).encode(uid, login, token, now=now)
+def _cookie(uid: int = UID, login: str = LOGIN, now: float | None = None) -> str:
+    return auth.SessionCodec(SECRET).encode(uid, login, now=now)
 
 
 def _sign_in(jar: aiohttp.CookieJar, url: URL, **kwargs) -> None:
@@ -164,7 +164,7 @@ def _sign_in(jar: aiohttp.CookieJar, url: URL, **kwargs) -> None:
     jar.update_cookies({"ct_auth": _cookie(**kwargs)}, response_url=url)
 
 
-def _payload(*logins: str, token: str = "", **period) -> dict:
+def _payload(*logins: str, token: str = PAT, **period) -> dict:
     payload: dict = {"accounts": [{"login": login, "token": token, "emails": ""} for login in logins]}
     if period:
         payload["period"] = period
@@ -247,14 +247,15 @@ class BrokenStore(Store):
 def test_session_cookie_roundtrip_tamper_and_expiry():
     codec = auth.SessionCodec(SECRET)
     now = 1_800_000_000
-    value = codec.encode(UID, LOGIN, OAUTH_TOKEN, now=now)
+    value = codec.encode(UID, LOGIN, now=now)
     assert "=" not in value and ";" not in value, "cookie values never need quoting"
-    assert OAUTH_TOKEN not in value and LOGIN not in value, "the cookie is encrypted, not just signed"
+    assert LOGIN not in value, "the cookie is encrypted, not just signed"
 
     session = codec.decode(value, now=now + 60)
-    assert (session.uid, session.login, session.token) == (UID, LOGIN, OAUTH_TOKEN)
+    assert (session.uid, session.login) == (UID, LOGIN)
     assert session.exp == now + 14 * 24 * 3600
-    assert OAUTH_TOKEN not in repr(session) and "SessionCodec()" == repr(codec)
+    assert not hasattr(session, "token"), "a session holds no GitHub token"
+    assert "SessionCodec()" == repr(codec)
 
     middle = len(value) // 2
     tampered = value[:middle] + ("A" if value[middle] != "A" else "B") + value[middle + 1:]
@@ -269,10 +270,11 @@ def test_session_cookie_roundtrip_tamper_and_expiry():
 
     fernet = Fernet(auth.fernet_key(SECRET))
     for data in (
-        {"uid": "4242", "login": LOGIN, "token": OAUTH_TOKEN, "exp": now + 99},
-        {"uid": UID, "login": "--x", "token": OAUTH_TOKEN, "exp": now + 99},
-        {"uid": UID, "login": LOGIN, "token": "a b", "exp": now + 99},
-        {"uid": UID, "login": LOGIN, "token": OAUTH_TOKEN},
+        {"uid": "4242", "login": LOGIN, "exp": now + 99},
+        {"uid": UID, "login": "--x", "exp": now + 99},
+        {"uid": UID, "login": LOGIN},
+        # A cookie from when sign-in still kept a GitHub token: dropped.
+        {"uid": UID, "login": LOGIN, "token": OAUTH_TOKEN, "exp": now + 99},
     ):
         forged = fernet.encrypt_at_time(json.dumps(data).encode(), now).decode().rstrip("=")
         assert codec.decode(forged, now=now) is None, data
@@ -329,6 +331,11 @@ def test_oauth_login_and_callback():
         calls.append(("user", token))
         return UID, LOGIN
 
+    revoked: list[tuple[str, str, str]] = []
+
+    async def fake_revoke(client_id, client_secret, token):
+        revoked.append((client_id, client_secret, token))
+
     async def scenario(tmp: Path) -> None:
         store = MemoryStore()
         app = create_app(_auth_settings(tmp), store=store)
@@ -342,7 +349,8 @@ def test_oauth_login_and_callback():
                 query = target.query
                 assert query["client_id"] == CLIENT_ID
                 assert query["redirect_uri"] == f"{PUBLIC_URL}/auth/callback"
-                assert query["scope"] == "repo read:org" and query["allow_signup"] == "true"
+                assert "scope" not in query, "sign-in asks for no permissions"
+                assert query["allow_signup"] == "true"
                 cookie = response.headers["Set-Cookie"]
                 assert cookie.startswith("ct_oauth_state=") and "HttpOnly" in cookie
                 assert "SameSite=Lax" in cookie and "Max-Age=600" in cookie and "Path=/" in cookie
@@ -389,6 +397,8 @@ def test_oauth_login_and_callback():
             assert "Path=/" in session_cookie and OAUTH_TOKEN not in session_cookie
             assert any(c.startswith("ct_oauth_state=") and "Max-Age=0" in c for c in set_cookies), set_cookies
             assert UID in store.users and store.reports == {}
+            # The token only told us who signed in: it is revoked straight away.
+            await _until(lambda: revoked == [(CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN)])
 
             me = await (await client.get("/api/me")).json()
             assert me == {
@@ -402,7 +412,7 @@ def test_oauth_login_and_callback():
             # The state is single-use: replaying the callback fails.
             assert (await callback(code="good-code", state=state)).headers["Location"] == "/?auth_error=state"
 
-    with patched(auth, exchange_code=fake_exchange, fetch_user=fake_user):
+    with patched(auth, exchange_code=fake_exchange, fetch_user=fake_user, revoke_token=fake_revoke):
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(scenario(Path(tmp)))
     print("ok  test_oauth_login_and_callback")
@@ -454,15 +464,30 @@ def test_signed_out_requests_get_401():
 # ---------------------------------------------------------------------------
 
 
-def test_blank_token_uses_the_sign_in_token():
+def test_reports_use_each_accounts_own_token():
+    other_pat = "ghp_" + "Z9y8X7w6V5" * 4
+
     async def scenario(tmp: Path) -> None:
         store = RecordingStore()
         settings = _auth_settings(tmp)
         app = create_app(settings, store=store)
         async with TestClient(TestServer(app)) as client:
             _sign_in(client.session.cookie_jar, client.make_url("/"))
-            payload = _payload(LOGIN, "someone-else", since="2026-01-01", until="2026-03-31", timezone="UTC")
-            payload["accounts"].append({"login": "pat-user", "token": PAT})
+
+            # Signing in never stands in for a token - not even the signed-in
+            # account's own row - so no report is silently read with the
+            # wrong account's access.
+            for logins in ((LOGIN,), ("someone-else",), (LOGIN, "someone-else")):
+                refused = await client.post("/api/jobs", json=_payload(*logins, token=""), headers=ORIGIN)
+                assert refused.status == 400, logins
+                assert "personal access token" in (await refused.json())["error"]
+            assert store.reports == {}
+
+            # Signed in as one account, a report on two others, each with its own token.
+            payload = {
+                "accounts": [{"login": "someone-else", "token": PAT}, {"login": "pat-user", "token": other_pat}],
+                "period": {"since": "2026-01-01", "until": "2026-03-31", "timezone": "UTC"},
+            }
             created = await client.post("/api/jobs", json=payload, headers=ORIGIN)
             assert created.status == 201, await created.text()
             job_id = (await created.json())["id"]
@@ -472,19 +497,23 @@ def test_blank_token_uses_the_sign_in_token():
             assert job["status"] == "done", job
             assert set(job["files"]) == {"pdf", "html"} and "expired" not in job
             log = "\n".join((await (await client.get(f"/api/jobs/{job_id}/log")).json())["lines"])
-            # Blank rows got the OAuth token - whatever login they name - through the env.
-            assert f"sha-{LOGIN}={_sha(OAUTH_TOKEN)}" in log
-            assert f"sha-someone-else={_sha(OAUTH_TOKEN)}" in log
-            assert f"sha-pat-user={_sha(PAT)}" in log
-            # Never in argv, never shown.
+            # Each row's own token reached the run, through the env only.
+            assert f"sha-someone-else={_sha(PAT)}" in log
+            assert f"sha-pat-user={_sha(other_pat)}" in log
             argv = next(line for line in log.splitlines() if line.startswith("argv="))
-            assert "••••" not in argv and "gho_" not in argv
-            assert "token=••••" in log and OAUTH_TOKEN not in log and PAT not in log
+            assert "••••" not in argv and "ghp_" not in argv
+            assert "token=••••" in log and PAT not in log and other_pat not in log
             run_dir = settings.jobs_dir / job_id
             for path in run_dir.rglob("*"):
-                assert OAUTH_TOKEN not in path.read_text(encoding="utf-8", errors="ignore"), path
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                assert PAT not in text and other_pat not in text, path
             record = json.loads((run_dir / "job.json").read_text(encoding="utf-8"))
             assert record["owner"] == f"gh:{UID}"
+
+            # The signed-in account can be in its own report too, with its token.
+            mine = await client.post("/api/jobs", json=_payload(LOGIN, token=PAT), headers=ORIGIN)
+            assert mine.status == 201, await mine.text()
+            await _wait_until_finished(client, (await mine.json())["id"])
 
             # The history row: id, user, period, status - and the status trail.
             await _until(lambda: store.statuses.get(job_id, [])[-1:] == ["done"])
@@ -495,7 +524,7 @@ def test_blank_token_uses_the_sign_in_token():
             # Another signed-in user sees nothing of it.
             async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as other:
                 url = client.make_url
-                _sign_in(other.cookie_jar, url("/"), uid=OTHER_UID, login=OTHER_LOGIN, token=PAT)
+                _sign_in(other.cookie_jar, url("/"), uid=OTHER_UID, login=OTHER_LOGIN)
                 assert await _jobs(other, url) == []
                 for path in (f"/api/jobs/{job_id}/log", job["files"]["pdf"]):
                     assert (await other.get(url(path))).status == 404
@@ -504,25 +533,25 @@ def test_blank_token_uses_the_sign_in_token():
 
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(scenario(Path(tmp)))
-    print("ok  test_blank_token_uses_the_sign_in_token")
+    print("ok  test_reports_use_each_accounts_own_token")
 
 
-def test_parse_job_request_default_token():
+def test_public_runs_need_a_token_per_account():
     blank = {"accounts": [{"login": "alice", "token": ""}, {"login": "bob", "token": PAT}]}
-    request = parse_job_request(blank, {}, require_tokens=True, default_token=OAUTH_TOKEN)
-    assert [a.token for a in request.accounts] == [OAUTH_TOKEN, PAT]
-    env = build_env(request, {"PATH": "p", "PDF_NO_SANDBOX": "1", "DATABASE_URL": "x"}, isolated=True)
-    assert env["GITHUB_TOKEN_ALICE"] == OAUTH_TOKEN and env["GITHUB_TOKEN_BOB"] == PAT
-    assert env["PDF_NO_SANDBOX"] == "1" and "DATABASE_URL" not in env
-    assert "PDF_NO_SANDBOX" in CHILD_ENV_ALLOWLIST and "SESSION_SECRET" not in CHILD_ENV_ALLOWLIST
-    # Without a sign-in, public mode still needs every token.
     try:
         parse_job_request(blank, {}, require_tokens=True)
     except RequestError as exc:
-        assert "personal access token" in str(exc)
+        assert "personal access token" in str(exc) and "alice" in str(exc)
     else:
-        raise AssertionError("accepted a blank token without a sign-in")
-    print("ok  test_parse_job_request_default_token")
+        raise AssertionError("accepted a blank token in public mode")
+    other_pat = "ghp_" + "Z9y8X7w6V5" * 4
+    full = {"accounts": [{"login": "alice", "token": other_pat}, {"login": "bob", "token": PAT}]}
+    request = parse_job_request(full, {}, require_tokens=True)
+    env = build_env(request, {"PATH": "p", "PDF_NO_SANDBOX": "1", "DATABASE_URL": "x"}, isolated=True)
+    assert env["GITHUB_TOKEN_ALICE"] == other_pat and env["GITHUB_TOKEN_BOB"] == PAT
+    assert env["PDF_NO_SANDBOX"] == "1" and "DATABASE_URL" not in env
+    assert "PDF_NO_SANDBOX" in CHILD_ENV_ALLOWLIST and "SESSION_SECRET" not in CHILD_ENV_ALLOWLIST
+    print("ok  test_public_runs_need_a_token_per_account")
 
 
 def test_history_merges_live_jobs_with_expired_rows():
@@ -622,13 +651,16 @@ def test_store_failures_never_break_sign_in_or_runs():
             unknown = await client.delete(f"/api/jobs/{uuid.uuid4()}", json={}, headers=ORIGIN)
             assert unknown.status == 503
 
-    with patched(auth, exchange_code=fake_exchange, fetch_user=fake_user):
+    async def fake_revoke(*_args):
+        return None
+
+    with patched(auth, exchange_code=fake_exchange, fetch_user=fake_user, revoke_token=fake_revoke):
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(scenario(Path(tmp)))
     print("ok  test_store_failures_never_break_sign_in_or_runs")
 
 
-def test_logout_revokes_the_token_after_running_reports():
+def test_logout_clears_the_session_and_leaves_runs_alone():
     revoked: list[tuple[str, str, str]] = []
 
     async def fake_revoke(client_id, client_secret, token):
@@ -640,16 +672,13 @@ def test_logout_revokes_the_token_after_running_reports():
             url = client.make_url("/")
             _sign_in(client.session.cookie_jar, url)
             assert (await client.post("/auth/logout", json={})).status == 403, "Origin guard"
-            assert revoked == []
             out = await client.post("/auth/logout", json={}, headers=ORIGIN)
             assert out.status == 200 and await out.json() == {"ok": True}
-            assert revoked == [(CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN)]
             assert "ct_auth=" in out.headers["Set-Cookie"] and "Max-Age=0" in out.headers["Set-Cookie"]
             assert not (await (await client.get("/api/me")).json())["signed_in"]
             assert (await client.get("/api/jobs")).status == 401
 
-            # Signing out mid-run: the token is revoked once the run has ended.
-            revoked.clear()
+            # A report running at sign-out keeps going: it uses its own tokens.
             _sign_in(client.session.cookie_jar, url)
             created = await client.post("/api/jobs", json=_payload("slow"), headers=ORIGIN)
             job_id = (await created.json())["id"]
@@ -657,15 +686,15 @@ def test_logout_revokes_the_token_after_running_reports():
             await _until(lambda: manager.jobs[job_id].status == "running")
             assert (await client.post("/auth/logout", json={}, headers=ORIGIN)).status == 200
             await asyncio.sleep(0.3)
-            assert revoked == [], "revoked while a report still used the token"
+            assert manager.jobs[job_id].status == "running"
             manager.cancel(manager.jobs[job_id])
-            await _until(lambda: revoked == [(CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN)])
-            assert manager.jobs[job_id].status == "cancelled"
+            await _until(lambda: manager.jobs[job_id].status == "cancelled")
+            assert revoked == [], "the session holds no token, so there is nothing to revoke"
 
     with patched(auth, revoke_token=fake_revoke):
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(scenario(Path(tmp)))
-    print("ok  test_logout_revokes_the_token_after_running_reports")
+    print("ok  test_logout_clears_the_session_and_leaves_runs_alone")
 
 
 def test_hourly_limit_counts_per_account():
@@ -897,7 +926,7 @@ def test_webui_defaults_from_the_environment():
     assert (host, args.port) == ("0.0.0.0", 10000)
     assert settings.public_url == "https://commitstracker.onrender.com" and settings.auth
     assert settings.trust_proxy and settings.retention_hours == 6 and settings.parallel == 1
-    assert settings.database_url == render["DATABASE_URL"] and settings.oauth_scopes == "repo read:org"
+    assert settings.database_url == render["DATABASE_URL"]
 
     custom = {**render, "PUBLIC_URL": "https://reports.example.com", "HOST": "::"}
     _parser, args, host, settings = webui.configure(["--retention-hours", "2"], custom)

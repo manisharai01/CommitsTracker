@@ -13,8 +13,9 @@ the time range, and download the finished report. It runs in one of two modes:
   ``--retention-hours``.
 * **Public with GitHub sign-in** — public mode plus ``GITHUB_CLIENT_ID`` /
   ``GITHUB_CLIENT_SECRET`` / ``SESSION_SECRET``: people sign in with GitHub
-  (see :mod:`.auth`), a blank token uses their sign-in, and their report
-  history follows their account across browsers (see :mod:`.store`).
+  (see :mod:`.auth`) and their report history follows their account across
+  browsers (see :mod:`.store`). Signing in only identifies them: a report can
+  cover any accounts, each with its own token, as in public mode.
 
 Each submitted form becomes a *job* that runs ``github_report.py --pdf`` in a
 subprocess:
@@ -48,7 +49,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping
+from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -215,7 +216,6 @@ class Settings:
     github_client_id: str = ""
     github_client_secret: str = field(default="", repr=False)
     session_secret: str = field(default="", repr=False)
-    oauth_scopes: str = gh_auth.DEFAULT_SCOPES
     database_url: str = field(default="", repr=False)
 
     @property
@@ -387,15 +387,14 @@ def parse_job_request(
     env: Mapping[str, str],
     *,
     require_tokens: bool = False,
-    default_token: str = "",
 ) -> JobRequest:
     """Validate a form submission.
 
     ``env`` is what the CLI child will see (see :func:`effective_env`): an
     account may leave its token blank when ``env`` already holds one — unless
     ``require_tokens`` (public mode), where every account brings its own.
-    ``default_token`` (the signed-in user's GitHub token) fills every blank
-    token instead, whatever login the row names.
+    Signing in with GitHub never stands in for a token: a report reads each
+    account with that account's own access, or not at all.
     """
     if not isinstance(payload, dict):
         raise RequestError("The request must be a JSON object.")
@@ -419,8 +418,6 @@ def parse_job_request(
         token = str(raw.get("token") or "").strip()
         if token and not _TOKEN_RE.match(token):
             raise RequestError(f"The token for {login} doesn't look like a GitHub token.")
-        if not token and default_token:
-            token = default_token
         if not token and require_tokens:
             raise RequestError(f"Enter a personal access token for {login}.")
         if not token and not has_env_token(login, env):
@@ -699,9 +696,6 @@ class Job:
         """The time range as stored in the history: "<since>..<until>"."""
         return f"{self.options.get('since') or ''}..{self.options.get('until') or ''}"
 
-    def uses_token(self, token: str) -> bool:
-        return self.request is not None and any(a.token == token for a in self.request.accounts)
-
     @property
     def active(self) -> bool:
         return self.status in ACTIVE_STATUSES
@@ -900,16 +894,7 @@ class JobManager:
             out_dir, self.jobs_dir, PROJECT_ROOT, Path(sys.prefix), Path(sys.base_prefix), Path.home()
         )
 
-    def submit(
-        self,
-        request: JobRequest,
-        *,
-        owner: str = "",
-        client: str = "",
-        hide: tuple[str, ...] = (),
-    ) -> Job:
-        """Queue a run. ``hide`` lists extra values to hide from everything
-        shown (the signed-in user's token, even when every row typed its own)."""
+    def submit(self, request: JobRequest, *, owner: str = "", client: str = "") -> Job:
         if self.store is not None:
             # The history row's id: a uuid, with no login in it.
             job_id = str(uuid.uuid4())
@@ -917,8 +902,7 @@ class JobManager:
             names = "+".join(request.logins[:3])
             job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{names}-{secrets.token_hex(8)}"
         out_dir = self.jobs_dir / job_id
-        hidden = dict.fromkeys([*(a.token for a in request.accounts), *hide])
-        secrets_ = [(value, "••••") for value in hidden if value]
+        secrets_ = [(a.token, "••••") for a in request.accounts if a.token]
         job = Job(
             id=job_id,
             out_dir=out_dir,
@@ -1046,20 +1030,6 @@ class JobManager:
                 await self.store.close()
             except Exception:  # noqa: BLE001 - shutting down anyway
                 pass
-
-    def token_in_use(self, token: str) -> bool:
-        return any(job.active and job.uses_token(token) for job in self.jobs.values())
-
-    def after_runs_using(self, token: str, action: Callable[[], Awaitable[None]]) -> None:
-        """Run ``action`` once no active report uses ``token`` (sign-out revokes
-        the token only after the user's running reports have finished)."""
-
-        async def wait_then_act() -> None:
-            while self.token_in_use(token):
-                await asyncio.sleep(2)
-            await action()
-
-        self._spawn(wait_then_act())
 
     def share(self, job: Job) -> str:
         """Create (or reuse) the job's read-only link token."""
@@ -1436,9 +1406,7 @@ async def _auth_login(request: web.Request) -> web.Response:
     settings = request.app[SETTINGS]
     state = secrets.token_urlsafe(32)
     response = _redirect(
-        gh_auth.authorize_url(
-            settings.github_client_id, settings.redirect_uri, settings.oauth_scopes, state
-        )
+        gh_auth.authorize_url(settings.github_client_id, settings.redirect_uri, state)
     )
     # Lax, not Strict: it must come back with the redirect from github.com.
     response.set_cookie(
@@ -1485,6 +1453,8 @@ async def _auth_callback(request: web.Request) -> web.Response:
     except Exception as exc:  # noqa: BLE001 - network trouble, bad JSON...
         log.warning("GitHub sign-in failed (%s)", exc.__class__.__name__)
         return finish("/?auth_error=github")
+    # The token only served to learn who signed in: it is never kept.
+    manager._spawn(_revoke_sign_in_token(settings, token))
     if manager.store is not None:
         try:
             await manager.store.ensure_user(uid)
@@ -1493,7 +1463,7 @@ async def _auth_callback(request: web.Request) -> web.Response:
     response = finish("/")
     response.set_cookie(
         settings.auth_cookie,
-        request.app[CODEC].encode(uid, login, token),
+        request.app[CODEC].encode(uid, login),
         max_age=gh_auth.SESSION_TTL,
         path="/",
         httponly=True,
@@ -1504,29 +1474,17 @@ async def _auth_callback(request: web.Request) -> web.Response:
     return response
 
 
+async def _revoke_sign_in_token(settings: Settings, token: str) -> None:
+    try:
+        await gh_auth.revoke_token(settings.github_client_id, settings.github_client_secret, token)
+    except Exception as exc:  # noqa: BLE001 - best effort: it grants no permissions anyway
+        log.warning("could not revoke a sign-in token (%s)", exc.__class__.__name__)
+
+
 async def _auth_logout(request: web.Request) -> web.Response:
-    """Sign out: clear the cookie and revoke the token (after the user's
-    running reports finish, so they aren't cut short)."""
-    settings = request.app[SETTINGS]
-    manager = request.app[MANAGER]
-    session = request.get(AUTH)
+    """Sign out: clear the cookie (the session holds no GitHub token)."""
     response = web.json_response({"ok": True})
-    _clear_cookie(response, settings.auth_cookie, settings)
-    if session is not None:
-        token = session.token
-
-        async def revoke() -> None:
-            try:
-                await gh_auth.revoke_token(
-                    settings.github_client_id, settings.github_client_secret, token
-                )
-            except Exception as exc:  # noqa: BLE001 - best effort
-                log.warning("could not revoke a GitHub token on sign-out (%s)", exc.__class__.__name__)
-
-        if manager.token_in_use(token):
-            manager.after_runs_using(token, revoke)
-        else:
-            await revoke()
+    _clear_cookie(response, request.app[SETTINGS].auth_cookie, request.app[SETTINGS])
     return response
 
 
@@ -1556,17 +1514,13 @@ async def _list_jobs(request: web.Request) -> web.Response:
 async def _create_job(request: web.Request) -> web.Response:
     settings = request.app[SETTINGS]
     manager = request.app[MANAGER]
-    session = request.get(AUTH)
     try:
         payload = await request.json()
     except ValueError:
         return _error("The request was not valid JSON.")
     try:
         job_request = parse_job_request(
-            payload,
-            {} if settings.public else effective_env(),
-            require_tokens=settings.public,
-            default_token=session.token if session is not None else "",
+            payload, {} if settings.public else effective_env(), require_tokens=settings.public
         )
     except RequestError as exc:
         return _error(str(exc))
@@ -1574,12 +1528,7 @@ async def _create_job(request: web.Request) -> web.Response:
     refusal = manager.admit(request[OWNER], client)
     if refusal is not None:
         return _error(*refusal)
-    job = manager.submit(
-        job_request,
-        owner=request[OWNER],
-        client=client,
-        hide=(session.token,) if session is not None else (),
-    )
+    job = manager.submit(job_request, owner=request[OWNER], client=client)
     log.info("queued report %s", job.id)
     return web.json_response(job.to_json(_share_base(request)), status=201)
 

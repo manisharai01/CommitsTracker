@@ -56,10 +56,11 @@ be `https://<service>.onrender.com`. It's used in step 1.
 ## 4. First sign-in and smoke test
 
 1. Open `https://<service>.onrender.com` and click **Sign in with GitHub**.
-   Approve the app. For organization repositories, click **Grant** next to
-   each organization on that screen (or ask an org owner to approve the app).
-2. You're back on the page with your avatar at the top and your login in the
-   first account row. Leave the token blank, pick **Last 30 days**, and click
+   GitHub asks for no permissions: signing in only says who you are (your
+   report history is kept per GitHub account).
+2. You're back on the page with your avatar at the top. Add the accounts to
+   report on (yours, other accounts, or both), each with its own classic
+   token (`repo` + `read:org`), pick **Last 30 days**, and click
    **Generate report**.
 3. When it's ready, download the PDF. In Render → **Logs** you should see no
    errors, and a `report history: connected to the database` line.
@@ -74,7 +75,6 @@ be `https://<service>.onrender.com`. It's used in step 1.
 | `SESSION_SECRET` | yes | Random string, 16+ characters, that encrypts the sign-in cookie. Changing it signs everyone out. The app won't start without it when sign-in is on. |
 | `DATABASE_URL` | recommended | Postgres URL for the report history. Without it, history is kept in memory and lost on restart. |
 | `PUBLIC_URL` | no | The site address, if you use a custom domain. Default: `RENDER_EXTERNAL_URL`. |
-| `GITHUB_OAUTH_SCOPES` | no | Scopes asked at sign-in. Default `repo read:org`. |
 | `RETENTION_HOURS` | no | Hours to keep report files after a run finishes. Default 24. |
 | `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. |
 | `PORT`, `RENDER`, `RENDER_EXTERNAL_URL` | set by Render | Port, `0.0.0.0` binding and trusted proxy headers. |
@@ -98,16 +98,17 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 
 ## Security notes
 
-- **Why `repo`**: GitHub has no read-only scope for private repositories.
-  `repo` and `read:org` let the report count private and organization work.
-  The app only reads.
-- **The token** stays in an encrypted, HttpOnly cookie (Fernet, key derived
-  from `SESSION_SECRET`) that expires after 14 days. During a run, it's in
-  server memory and in the report process's environment only. It is never
-  written to disk, the database, logs or command lines.
-- **Sign out** clears the cookie and revokes the token at GitHub. If a report
-  is still running, the token is revoked when it finishes. Users can also
-  revoke access at any time at github.com → Settings → Applications.
+- **Sign-in is identity only.** The OAuth App asks for no scopes. GitHub's
+  token is used once to read the account's id and login, then revoked; the
+  session cookie (encrypted, HttpOnly, 14 days) holds only that id and login.
+- **Report tokens** are typed per account for each report. During a run they
+  are in server memory and in the report process's environment only, never
+  written to disk, the database, logs or command lines. Every account must
+  bring its own: a signed-in user's identity never stands in for one, so a
+  report is never read with the wrong account's access.
+- **Classic tokens** (`repo` + `read:org`) see private and organization
+  repositories. Organizations with SAML SSO need the token authorized for
+  them (github.com → Settings → Tokens → Configure SSO).
 - **The database** holds only GitHub user ids and, per report: id, time,
   period and status. Row level security is on with no policies, so Supabase's
   public REST API can't read it.

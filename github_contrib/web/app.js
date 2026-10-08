@@ -350,9 +350,9 @@ function envTokenName(login) {
   return state.config.has_default_token ? "GITHUB_TOKEN" : null;
 }
 
-// Whether a row may leave its token blank: signed in with GitHub, or (locally)
-// .env has a token for it.
-const blankTokenOk = (login) => signedIn() || Boolean(envTokenName(login));
+// Whether a row may leave its token blank: only locally, when .env has a
+// token for it. Signing in with GitHub never stands in for a token.
+const blankTokenOk = (login) => Boolean(envTokenName(login));
 
 function readAccounts() {
   return $$("#accounts .account").map((row) => ({
@@ -373,7 +373,6 @@ function addAccount({ login = "", emails = "", token = "" } = {}) {
     $(`label[data-for="${input.name}"]`, row).htmlFor = input.id;
   }
   const inputs = { login: $("[name=login]", row), token: $("[name=token]", row), emails: $("[name=emails]", row) };
-  if (signedIn()) $('label[data-for="token"]', row).textContent = "Access token (optional)";
   inputs.login.value = login;
   inputs.token.value = token;
   inputs.emails.value = emails;
@@ -428,18 +427,6 @@ function updateTokenHint(row) {
     hint.classList.add("hint-warning");
     hint.innerHTML = `${icon("alert")}<span>Fine-grained tokens can't see repos owned by other accounts or ` +
       `organizations. Use a classic token (ghp_…) with <b>repo</b> and <b>read:org</b>.</span>`;
-  } else if (!token && signedIn()) {
-    const login = loginOf(row);
-    if (!login || login.toLowerCase() === state.me.login.toLowerCase()) {
-      hint.classList.add("hint-success");
-      hint.innerHTML = `${icon("check")}<span>Leave blank to use your GitHub sign-in.</span>`;
-    } else {
-      // Another account: the sign-in token only sees what the signed-in user can.
-      hint.classList.add("hint-warning");
-      hint.innerHTML = `${icon("alert")}<span>Blank uses your sign-in, so only repos <b>@${esc(state.me.login)}</b> ` +
-        `can see are scanned. To include <b>@${esc(login)}</b>'s private repos, paste a ` +
-        `<a href="${NEW_TOKEN_URL}" target="_blank" rel="noopener noreferrer">classic token</a> from that account.</span>`;
-    }
   } else if (!token && envName) {
     hint.classList.add("hint-success");
     hint.innerHTML = `${icon("check")}<span>Leave blank to use <code>${esc(envName)}</code> from .env.</span>`;
@@ -512,8 +499,7 @@ function restoreForm() {
   } catch {
     saved = null;
   }
-  // Signed in: the first row starts as the signed-in account.
-  addAccount(signedIn() ? { login: state.me.login } : {});
+  addAccount();
   if (saved && typeof saved === "object") {
     applyOptions(saved.options);
     setMode(saved.mode);
@@ -1297,7 +1283,8 @@ function applyMode() {
   const version = state.config.version ? ` · v${state.config.version}` : "";
   if (isAuth()) {
     $("#intro-text").textContent =
-      "Add the GitHub accounts to report on. Leave a token blank to use your GitHub sign-in." + kept;
+      "Add the GitHub accounts to report on: yours or anyone's, each with its own token. " +
+      "Tokens are used for this run only and never stored." + kept;
     $("#privacy-text").textContent = "Private to your GitHub account";
     const files = hours ? ` Files are deleted ${hours} hours after a report finishes; the history stays.` : "";
     $("#sidebar-footer").textContent = `Only you can see your reports, from any device.${files}${version}`;

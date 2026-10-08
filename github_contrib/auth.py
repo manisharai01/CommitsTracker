@@ -1,8 +1,13 @@
 """GitHub sign-in for the hosted web app (OAuth App web flow).
 
-* :class:`SessionCodec` seals the signed-in session — GitHub user id, login,
-  OAuth token and expiry — into a Fernet-encrypted cookie value. The token
-  lives only there and in memory while a report run uses it.
+Signing in only says who the user is (their report history is kept per
+GitHub account). It asks GitHub for no permissions, and the token GitHub
+returns is used once, to read the account's id and login, then revoked.
+Reports never use it: every account in a report brings its own token, so a
+signed-in user can report on any accounts, with or without their own.
+
+* :class:`SessionCodec` seals the session (GitHub user id, login, expiry)
+  into a Fernet-encrypted cookie value.
 * :func:`exchange_code`, :func:`fetch_user` and :func:`revoke_token` are the
   three GitHub calls the flow makes. They are module-level functions so tests
   can replace them.
@@ -15,7 +20,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import quote, urlencode
 
 import aiohttp
@@ -23,7 +28,6 @@ import aiohttp
 AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 TOKEN_URL = "https://github.com/login/oauth/access_token"
 API_URL = "https://api.github.com"
-DEFAULT_SCOPES = "repo read:org"
 SESSION_TTL = 14 * 24 * 3600  # seconds
 STATE_TTL = 10 * 60
 MIN_SECRET_LENGTH = 16
@@ -50,7 +54,6 @@ def avatar_url(user_id: int) -> str:
 class AuthSession:
     uid: int
     login: str
-    token: str = field(repr=False)
     exp: int = 0
 
 
@@ -78,10 +81,10 @@ class SessionCodec:
     def __repr__(self) -> str:
         return "SessionCodec()"
 
-    def encode(self, uid: int, login: str, token: str, *, now: float | None = None) -> str:
+    def encode(self, uid: int, login: str, *, now: float | None = None) -> str:
         moment = int(time.time() if now is None else now)
         payload = json.dumps(
-            {"uid": int(uid), "login": login, "token": token, "exp": moment + self.ttl},
+            {"uid": int(uid), "login": login, "exp": moment + self.ttl},
             separators=(",", ":"),
         ).encode("utf-8")
         sealed = self._fernet.encrypt_at_time(payload, moment)
@@ -98,26 +101,28 @@ class SessionCodec:
             raw = (value + "=" * (-len(value) % 4)).encode("ascii")
             payload = self._fernet.decrypt_at_time(raw, ttl=self.ttl + 60, current_time=moment)
             data = json.loads(payload)
-            uid, login, token, exp = data["uid"], data["login"], data["token"], data["exp"]
+            uid, login, exp = data["uid"], data["login"], data["exp"]
         except (self._invalid, ValueError, KeyError, TypeError, UnicodeError):
+            return None
+        if "token" in data:
+            # Issued when sign-in still kept a GitHub token: drop it, sign in again.
             return None
         if not (isinstance(uid, int) and not isinstance(uid, bool) and uid > 0):
             return None
         if not (isinstance(login, str) and _LOGIN_RE.match(login)):
             return None
-        if not (isinstance(token, str) and _TOKEN_RE.match(token)):
-            return None
         if not isinstance(exp, int) or exp <= moment:
             return None
-        return AuthSession(uid=uid, login=login, token=token, exp=exp)
+        return AuthSession(uid=uid, login=login, exp=exp)
 
 
-def authorize_url(client_id: str, redirect_uri: str, scopes: str, state: str) -> str:
+def authorize_url(client_id: str, redirect_uri: str, state: str) -> str:
+    """GitHub's sign-in page. No ``scope``: the app asks for no permissions,
+    only the public profile that identifies the account."""
     query = urlencode(
         {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "scope": scopes,
             "state": state,
             "allow_signup": "true",
         }

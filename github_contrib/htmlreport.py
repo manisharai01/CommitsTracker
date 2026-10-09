@@ -402,6 +402,26 @@ button.toggle:hover { background:#eef2f9; }
      browser CPU time (minutes on a small cloud server). */
   #commit-timeline table { font-size:9.5px; }
   #commit-timeline td, #commit-timeline th { padding:2px 6px; }
+  /* Fixed columns: the same on every page, also when the PDF is printed in
+     parts (each part would otherwise size them to its own rows). */
+  #commit-timeline table { table-layout:fixed; }
+  #commit-timeline thead th:nth-child(1) { width:5%; }
+  #commit-timeline thead th:nth-child(2) { width:10%; }
+  #commit-timeline thead th:nth-child(3) { width:19%; }
+  #commit-timeline thead th:nth-child(4) { width:10%; }
+  #commit-timeline thead th:nth-child(6) { width:8%; }
+  #commit-timeline thead th:nth-child(7) { width:10%; }
+  #commit-timeline td { overflow-wrap:anywhere; }
+  #commit-timeline td.clines { white-space:normal; }
+  #commit-timeline td.sha a { font-size:10.5px; }
+  /* A long appendix is printed in parts (#print=FROM-TO, see pdfexport):
+     each part shows only its rows, and later parts only the appendix. */
+  #commit-timeline tr.pskip { display:none; }
+  body.pcont header.hero, body.pcont .wrap > :not(#commit-timeline):not(footer),
+  body.pcont #commit-timeline > :not(details), body.pcont #commit-timeline summary,
+  body.pmore footer { display:none; }
+  body.pcont #commit-timeline { break-before:auto; }
+  body.pcont #commit-timeline details { margin-top:0; border-top:none; padding-top:0; }
   details.commitlist summary { list-style:none; }
   details.commitlist summary::-webkit-details-marker { display:none; }
 }
@@ -421,10 +441,38 @@ _SCRIPT = """
       btn.textContent = open ? 'Collapse all commit lists' : 'Expand all commit lists';
     });
   }
+  // A PDF prints only one part of a long appendix at a time: its rows FROM
+  // to TO-1, after the rest of the report (first part) or alone (later ones).
+  function printPart(from, to) {
+    var rows = document.querySelectorAll('#commit-timeline tbody > tr');
+    for (var i = 0; i < rows.length; i++) {
+      if (i < from || i >= to) rows[i].classList.add('pskip');
+    }
+    // A part that starts mid-month repeats that month's header.
+    var first = rows[from];
+    if (from > 0 && first && !first.classList.contains('month')) {
+      for (var j = from - 1; j >= 0; j--) {
+        if (rows[j].classList.contains('month')) {
+          var head = rows[j].cloneNode(true);
+          head.classList.remove('pskip');
+          head.cells[0].textContent += ' (continued)';
+          first.parentNode.insertBefore(head, first);
+          break;
+        }
+      }
+    }
+    if (from > 0) document.body.classList.add('pcont');
+    if (to < rows.length) document.body.classList.add('pmore');
+  }
   // For PDF/printing only the chronological appendix is expanded; collapsed
   // per-repo lists are hidden by the print stylesheet so raw commit data
-  // appears once, at the end, in time order.
-  if (location.hash === '#print') setAll(true, 'details.timeline');
+  // appears once, at the end, in time order ('#print', or '#print=FROM-TO'
+  // for one part of it).
+  var print = /^#print(?:=(\\d+)-(\\d+))?$/.exec(location.hash);
+  if (print) {
+    setAll(true, 'details.timeline');
+    if (print[1]) printPart(+print[1], +print[2]);
+  }
   window.addEventListener('beforeprint', function () { setAll(true, 'details.timeline'); });
 })();
 """
@@ -601,8 +649,9 @@ def _render_commit_timeline(commits_df: pd.DataFrame) -> str:
             "</tr>"
         )
     n = len(rows)
+    # data-print-parts: the script can print this appendix in parts (pdfexport).
     return (
-        "<section id='commit-timeline'><h2>Appendix — complete commit timeline</h2>"
+        "<section id='commit-timeline' data-print-parts><h2>Appendix — complete commit timeline</h2>"
         f"<p class='note'>All {n} commits across every repository in chronological "
         "order (oldest first), so the work can be followed as it happened.</p>"
         f"<details class='commitlist timeline'><summary>Show the full timeline ({n} commits)</summary>"

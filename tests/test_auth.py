@@ -22,7 +22,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import textwrap
@@ -658,6 +657,7 @@ def test_history_merges_live_jobs_with_expired_rows():
                 "share_url": "",
                 "log_count": 0,
                 "expired": True,
+                "lost": False,  # older than the retention period: deleted on schedule
             }
             assert jobs[2]["status"] == "failed" and jobs[2]["options"]["since"] == ""
 
@@ -689,6 +689,19 @@ def test_history_merges_live_jobs_with_expired_rows():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(scenario(Path(tmp)))
     print("ok  test_history_merges_live_jobs_with_expired_rows")
+
+
+def test_expired_entries_say_why_their_files_are_gone():
+    created = datetime(2026, 10, 9, 5, 0, tzinfo=timezone.utc)
+    row = ReportRow(str(uuid.uuid4()), UID, created, "..", "done")
+    minutes_later, next_day = created + timedelta(minutes=4), created + timedelta(hours=25)
+    # Gone within the retention period: lost when the server restarted.
+    assert webapp.expired_report_json(row, LOGIN, 24, now=minutes_later)["lost"] is True
+    # Gone after it: deleted on schedule.
+    assert webapp.expired_report_json(row, LOGIN, 24, now=next_day)["lost"] is False
+    # Nothing is deleted on schedule without a retention period.
+    assert webapp.expired_report_json(row, LOGIN, 0, now=next_day)["lost"] is True
+    print("ok  test_expired_entries_say_why_their_files_are_gone")
 
 
 def test_store_failures_never_break_sign_in_or_runs():
@@ -1030,14 +1043,14 @@ def test_webui_takes_only_sign_in_settings_from_dotenv():
 def test_pdf_no_sandbox_only_when_asked():
     seen: list[list[str]] = []
 
-    def fake_run(cmd, **_kwargs):
+    def fake_run(cmd, _log_path, _deadline):
         seen.append(cmd)
-        return subprocess.CompletedProcess(cmd, 1, "", "")
+        return "done", 1  # exits without writing a PDF
 
     with tempfile.TemporaryDirectory() as tmp:
         html = Path(tmp) / "report.html"
         html.write_text("<html></html>", encoding="utf-8")
-        with patched(pdfexport, find_browser=lambda: "chromium"), patched(subprocess, run=fake_run):
+        with patched(pdfexport, find_browser=lambda: "chromium", _run_browser=fake_run):
             with env_vars(PDF_NO_SANDBOX="0"):
                 pdfexport.export_pdf(html)
             assert seen and all("--no-sandbox" not in cmd for cmd in seen)

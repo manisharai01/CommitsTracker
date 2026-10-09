@@ -737,9 +737,9 @@ function statusChip(status, expired = false) {
 }
 
 function expiredHTML(job) {
-  const text = job.status === "done"
-    ? "The files for this report have expired. Run it again for a fresh copy."
-    : "The details of this run have expired.";
+  const text = job.status !== "done" ? "The details of this run have expired."
+    : job.lost ? "This report's files were lost when the server restarted. Run it again for a fresh copy."
+    : "The files for this report have expired. Run it again for a fresh copy.";
   return `<p class="report-text expired-note">${icon("clock")}<span>${text}</span></p>`;
 }
 
@@ -874,16 +874,18 @@ function createCard(job) {
   el.dataset.id = job.id;
   el.innerHTML = avatarHTML(job) +
     '<div class="report-main"><div class="report-body"></div><div class="log" role="log" hidden></div></div>';
-  const card = { el, body: $(".report-body", el), log: $(".log", el), html: "", status: job.status };
+  const card = { el, body: $(".report-body", el), log: $(".log", el), html: "", avatar: avatarHTML(job) };
   state.cards.set(job.id, card);
   return card;
 }
 
 function renderCard(card, job) {
-  if (card.status !== job.status) {
-    // The avatar picture appears once the report is done.
-    card.el.firstElementChild.outerHTML = avatarHTML(job);
-    card.status = job.status;
+  // The avatar picture appears once the report is done; an expired entry
+  // names only the signed-in account.
+  const avatar = avatarHTML(job);
+  if (card.avatar !== avatar) {
+    card.el.firstElementChild.outerHTML = avatar;
+    card.avatar = avatar;
   }
   card.el.dataset.status = job.status;
   card.el.classList.toggle("report-expired", Boolean(job.expired));

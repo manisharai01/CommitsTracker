@@ -99,6 +99,9 @@ FAKE_PDF = textwrap.dedent(
     if mode == "fail":
         log("WARNING", "PDF export stopped: chromium took longer than 900 seconds (set PDF_TIMEOUT to allow more).")
         sys.exit(1)
+    if mode == "nomem":
+        log("WARNING", "PDF export stopped: the server was about to run out of memory (460 of 512 MB in use).")
+        sys.exit(3)
     html.with_suffix(".pdf").write_text("pdf")
     log("INFO", "wrote report.pdf (via chromium, 1s)")
     """
@@ -339,6 +342,14 @@ def test_pdf_is_printed_after_the_report_is_done():
                 assert job["status"] == "done" and "pdf" not in job["files"] and "html" in job["files"]
                 assert webapp.PDF_FAILED in job["warnings"]
                 assert any("took longer than 900 seconds" in w for w in job["warnings"])
+
+                # Stopped before the server ran out of memory: the report stays, and says so.
+                mode["value"] = "nomem"
+                job_id = await start()
+                await until(lambda: _pdf_is(client, job_id, "failed"))
+                job = await job_state(client, job_id)
+                assert job["status"] == "done" and "html" in job["files"]
+                assert webapp.PDF_NO_MEMORY in job["warnings"] and webapp.PDF_FAILED not in job["warnings"]
 
                 # No browser at all: no PDF step is started.
                 webapp.find_browser = lambda: None

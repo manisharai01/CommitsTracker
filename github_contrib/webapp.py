@@ -68,7 +68,7 @@ from .config import (
 from .htmlreport import REPORT_CSP
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
-from .pdfexport import find_browser, pdf_timeout
+from .pdfexport import EXIT_NO_MEMORY, find_browser, pdf_timeout
 from .store import ReportRow, Store, make_store
 
 log = get_logger("webapp")
@@ -131,8 +131,8 @@ CHILD_ENV_ALLOWLIST = frozenset(
         "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "FONTCONFIG_PATH",
         "FONTCONFIG_FILE",
         # Chromium in a container needs --no-sandbox; slow hosts may need more
-        # time for the PDF (see pdfexport).
-        "PDF_NO_SANDBOX", "PDF_TIMEOUT",
+        # time for the PDF, small ones smaller parts (see pdfexport).
+        "PDF_NO_SANDBOX", "PDF_TIMEOUT", "PDF_PART_ROWS", "PDF_MEMORY_LIMIT_MB",
     )
 )
 
@@ -144,6 +144,10 @@ PDF_NO_BROWSER = (
 PDF_FAILED = (
     "The PDF could not be rendered on this server. Open the HTML report and print it "
     "to PDF instead (the report itself is complete)."
+)
+PDF_NO_MEMORY = (
+    "The PDF needs more memory than this server has, so it wasn't made. Open the HTML "
+    "report and print it to PDF instead (the report itself is complete)."
 )
 PDF_STOPPED = "The server stopped before the PDF was ready. Open the HTML report and print it to PDF instead."
 
@@ -709,13 +713,19 @@ def _split_period(period: str) -> tuple[str, str]:
     return (since if _DATE_RE.match(since) else "", until if _DATE_RE.match(until) else "")
 
 
-def expired_report_json(row: ReportRow, login: str) -> dict:
+def expired_report_json(
+    row: ReportRow, login: str, retention_hours: float = 0.0, now: datetime | None = None
+) -> dict:
     """A history row whose files are gone, shaped like a job for the page."""
     since, until = _split_period(row.period)
     status = row.status if row.status not in ACTIVE_STATUSES else "failed"  # its run died elsewhere
     created = row.created_at
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
+    # Files are deleted once the retention period is over; gone sooner, they
+    # were lost when the server restarted (its disk doesn't survive one).
+    age = (now or datetime.now(timezone.utc)) - created
+    lost = retention_hours <= 0 or age < timedelta(hours=retention_hours)
     return {
         "id": row.id,
         "status": status,
@@ -731,6 +741,7 @@ def expired_report_json(row: ReportRow, login: str) -> dict:
         "share_url": "",
         "log_count": 0,
         "expired": True,
+        "lost": lost,
     }
 
 
@@ -1245,6 +1256,7 @@ class JobManager:
             self._save(job)
             return
         job.phase = "Rendering PDF"
+        code = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *pdf_command(self.settings.python, html_path),
@@ -1265,7 +1277,7 @@ class JobManager:
 
             try:
                 # pdfexport enforces PDF_TIMEOUT itself; this is the backstop.
-                await asyncio.wait_for(drain(), timeout=pdf_timeout() + 60)
+                code = await asyncio.wait_for(drain(), timeout=pdf_timeout() + 60)
             except asyncio.TimeoutError:
                 _kill_tree(process)
                 await process.wait()
@@ -1275,7 +1287,7 @@ class JobManager:
             job.process = None
         job.pdf = "ready" if (job.out_dir / REPORT_FILES["pdf"]).is_file() else "failed"
         if job.pdf == "failed" and not job.delete_requested:
-            job.warnings.append(PDF_FAILED)
+            job.warnings.append(PDF_NO_MEMORY if code == EXIT_NO_MEMORY else PDF_FAILED)
         if job.delete_requested:
             self._remove(job)
         else:
@@ -1661,7 +1673,7 @@ async def _list_jobs(request: web.Request) -> web.Response:
         # History rows whose files are gone (expired, or lost with a restart).
         rows = await manager.history(session.uid)
         items += [
-            expired_report_json(row, session.login)
+            expired_report_json(row, session.login, manager.settings.retention_hours)
             for row in rows
             if row.id not in manager.jobs and row.id not in manager.forgotten
         ]

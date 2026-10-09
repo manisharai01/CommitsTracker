@@ -78,6 +78,8 @@ be `https://<service>.onrender.com`. It's used in step 1.
 | `RETENTION_HOURS` | no | Hours to keep report files after a run finishes. Default 24. |
 | `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. |
 | `PDF_TIMEOUT` | no | Seconds the PDF may take. Default 900 (15 minutes). |
+| `PDF_PART_ROWS` | no | Commit-appendix rows printed per part of the PDF. Default 200, which keeps the PDF step at about 330 MB however long the report is. `0` prints in one go (over 900 MB for 1,800 commits). |
+| `PDF_MEMORY_LIMIT_MB` | no | The memory the PDF step must stay under. Default: the container's limit. It stops the browser 64 MB before that, so the server never runs out. |
 | `PORT`, `RENDER`, `RENDER_EXTERNAL_URL` | set by Render | Port, `0.0.0.0` binding and trusted proxy headers. |
 
 Other limits are `webui.py` flags (`python webui.py --help`), for example
@@ -88,15 +90,21 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 - **Free** (`render.yaml` default) needs no card. It sleeps after 15 idle
   minutes, and the next visit waits about a minute while it wakes up. A
   report in progress keeps it awake (the page checks on it every second).
-  It has a tenth of a CPU, so the PDF of a long report takes a few minutes
-  (about 3 for 1,800 commits). The report is marked done first, with the
-  HTML and Excel files ready, and shows "Preparing PDF…" until the PDF is in.
+  It has a tenth of a CPU, so the PDF of a long report takes a few minutes.
+  The report is marked done first, with the HTML and Excel files ready, and
+  shows "Preparing PDF…" until the PDF is in.
+- **Memory**: free and starter have 512 MB. Chromium needs a lot to print a
+  long report, so the PDF is printed in parts (`PDF_PART_ROWS`) by Chromium's
+  headless shell. If the server still gets close to its limit, the PDF step
+  stops and the report says so; the report itself stays. (Running out of
+  memory would restart the whole service and lose the report's files.)
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is
   wiped by each deploy, restart or sleep. The **history** (date, period,
-  status) is in the database, so old entries stay listed as "expired" with a
-  **Run again** button.
+  status) is in the database, so old entries stay listed with a **Run again**
+  button: as expired after `RETENTION_HOURS`, or as lost in a restart if the
+  files went sooner.
 - Supabase's free tier pauses a project after a week without activity. Resume
   it from the Supabase dashboard if the history stops loading.
 

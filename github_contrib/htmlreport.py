@@ -398,6 +398,10 @@ button.toggle:hover { background:#eef2f9; }
      collapsed per-repo lists (mid-document) disappear entirely. */
   details.commitlist:not([open]) { display:none; }
   #commit-timeline { break-before:page; }
+  /* Compact appendix: about 40% fewer pages, and each page costs the
+     browser CPU time (minutes on a small cloud server). */
+  #commit-timeline table { font-size:9.5px; }
+  #commit-timeline td, #commit-timeline th { padding:2px 6px; }
   details.commitlist summary { list-style:none; }
   details.commitlist summary::-webkit-details-marker { display:none; }
 }

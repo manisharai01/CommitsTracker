@@ -78,10 +78,29 @@ FAKE_CLI = textwrap.dedent(
         fh.write("2026-10-06 10:00:00 | DEBUG   | x | header Authorization: Bearer " + token + "\\n")
     with open(os.path.join(out, "contribution_summary.csv"), "w", encoding="utf-8-sig") as fh:
         fh.write("metric,value\\ntotal_lifetime_commits,2\\nactive_days,1\\nemails_seen," + os.environ["AUTHOR_EMAILS"] + "\\n")
-    for name in ("report.pdf", "report.html", "github_contributions.xlsx"):
+    names = ["report.html", "github_contributions.xlsx"]
+    if "nopdf" not in users:  # "nopdf": the web app must print the PDF itself
+        names.append("report.pdf")
+    for name in names:
         with open(os.path.join(out, name), "w") as fh:
             fh.write(name)
     log("INFO", "wrote report.md and report.html")
+    """
+)
+
+# Stand-in for `python -m github_contrib.pdfexport <report.html>`.
+FAKE_PDF = textwrap.dedent(
+    """
+    import pathlib, sys, time
+    mode, html = sys.argv[1], pathlib.Path(sys.argv[2])
+    def log(level, msg):
+        print(f"2026-10-06 10:00:00 | {level:<7} | github_contrib.pdfexport | {msg}", flush=True)
+    time.sleep(30 if mode == "slow" else 0.4)
+    if mode == "fail":
+        log("WARNING", "PDF export stopped: chromium took longer than 900 seconds (set PDF_TIMEOUT to allow more).")
+        sys.exit(1)
+    html.with_suffix(".pdf").write_text("pdf")
+    log("INFO", "wrote report.pdf (via chromium, 1s)")
     """
 )
 
@@ -158,7 +177,8 @@ def test_build_command_and_env():
     )
     cmd = build_command(req, Path("out"), "py", Path("cli.py"))
     assert cmd[:2] == ["py", "cli.py"]
-    assert cmd.count("--user") == 2 and "--pdf" in cmd
+    assert cmd.count("--user") == 2
+    assert "--pdf" not in cmd, "the PDF is printed after the run, by the web app"
     assert "--default-branch-only" in cmd and "--no-prs" in cmd and "--no-commit-stats" not in cmd
     assert cmd[cmd.index("--since") + 1] == "2026-01-01" and "--until" not in cmd
     assert cmd[cmd.index("--timezone") + 1] == "UTC"
@@ -261,6 +281,110 @@ def _fake(tmp: Path) -> Path:
     fake = tmp / "fake_cli.py"
     fake.write_text(FAKE_CLI, encoding="utf-8")
     return fake
+
+
+def test_pdf_is_printed_after_the_report_is_done():
+    from github_contrib import webapp
+
+    async def job_state(client: TestClient, job_id: str) -> dict | None:
+        jobs = (await (await client.get("/api/jobs")).json())["jobs"]
+        return next((j for j in jobs if j["id"] == job_id), None)
+
+    async def until(predicate, timeout: float = 20.0) -> None:
+        for _ in range(int(timeout / 0.05)):
+            if await predicate():
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("condition not met in time")
+
+    async def scenario(tmp: Path) -> None:
+        settings = Settings(jobs_dir=tmp / "runs", script=_fake(tmp))
+        fake_pdf = tmp / "fake_pdf.py"
+        fake_pdf.write_text(FAKE_PDF, encoding="utf-8")
+        mode = {"value": "ok"}
+        commands: list[list[str]] = []
+
+        def command(_python, html_path):
+            commands.append([mode["value"], str(html_path)])
+            return [sys.executable, str(fake_pdf), mode["value"], str(html_path)]
+
+        saved = webapp.pdf_command, webapp.find_browser
+        webapp.pdf_command, webapp.find_browser = command, (lambda: "chromium")
+        try:
+            async with TestClient(TestServer(create_app(settings))) as client:
+                async def start() -> str:
+                    created = await client.post("/api/jobs", json=_payload("nopdf"))
+                    assert created.status == 201, await created.text()
+                    return (await created.json())["id"]
+
+                # The report is done - HTML and Excel ready - while its PDF prints.
+                job_id = await start()
+                job = await _wait_until_finished(client, job_id)
+                assert job["status"] == "done" and job["pdf"] == "rendering", job
+                assert set(job["files"]) == {"html", "xlsx"}
+                await until(lambda: _pdf_is(client, job_id, "ready"))
+                job = await job_state(client, job_id)
+                assert set(job["files"]) == {"pdf", "html", "xlsx"} and job["warnings"] == [
+                    "[nopdf] classic token lacks 'read:org'"
+                ]
+                record = json.loads((settings.jobs_dir / job_id / "job.json").read_text(encoding="utf-8"))
+                assert record["pdf"] == "ready" and commands[-1][1].endswith("report.html")
+                assert (await client.get(job["files"]["pdf"])).status == 200
+
+                # A PDF that fails leaves a complete report and says why.
+                mode["value"] = "fail"
+                job_id = await start()
+                await until(lambda: _pdf_is(client, job_id, "failed"))
+                job = await job_state(client, job_id)
+                assert job["status"] == "done" and "pdf" not in job["files"] and "html" in job["files"]
+                assert webapp.PDF_FAILED in job["warnings"]
+                assert any("took longer than 900 seconds" in w for w in job["warnings"])
+
+                # No browser at all: no PDF step is started.
+                webapp.find_browser = lambda: None
+                count = len(commands)
+                job_id = await start()
+                await until(lambda: _pdf_is(client, job_id, "failed"))
+                assert webapp.PDF_NO_BROWSER in (await job_state(client, job_id))["warnings"]
+                assert len(commands) == count
+                webapp.find_browser = lambda: "chromium"
+
+                # Deleting a report while its PDF prints stops the browser and
+                # removes the report for good (nothing is written back).
+                mode["value"] = "slow"
+                job_id = await start()
+                await until(lambda: _pdf_is(client, job_id, "rendering"))
+                deleted = await client.delete(f"/api/jobs/{job_id}", json={})
+                assert deleted.status == 200
+                manager = client.server.app[MANAGER]
+                await until(lambda: _gone(manager, settings.jobs_dir / job_id))
+                await asyncio.sleep(0.3)
+                assert not (settings.jobs_dir / job_id).exists()
+                assert await job_state(client, job_id) is None
+        finally:
+            webapp.pdf_command, webapp.find_browser = saved
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(scenario(Path(tmp)))
+
+    # A server that stopped mid-PDF: the report stays, the PDF is marked failed.
+    with tempfile.TemporaryDirectory() as tmp:
+        record = {"accounts": [{"login": "a"}], "created_at": "2026-10-06T10:00:00+00:00",
+                  "status": "done", "pdf": "rendering", "warnings": []}
+        job = Job.from_record(record, Path(tmp) / "x")
+        from github_contrib.webapp import PDF_STOPPED
+        assert job.status == "done" and job.pdf == "failed" and job.warnings == [PDF_STOPPED]
+    print("ok  test_pdf_is_printed_after_the_report_is_done")
+
+
+async def _pdf_is(client: TestClient, job_id: str, state: str) -> bool:
+    jobs = (await (await client.get("/api/jobs")).json())["jobs"]
+    job = next((j for j in jobs if j["id"] == job_id), None)
+    return job is not None and job["status"] == "done" and job.get("pdf") == state
+
+
+async def _gone(manager, folder: Path) -> bool:
+    return folder.name not in manager.jobs and not folder.exists()
 
 
 def test_web_end_to_end_local():

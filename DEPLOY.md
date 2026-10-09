@@ -77,6 +77,7 @@ be `https://<service>.onrender.com`. It's used in step 1.
 | `PUBLIC_URL` | no | The site address, if you use a custom domain. Default: `RENDER_EXTERNAL_URL`. |
 | `RETENTION_HOURS` | no | Hours to keep report files after a run finishes. Default 24. |
 | `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. |
+| `PDF_TIMEOUT` | no | Seconds the PDF may take. Default 900 (15 minutes). |
 | `PORT`, `RENDER`, `RENDER_EXTERNAL_URL` | set by Render | Port, `0.0.0.0` binding and trusted proxy headers. |
 
 Other limits are `webui.py` flags (`python webui.py --help`), for example
@@ -87,6 +88,9 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 - **Free** (`render.yaml` default) needs no card. It sleeps after 15 idle
   minutes, and the next visit waits about a minute while it wakes up. A
   report in progress keeps it awake (the page checks on it every second).
+  It has a tenth of a CPU, so the PDF of a long report takes a few minutes
+  (about 3 for 1,800 commits). The report is marked done first, with the
+  HTML and Excel files ready, and shows "Preparing PDF…" until the PDF is in.
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is

@@ -68,7 +68,7 @@ from .config import (
 from .htmlreport import REPORT_CSP
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
-from .pdfexport import find_browser
+from .pdfexport import find_browser, pdf_timeout
 from .store import ReportRow, Store, make_store
 
 log = get_logger("webapp")
@@ -130,10 +130,22 @@ CHILD_ENV_ALLOWLIST = frozenset(
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
         "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "FONTCONFIG_PATH",
         "FONTCONFIG_FILE",
-        # Chromium in a container needs --no-sandbox (see pdfexport.export_pdf).
-        "PDF_NO_SANDBOX",
+        # Chromium in a container needs --no-sandbox; slow hosts may need more
+        # time for the PDF (see pdfexport).
+        "PDF_NO_SANDBOX", "PDF_TIMEOUT",
     )
 )
+
+#: What a report card says when its PDF couldn't be made.
+PDF_NO_BROWSER = (
+    "The PDF could not be rendered (it needs Microsoft Edge or Google Chrome). "
+    "Open the HTML report and print it to PDF instead."
+)
+PDF_FAILED = (
+    "The PDF could not be rendered on this server. Open the HTML report and print it "
+    "to PDF instead (the report itself is complete)."
+)
+PDF_STOPPED = "The server stopped before the PDF was ready. Open the HTML report and print it to PDF instead."
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ACTIVE_STATUSES = frozenset({"queued", "running"})
@@ -453,7 +465,8 @@ def build_command(
     cmd = [python, str(script)]
     for login in request.logins:
         cmd += ["--user", login]
-    cmd += ["--output", str(out_dir), "--pdf", "--timezone", request.timezone]
+    # No --pdf: the PDF is printed once this run has exited (JobManager._render_pdf).
+    cmd += ["--output", str(out_dir), "--timezone", request.timezone]
     if request.since:
         cmd += ["--since", request.since]
     if request.until:
@@ -501,6 +514,19 @@ def build_env(
     }
     for name, var in FORM_ENV_VARS.items():
         env[var] = ",".join(values[name])
+    return env
+
+
+def pdf_command(python: str, html_path: Path) -> list[str]:
+    """The PDF step: ``python -m github_contrib.pdfexport <report.html>``."""
+    return [python, "-m", "github_contrib.pdfexport", str(html_path)]
+
+
+def pdf_env(base: Mapping[str, str]) -> dict[str, str]:
+    """The PDF step's environment: operating-system variables only (it needs
+    no token, and never reads .env)."""
+    env = {k: v for k, v in base.items() if k.upper() in CHILD_ENV_ALLOWLIST}
+    env.update({NO_DOTENV_ENV: "1", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"})
     return env
 
 
@@ -738,6 +764,9 @@ class Job:
     redactions: list[tuple[str, str]] = field(default_factory=list)
     # Secret part of the read-only link the owner shared ("" = not shared).
     share_token: str = ""
+    # The PDF of a finished report: "rendering" while a browser prints it (the
+    # report is already usable), then "ready" or "failed".
+    pdf: str = ""
     # Report-history row (GitHub sign-in mode): what was last written, and
     # whether the owner deleted the report (the row must go too).
     db_added: bool = False
@@ -767,7 +796,7 @@ class Job:
         return {
             kind: f"/api/jobs/{self.id}/files/{kind}"
             for kind, name in REPORT_FILES.items()
-            if (self.out_dir / name).is_file()
+            if (self.out_dir / name).is_file() and not (kind == "pdf" and self.pdf == "rendering")
         }
 
     def download_name(self, kind: str) -> str:
@@ -788,6 +817,7 @@ class Job:
             "warnings": self.warnings,
             "summary": self.summary,
             "share_token": self.share_token,
+            "pdf": self.pdf,
         }
 
     def to_json(self, share_base: str = "") -> dict:
@@ -823,12 +853,16 @@ class Job:
         )
         token = str(data.get("share_token") or "")
         job.share_token = token if _SHARE_RE.match(token) else ""
+        job.pdf = str(data.get("pdf") or "")
         # Its history row was written by the server that ran it.
         job.db_added, job.db_status = job.user_id is not None, job.status
         if job.active:  # the server stopped mid-run
             job.status = "failed"
             job.error = job.error or "The server stopped before this report finished."
             job.finished_at = job.finished_at or job.created_at
+        if job.pdf == "rendering":  # ... or while printing the PDF
+            job.pdf = "failed"
+            job.warnings.append(PDF_STOPPED)
         return job
 
     def redact(self, text: str) -> str:
@@ -1012,6 +1046,11 @@ class JobManager:
             if job.status == "cancelled" and job.process is None:
                 self._remove(job)  # it never started
             return
+        if job.pdf == "rendering":
+            job.delete_requested = True  # _render_pdf removes it once the browser stops
+            if job.process is not None:
+                _kill_tree(job.process)
+            return
         self._remove(job)
 
     # -- report history (GitHub sign-in mode) ------------------------------
@@ -1155,31 +1194,92 @@ class JobManager:
     async def shutdown(self, _app: web.Application | None = None) -> None:
         for job in list(self.jobs.values()):
             self.cancel(job)
+            if job.pdf == "rendering" and job.process is not None:
+                _kill_tree(job.process)
         if self._tasks:
             await asyncio.wait(self._tasks, timeout=10)
 
     # -- running ------------------------------------------------------------
 
     async def _run(self, job: Job) -> None:
-        try:
-            async with self._slots:
+        async with self._slots:
+            try:
                 if not job.cancel_requested:
                     await self._execute(job)
-        except Exception as exc:  # noqa: BLE001 - one broken run must not take the server down
-            log.exception("report %s crashed", job.id)
-            job.status, job.error = "failed", job.redact(str(exc) or exc.__class__.__name__)
+            except Exception as exc:  # noqa: BLE001 - one broken run must not take the server down
+                log.exception("report %s crashed", job.id)
+                job.status, job.error = "failed", job.redact(str(exc) or exc.__class__.__name__)
+            finally:
+                await self._wrap_up(job)
+            # The report is done and usable now; the PDF follows. It keeps the
+            # slot, so one browser at a time shares the host with report runs.
+            if job.status == "done" and not job.delete_requested:
+                await self._render_pdf(job)
+
+    async def _wrap_up(self, job: Job) -> None:
+        """A run has ended: settle its status, drop its tokens, save it."""
+        if job.active:
+            job.status = "cancelled" if job.cancel_requested else "failed"
+        self._scrub_run_log(job)
+        job.request = job.process = job.progress = None  # drop the tokens
+        job.redactions = self._server_paths(job.out_dir)
+        job.finished_at = _now()
+        if job.status == "done":  # decided before anyone sees the job as done
+            job.pdf = "ready" if "pdf" in job.files() else "rendering"
+        if job.delete_requested:
+            self._remove(job)
+        else:
+            self._save(job)
+        await self.sync(job)
+
+    async def _render_pdf(self, job: Job) -> None:
+        """Print report.html to report.pdf, in a process of its own started
+        after the report run has exited (so its memory is free again). Never
+        raises: without a PDF the report is still complete."""
+        if job.pdf != "rendering":
+            return
+        html_path = job.out_dir / REPORT_FILES["html"]
+        if find_browser() is None or not html_path.is_file():
+            job.pdf = "failed"
+            job.warnings.append(PDF_NO_BROWSER)
+            self._save(job)
+            return
+        job.phase = "Rendering PDF"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *pdf_command(self.settings.python, html_path),
+                cwd=PROJECT_ROOT,
+                env=pdf_env(os.environ),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                # Its own process group, so stopping it also stops the browser.
+                **({"start_new_session": True} if not sys.platform.startswith("win") else {}),
+            )
+            job.process = process
+            assert process.stdout is not None
+
+            async def drain() -> int:
+                await pump_lines(process.stdout, job.add_output)
+                return await process.wait()
+
+            try:
+                # pdfexport enforces PDF_TIMEOUT itself; this is the backstop.
+                await asyncio.wait_for(drain(), timeout=pdf_timeout() + 60)
+            except asyncio.TimeoutError:
+                _kill_tree(process)
+                await process.wait()
+        except Exception:  # noqa: BLE001 - the report must survive a broken PDF step
+            log.exception("PDF of report %s failed", job.id)
         finally:
-            if job.active:
-                job.status = "cancelled" if job.cancel_requested else "failed"
-            self._scrub_run_log(job)
-            job.request = job.process = job.progress = None  # drop the tokens
-            job.redactions = self._server_paths(job.out_dir)
-            job.finished_at = _now()
-            if job.delete_requested:
-                self._remove(job)
-            else:
-                self._save(job)
-            await self.sync(job)
+            job.process = None
+        job.pdf = "ready" if (job.out_dir / REPORT_FILES["pdf"]).is_file() else "failed"
+        if job.pdf == "failed" and not job.delete_requested:
+            job.warnings.append(PDF_FAILED)
+        if job.delete_requested:
+            self._remove(job)
+        else:
+            self._save(job)
 
     async def _execute(self, job: Job) -> None:
         request = job.request
@@ -1225,11 +1325,6 @@ class JobManager:
         elif code == 0:
             job.status = "done"
             job.summary = read_summary(job.out_dir)
-            if "pdf" not in job.files():
-                job.warnings.append(
-                    "The PDF could not be rendered (it needs Microsoft Edge or Google "
-                    "Chrome). Open the HTML report and print it to PDF instead."
-                )
         else:
             job.status = "failed"
             job.error = job.error or (job.log[-1].strip() if job.log else f"The run exited with code {code}.")

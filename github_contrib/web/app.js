@@ -813,6 +813,10 @@ function actionsHTML(job, logOpen) {
     const main = [];
     if (files.pdf) {
       main.push(`<a class="btn btn-primary btn-sm" href="${esc(files.pdf)}" download>${icon("download")}Download PDF</a>`);
+    } else if (job.pdf === "rendering") {
+      // The report is ready; its PDF is still being printed (minutes on a small server).
+      main.push(`<span class="btn btn-primary btn-sm" aria-disabled="true" role="status">` +
+        `<span class="spinner"></span>Preparing PDF…</span>`);
     }
     if (files.pdf || files.html) {
       main.push(`<button type="button" class="btn btn-outline btn-sm" data-action="share">${icon("share")}Share report</button>`);
@@ -1264,7 +1268,8 @@ async function refresh() {
     // The server may be restarting; keep trying on the normal schedule.
   }
   if (state.signedOut) return; // a 401 switched to the sign-in card
-  schedulePoll(state.jobs.some((job) => ACTIVE.has(job.status)) ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+  const busy = state.jobs.some((job) => ACTIVE.has(job.status) || job.pdf === "rendering");
+  schedulePoll(busy ? POLL_ACTIVE_MS : POLL_IDLE_MS);
 }
 
 // ---------- GitHub sign-in ----------

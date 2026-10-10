@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -589,6 +590,10 @@ def test_share_links_and_linkedin_summary():
                 assert pdf.status == 200 and pdf.headers["Content-Disposition"].startswith("inline")
                 html = await stranger.get(at(f"{path}/files/html"))
                 assert html.headers["Content-Security-Policy"].startswith("sandbox")
+                # "Save as PDF" opens the browser's print dialog, which a sandbox
+                # allows only with allow-modals.
+                assert "allow-modals" in html.headers["Content-Security-Policy"].split(";")[0]
+                assert "Open PDF" in body and "#save-pdf" not in body, "a server PDF comes first"
                 for hidden in (f"{path}/files/xlsx", f"{path}/files/md", f"/api/jobs/{job['id']}/log"):
                     assert (await stranger.get(at(hidden))).status == 404, hidden
                 # Only the owner can change sharing.
@@ -610,6 +615,10 @@ def test_share_links_and_linkedin_summary():
         # Links survive a restart, and die with the report.
         async with TestClient(TestServer(create_app(settings))) as visitor:
             assert (await visitor.get(path)).status == 200
+            # Without a PDF from the server, viewers make one in their own browser.
+            (jobs_dir / job["id"] / "report.pdf").unlink()
+            body = await (await visitor.get(path)).text()
+            assert "Open PDF" not in body and f'href="{path}/files/html#save-pdf"' in body
             restored = create_app(settings)
             manager = restored[MANAGER]
             manager.delete(manager.jobs[job["id"]])
@@ -629,6 +638,20 @@ def test_share_links_and_linkedin_summary():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(scenario(Path(tmp)))
     print("ok  test_share_links_and_linkedin_summary")
+
+
+def test_web_server_does_not_load_pandas():
+    # On a 512 MB host the ~40 MB pandas takes is needed by the PDF step.
+    code = (
+        "import sys, github_contrib.webapp; "
+        "print(sorted(m for m in ('pandas', 'numpy', 'matplotlib') if m in sys.modules))"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    assert done.stdout.strip().splitlines()[-1] == "[]", done.stdout
+    print("ok  test_web_server_does_not_load_pandas")
 
 
 def test_job_timeout_and_retention():

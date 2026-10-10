@@ -96,8 +96,10 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 - **Memory**: free and starter have 512 MB. Chromium needs a lot to print a
   long report, so the PDF is printed in parts (`PDF_PART_ROWS`) by Chromium's
   headless shell. If the server still gets close to its limit, the PDF step
-  stops and the report says so; the report itself stays. (Running out of
-  memory would restart the whole service and lose the report's files.)
+  stops and the report stays (running out of memory would restart the whole
+  service and lose the report's files). The report card then offers **Save as
+  PDF**, which prints the report in the reader's own browser: the PDF is made
+  on their device, however long the report is.
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is

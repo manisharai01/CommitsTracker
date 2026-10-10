@@ -12,7 +12,6 @@ PDF in a headless browser.
 from __future__ import annotations
 
 import base64
-import hashlib
 import html
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +21,7 @@ import pandas as pd
 from .filters import ReportScope
 from .insights import ExecSummary, Insights, RepoWork, build_exec_summary
 from .logging_config import get_logger
+from .reportscript import REPORT_CSP, SCRIPT, SCRIPT_HASH  # noqa: F401 - SCRIPT_HASH re-exported
 from .statistics import Statistics
 
 log = get_logger("htmlreport")
@@ -381,14 +381,27 @@ button.toggle:hover { background:#eef2f9; }
 .dash .dbar { height:14px; border-radius:4px; background:linear-gradient(90deg,var(--accent),var(--accent2));
               min-width:3px; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
 .dash td.dmeta { color:var(--muted); font-size:12.5px; white-space:nowrap; }
+.dash .nobr { white-space:nowrap; }
 /* Commit timeline appendix */
 #commit-timeline tr.month th { background:#eef2f9; color:#33476a; font-size:12.5px; letter-spacing:.04em;
                                text-transform:uppercase; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
 #commit-timeline td.cnum { color:var(--muted); text-align:right; white-space:nowrap; }
 /* Print / PDF */
 @media print {
-  body { background:#fff; }
+  /* Backgrounds print even with the print dialog's "Background graphics"
+     off: the header and table headings are white text on them. */
+  body { background:#fff; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
   .wrap { max-width:none; padding:0 4px; }
+  /* Tables fit the page width (on screen they scroll sideways): smaller
+     text, and long values wrap. */
+  .table-scroll { overflow:visible; }
+  table { font-size:11.5px; }
+  th, td { padding:6px 8px; overflow-wrap:break-word; }
+  .dash { font-size:11.5px; }
+  .dash th, .dash td { padding:6px 8px; }
+  .dash td.dbarcell { width:16%; min-width:0; }
+  .dash td.dname, .dash td.dmeta { white-space:normal; overflow-wrap:break-word; }
+  .dash td.dmeta { font-size:11px; }
   .card, .charts figure, .exec .proj, tr { break-inside:avoid; }
   section { break-inside:auto; }
   h2 { break-after:avoid; }
@@ -427,64 +440,7 @@ button.toggle:hover { background:#eef2f9; }
 }
 """
 
-_SCRIPT = """
-(function () {
-  function setAll(open, selector) {
-    document.querySelectorAll(selector || 'details.commitlist').forEach(function (d) { d.open = open; });
-  }
-  var btn = document.getElementById('toggle-commits');
-  if (btn) {
-    btn.addEventListener('click', function () {
-      var open = btn.dataset.state !== 'open';
-      setAll(open);
-      btn.dataset.state = open ? 'open' : 'closed';
-      btn.textContent = open ? 'Collapse all commit lists' : 'Expand all commit lists';
-    });
-  }
-  // A PDF prints only one part of a long appendix at a time: its rows FROM
-  // to TO-1, after the rest of the report (first part) or alone (later ones).
-  function printPart(from, to) {
-    var rows = document.querySelectorAll('#commit-timeline tbody > tr');
-    for (var i = 0; i < rows.length; i++) {
-      if (i < from || i >= to) rows[i].classList.add('pskip');
-    }
-    // A part that starts mid-month repeats that month's header.
-    var first = rows[from];
-    if (from > 0 && first && !first.classList.contains('month')) {
-      for (var j = from - 1; j >= 0; j--) {
-        if (rows[j].classList.contains('month')) {
-          var head = rows[j].cloneNode(true);
-          head.classList.remove('pskip');
-          head.cells[0].textContent += ' (continued)';
-          first.parentNode.insertBefore(head, first);
-          break;
-        }
-      }
-    }
-    if (from > 0) document.body.classList.add('pcont');
-    if (to < rows.length) document.body.classList.add('pmore');
-  }
-  // For PDF/printing only the chronological appendix is expanded; collapsed
-  // per-repo lists are hidden by the print stylesheet so raw commit data
-  // appears once, at the end, in time order ('#print', or '#print=FROM-TO'
-  // for one part of it).
-  var print = /^#print(?:=(\\d+)-(\\d+))?$/.exec(location.hash);
-  if (print) {
-    setAll(true, 'details.timeline');
-    if (print[1]) printPart(+print[1], +print[2]);
-  }
-  window.addEventListener('beforeprint', function () { setAll(true, 'details.timeline'); });
-})();
-"""
-
-#: The only script the report may run (anything injected would not match).
-SCRIPT_HASH = "sha256-" + base64.b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode("ascii")
-#: Content-Security-Policy of report.html: no network access at all (charts
-#: are data URIs), inline styles, and only the script above.
-REPORT_CSP = (
-    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
-    f"script-src '{SCRIPT_HASH}'; base-uri 'none'; form-action 'none'"
-)
+_SCRIPT = SCRIPT
 
 
 def _esc(value: object) -> str:
@@ -573,7 +529,11 @@ def _render_repo_dashboard(insights: Insights) -> str:
         pr = f"{w.pull_requests} ({w.merged_pull_requests} merged)" if w.pull_requests else "—"
         span = ""
         if w.first_activity and w.last_activity:
-            span = f"{w.first_activity.date()} → {w.last_activity.date()}"
+            # Each date stays on one line when the period wraps (in print).
+            span = (
+                f"<span class='nobr'>{w.first_activity.date()}</span> → "
+                f"<span class='nobr'>{w.last_activity.date()}</span>"
+            )
         rows.append(
             "<tr>"
             f"<td class='dname'>{_esc(w.full_name)}</td>"
@@ -582,7 +542,7 @@ def _render_repo_dashboard(insights: Insights) -> str:
             f"<td class='dshare'>{share:.1f}%</td>"
             f"<td class='dmeta'>{_esc(pr)}</td>"
             f"<td class='dmeta'>{_esc(w.language or '—')}</td>"
-            f"<td class='dmeta'>{_esc(span)}</td>"
+            f"<td class='dmeta'>{span}</td>"
             "</tr>"
         )
     return (

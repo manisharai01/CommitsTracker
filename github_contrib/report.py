@@ -153,7 +153,9 @@ def _warn_about_token(client: GitHubClient, account, scopes: str | None, coverag
         if "read:org" not in granted and "admin:org" not in granted:
             coverage.warn(
                 f"[{account.login}] classic token {account.token_env} lacks 'read:org'; "
-                "organization membership and some organization repositories may be missing."
+                "organization membership and some organization repositories may be missing. "
+                "To add it: GitHub > Settings > Developer settings > Personal access tokens > "
+                "Tokens (classic) > this token > tick 'read:org' (under 'admin:org') > Update token."
             )
 
 

@@ -811,12 +811,21 @@ function actionsHTML(job, logOpen) {
   const links = [];
   if (job.status === "done" && !job.expired) {
     const main = [];
+    // "Save as PDF" prints the report in this browser (its print dialog), so it
+    // works however long the report is, also when the server couldn't make one.
+    const savePdf = (style) => files.html
+      ? `<a class="btn ${style} btn-sm" href="${esc(files.html)}#save-pdf" target="_blank" rel="noopener noreferrer" ` +
+        `title="Opens your browser's print dialog: choose “Save as PDF”">${icon("download")}Save as PDF</a>`
+      : "";
     if (files.pdf) {
       main.push(`<a class="btn btn-primary btn-sm" href="${esc(files.pdf)}" download>${icon("download")}Download PDF</a>`);
     } else if (job.pdf === "rendering") {
       // The report is ready; its PDF is still being printed (minutes on a small server).
       main.push(`<span class="btn btn-primary btn-sm" aria-disabled="true" role="status">` +
         `<span class="spinner"></span>Preparing PDF…</span>`);
+      main.push(savePdf("btn-outline"));
+    } else {
+      main.push(savePdf("btn-primary"));
     }
     if (files.pdf || files.html) {
       main.push(`<button type="button" class="btn btn-outline btn-sm" data-action="share">${icon("share")}Share report</button>`);

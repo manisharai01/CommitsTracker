@@ -65,10 +65,10 @@ from .config import (
     resolve_timezone,
     token_env_candidates,
 )
-from .htmlreport import REPORT_CSP
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
 from .pdfexport import EXIT_NO_MEMORY, find_browser, pdf_timeout
+from .reportscript import REPORT_CSP  # not htmlreport: pandas would cost the server ~40 MB
 from .store import ReportRow, Store, make_store
 
 log = get_logger("webapp")
@@ -136,20 +136,21 @@ CHILD_ENV_ALLOWLIST = frozenset(
     )
 )
 
-#: What a report card says when its PDF couldn't be made.
+#: What a report card says when its PDF couldn't be made. "Save as PDF" (the
+#: card's button) makes it in the reader's own browser instead.
 PDF_NO_BROWSER = (
-    "The PDF could not be rendered (it needs Microsoft Edge or Google Chrome). "
-    "Open the HTML report and print it to PDF instead."
+    "This server can't make PDFs (it needs Microsoft Edge or Google Chrome). "
+    "Use Save as PDF to make it on your device."
 )
 PDF_FAILED = (
-    "The PDF could not be rendered on this server. Open the HTML report and print it "
-    "to PDF instead (the report itself is complete)."
+    "The PDF could not be made on this server. Use Save as PDF to make it on your "
+    "device (the report itself is complete)."
 )
 PDF_NO_MEMORY = (
-    "The PDF needs more memory than this server has, so it wasn't made. Open the HTML "
-    "report and print it to PDF instead (the report itself is complete)."
+    "This report's PDF needs more memory than the server has. Use Save as PDF to make "
+    "it on your device (the report itself is complete)."
 )
-PDF_STOPPED = "The server stopped before the PDF was ready. Open the HTML report and print it to PDF instead."
+PDF_STOPPED = "The server stopped before the PDF was ready. Use Save as PDF to make it on your device."
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ACTIVE_STATUSES = frozenset({"queued", "running"})
@@ -1394,8 +1395,11 @@ _INDEX_CSP = "; ".join(
     )
 )
 #: report.html opens in a sandbox: an opaque origin with no cookies, storage
-#: or network access, on top of the page's own policy.
-_REPORT_HTML_CSP = f"sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; {REPORT_CSP}"
+#: or network access, on top of the page's own policy. allow-modals lets
+#: "Save as PDF" open the browser's print dialog.
+_REPORT_HTML_CSP = (
+    f"sandbox allow-scripts allow-modals allow-popups allow-popups-to-escape-sandbox; {REPORT_CSP}"
+)
 
 
 def _client_address(request: web.Request, settings: Settings) -> str:
@@ -1890,6 +1894,12 @@ async def _shared_page(request: web.Request) -> web.Response:
     if "pdf" in files:
         buttons.append(f'<a class="btn btn-primary" href="{base}/pdf">Open PDF</a>')
         buttons.append(f'<a class="btn btn-outline" href="{base}/pdf?download">Download</a>')
+    elif "html" in files:
+        # No PDF from the server: the viewer's browser prints one.
+        buttons.append(
+            f'<a class="btn btn-primary" href="{base}/html#save-pdf" target="_blank" '
+            'rel="noopener noreferrer">Save as PDF</a>'
+        )
     if "html" in files:
         buttons.append(
             f'<a class="btn btn-outline" href="{base}/html" target="_blank" '

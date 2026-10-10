@@ -285,10 +285,11 @@ def _run_browser(cmd: list[str], log_path: Path, deadline: float) -> tuple[str, 
             use = memory_use()
             if use is not None and use[0] > use[1] - MEMORY_HEADROOM:
                 log.warning(
-                    "PDF export stopped: the server was about to run out of memory (%d of %d MB in use). "
-                    "Set PDF_PART_ROWS lower, or give the server more memory.",
+                    "PDF export stopped: the server was about to run out of memory (%d of %d MB in use).",
                     use[0] // _MB, use[1] // _MB,
                 )
+                # For whoever runs the server; report cards show only warnings.
+                log.info("More memory for the server (or a lower PDF_PART_ROWS) lets it make this PDF.")
                 return "memory", None
     finally:
         _stop(process)

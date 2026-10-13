@@ -159,6 +159,77 @@ def _warn_about_token(client: GitHubClient, account, scopes: str | None, coverag
             )
 
 
+#: Latest commits sampled per owned repository by :func:`_check_unlinked_commits`.
+UNLINKED_SAMPLE = 100
+
+
+async def _check_unlinked_commits(
+    repos: list[RepoRecord],
+    commits: list[CommitRecord],
+    config: AppConfig,
+    client_for: Callable[[RepoRecord], GitHubClient],
+    coverage: Coverage,
+) -> None:
+    """Never skip a tracked account's own repository silently.
+
+    A commit counts when GitHub links it to a tracked account (its email is
+    verified there) or its email is a --author-email. Commits made with any
+    other email are linked to nobody, so they can't be counted — in a
+    repository the account owns they are almost always its own work (another
+    machine, a work address). Sample each owned repository's latest commits
+    and name every such email, with what to do about it. Commits linked to
+    other GitHub accounts are other people's work and stay out of it.
+    """
+    tracked = {login.lower() for login in config.target_logins}
+    counted = {(c.full_name, c.sha) for c in commits}
+    owned = [r for r in repos if r.owner.lower() in tracked]
+
+    async def check(repo: RepoRecord) -> None:
+        try:
+            items = await client_for(repo).get_json(
+                f"/repos/{repo.full_name}/commits", params={"per_page": UNLINKED_SAMPLE}
+            )
+        except GitHubError as exc:
+            coverage.warn(f"{repo.full_name}: could not check it for commits that weren't counted ({exc}).")
+            return
+        items = items if isinstance(items, list) else []  # empty repository: nothing to count
+        sample = f" of its latest {len(items)}" if len(items) >= UNLINKED_SAMPLE else ""
+        missed: dict[str, int] = {}
+        not_collected = 0
+        for item in items:
+            author = (item.get("commit") or {}).get("author") or {}
+            when = parse_github_datetime(author.get("date"))
+            if (
+                (repo.full_name, item.get("sha")) in counted
+                or not _in_period(when, config)
+                # A fork's history from before it was forked is upstream work.
+                or (repo.is_fork and repo.created_at and when and when < repo.created_at)
+            ):
+                continue
+            linked = str((item.get("author") or {}).get("login") or "")
+            if linked.lower() in tracked:
+                not_collected += 1  # should never happen: a gap in collection
+            elif not linked:
+                who = f"{author.get('name') or '?'} <{author.get('email') or '?'}>"
+                missed[who] = missed.get(who, 0) + 1
+            # else: linked to someone else's account, so not this report's work
+        if not_collected:
+            coverage.warn(
+                f"{repo.full_name}: {not_collected} commit(s){sample} by the tracked accounts were "
+                "not collected, so the counts miss them. Run the report again."
+            )
+        if missed:
+            total = sum(missed.values())
+            names = ", ".join(f"{who} ({n})" for who, n in sorted(missed.items(), key=lambda kv: (-kv[1], kv[0])))
+            coverage.warn(
+                f"{repo.full_name}: {total} commit(s){sample} were not counted because their email "
+                f"isn't linked to any GitHub account: {names}. If they are yours, add the email to "
+                "your GitHub account (Settings > Emails) or under Commit emails, and run again."
+            )
+
+    await asyncio.gather(*(check(r) for r in owned))
+
+
 def _search_window(config: AppConfig) -> tuple[datetime, datetime]:
     """The author-date window searched for commits (the reporting period)."""
     start = config.since.astimezone(timezone.utc) if config.since else SEARCH_START
@@ -486,6 +557,10 @@ async def collect(config: AppConfig) -> CollectedData:
                         recovered += 1
             if recovered:
                 log.info("recovered %d commit(s) found only in pull requests", recovered)
+
+        # --- the accounts' own repos: commits no account is linked to ------
+        if config.collect_commits and scan_repos:
+            await _check_unlinked_commits(scan_repos, commits, config, client_for, coverage)
 
         # --- line-level stats (one request per commit in the period) ------
         if config.fetch_commit_stats and commits:

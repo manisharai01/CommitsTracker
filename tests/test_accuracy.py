@@ -276,6 +276,65 @@ def test_pr_commits_recover_deleted_branch_work():
 # Counting
 # ---------------------------------------------------------------------------
 
+def _api_commit(sha, *, login=None, name="Neha", email="neha@x.com", when="2026-04-21T11:33:00Z") -> dict:
+    """One item of GET /repos/{repo}/commits (``author`` is None when no account has the email)."""
+    return {"sha": sha, "author": {"login": login} if login else None,
+            "commit": {"author": {"name": name, "email": email, "date": when}}}
+
+
+def test_owned_repos_never_hide_commits_with_unlinked_emails():
+    from github_contrib.report import _check_unlinked_commits
+
+    work = "studio@work.example"
+    routes = {
+        # Every commit made with a work email no GitHub account has (the
+        # manisharai01/video-automate case): 0 counted, so it must be reported.
+        "/repos/neha/video-automate/commits": [
+            _api_commit(f"v{i}", name="Local AI Video Studio", email=work) for i in range(3)
+        ],
+        # Counted, a teammate's (linked to their own account), and one unlinked.
+        "/repos/neha/app/commits": [
+            _api_commit("a1", login="neha"), _api_commit("a2", login="teammate"),
+            _api_commit("a3", email="neha@laptop.local"),
+        ],
+        # A fork's history from before it was forked is upstream work.
+        "/repos/neha/fork/commits": [_api_commit("f1", email="upstream@dev.example", when="2020-01-01T00:00:00Z")],
+        # Linked to the account but not collected: a gap, reported as one.
+        "/repos/neha/gap/commits": [_api_commit("g1", login="Neha")],
+        "/repos/neha/empty/commits": None,  # GitHub answers 409 for an empty repository
+        "/repos/acme/org-app/commits": [_api_commit("o1", email="someone@acme.example")],
+    }
+    client = FakeClient(routes)
+    fork = replace(_repo("neha/fork", fork=True), created_at=datetime(2025, 1, 1, tzinfo=UTC))
+    repos = [_repo("neha/video-automate"), _repo("neha/app"), fork, _repo("neha/gap"),
+             _repo("neha/empty"), _repo("acme/org-app")]
+    commits = [_commit("a1", repo="neha/app")]
+    config = AppConfig(accounts=[], target_logins=["neha"])
+
+    coverage = Coverage()
+    asyncio.run(_check_unlinked_commits(repos, commits, config, lambda _repo: client, coverage))
+    notes = coverage.notes
+    assert any(n.startswith("neha/video-automate: 3 commit(s) were not counted")
+               and f"Local AI Video Studio <{work}> (3)" in n and "Settings > Emails" in n for n in notes), notes
+    assert any(n.startswith("neha/app: 1 commit(s)") and "<neha@laptop.local> (1)" in n for n in notes), notes
+    assert not any("teammate" in n for n in notes), "commits linked to other accounts aren't the report's"
+    assert any(n.startswith("neha/gap: 1 commit(s) by the tracked accounts were not collected") for n in notes), notes
+    assert not any(n.startswith(("neha/fork", "neha/empty", "acme/")) for n in notes), notes
+    assert "/repos/acme/org-app/commits" not in [path for path, _ in client.calls], "only own repos are sampled"
+
+    # Outside the report period: not this report's commits.
+    coverage = Coverage()
+    later = replace(config, since=datetime(2026, 6, 1, tzinfo=UTC))
+    asyncio.run(_check_unlinked_commits(repos, commits, later, lambda _repo: client, coverage))
+    assert coverage.notes == [], coverage.notes
+    # A repository that can't be read says so instead of passing as clean.
+    coverage = Coverage()
+    broken = FakeClient({"/repos/neha/app/commits": GitHubError("Access denied (403)")})
+    asyncio.run(_check_unlinked_commits([_repo("neha/app")], [], config, lambda _repo: broken, coverage))
+    assert coverage.notes and coverage.notes[0].startswith("neha/app: could not check it"), coverage.notes
+    print("ok  test_owned_repos_never_hide_commits_with_unlinked_emails")
+
+
 def test_dedupe_counts_each_change_once():
     repos = [_repo("acme/app"), _repo("neha/app", fork=True)]
     t = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)

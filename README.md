@@ -428,7 +428,15 @@ After that, `python github_report.py --all` runs for both without extra flags.
    commits that exist on that branch alone are read. A branch more than 1,000
    commits ahead, or with no history in common (`gh-pages`), is read per author
    instead. Upstream projects only have their default branch scanned.
-5. **Line statistics** (GraphQL) — 25 commits per query, for the commits inside
+5. **Own repositories check** — a commit counts when GitHub links it to a
+   tracked account (its email is verified there) or its email is a commit
+   email. For every repository a tracked account owns, the latest 100 commits
+   are checked: commits made with an email no GitHub account has (another
+   machine, a work address) are listed by name and email in Data completeness
+   and on the report card, so a repository is never skipped silently. Add the
+   email to the GitHub account (Settings → Emails) or as a commit email, and
+   run again.
+6. **Line statistics** (GraphQL) — 25 commits per query, for the commits inside
    the period (merge commits are skipped: their diff repeats the merged branch).
 
 Many repositories, branches or commits share one GraphQL query. A query GitHub

@@ -99,14 +99,16 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
   stops and the report stays (running out of memory would restart the whole
   service and lose the report's files). The report card then offers **Save as
   PDF**, which prints the report in the reader's own browser: the PDF is made
-  on their device, however long the report is.
+  on their device, however long the report is. Why the server made no PDF is
+  written to the server log (Render → **Logs**: `report <id>: no PDF (...)`),
+  never on the report card.
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is
   wiped by each deploy, restart or sleep. The **history** (date, period,
-  status) is in the database, so old entries stay listed with a **Run again**
-  button: as expired after `RETENTION_HOURS`, or as lost in a restart if the
-  files went sooner.
+  status and a finished report's numbers) is in the database, so old entries
+  stay listed with their commits, pull requests, repositories, active days and
+  lines, and a **Run again** button.
 - Supabase's free tier pauses a project after a week without activity. Resume
   it from the Supabase dashboard if the history stops loading.
 
@@ -124,5 +126,6 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
   repositories. Organizations with SAML SSO need the token authorized for
   them (github.com → Settings → Tokens → Configure SSO).
 - **The database** holds only GitHub user ids and, per report: id, time,
-  period and status. Row level security is on with no policies, so Supabase's
-  public REST API can't read it.
+  period, status and, once it is done, six numbers (commits, pull requests,
+  repositories, active days, lines added and deleted). Row level security is
+  on with no policies, so Supabase's public REST API can't read it.

@@ -736,13 +736,6 @@ function statusChip(status, expired = false) {
   return `<span class="chip chip-${esc(status)}">${lead}${esc(label)}</span>`;
 }
 
-function expiredHTML(job) {
-  const text = job.status !== "done" ? "The details of this run have expired."
-    : job.lost ? "This report's files were lost when the server restarted. Run it again for a fresh copy."
-    : "The files for this report have expired. Run it again for a fresh copy.";
-  return `<p class="report-text expired-note">${icon("clock")}<span>${text}</span></p>`;
-}
-
 function runningHTML(job) {
   const progress = job.progress;
   const pct = progress && progress.total ? Math.round((progress.n / progress.total) * 100) : null;
@@ -782,7 +775,8 @@ function doneHTML(job) {
 }
 
 function statusHTML(job) {
-  if (job.expired) return expiredHTML(job);
+  // A history entry (its files are gone) shows what it recorded: the numbers
+  // of a finished report, or how the run ended.
   switch (job.status) {
     case "queued":
       return '<p class="report-text muted">Waiting for the reports ahead of it to finish.</p>';
@@ -791,6 +785,8 @@ function statusHTML(job) {
     case "done":
       return doneHTML(job);
     case "failed":
+      // A history entry keeps no error text: its "Failed" chip says it all.
+      if (job.expired) return "";
       return `<div class="alert">${icon("alert")}<span>${esc(job.error || "The report failed.")}</span></div>`;
     default:
       return '<p class="report-text muted">Cancelled before it finished.</p>';

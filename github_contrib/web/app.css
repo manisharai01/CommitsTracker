@@ -541,8 +541,6 @@ dialog.sheet::backdrop { background: rgba(91, 112, 131, 0.4); }
   .signin h2 { font-size: 26px; line-height: 32px; }
 }
 
-.expired-note { display: flex; align-items: flex-start; gap: 6px; color: var(--muted); }
-.expired-note .icon { width: 16px; height: 16px; margin-top: 2px; }
 .report-expired > .avatar { opacity: 0.6; }
 
 @media (prefers-reduced-motion: reduce) {

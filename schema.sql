@@ -4,8 +4,9 @@
 -- idempotent). Paste this into the Supabase SQL editor to create the tables
 -- by hand. Keep it in sync with SCHEMA_SQL in github_contrib/store.py.
 --
--- Stored on purpose: nothing but ids, times, the period and the status.
--- No tokens, logins, emails, report files, summaries or options.
+-- Stored on purpose: nothing but ids, times, the period, the status and a
+-- finished report's headline numbers (so the history can show them after the
+-- report's files are gone). No tokens, logins, emails, report files or options.
 
 create table if not exists users (
     id         bigint primary key,                 -- the GitHub numeric user id
@@ -21,6 +22,14 @@ create table if not exists reports (
 );
 
 create index if not exists reports_user_created_idx on reports (user_id, created_at desc);
+
+-- A finished report's headline numbers (empty until it is done).
+alter table reports add column if not exists commits integer;
+alter table reports add column if not exists pull_requests integer;
+alter table reports add column if not exists repositories integer;
+alter table reports add column if not exists active_days integer;
+alter table reports add column if not exists lines_added bigint;
+alter table reports add column if not exists lines_deleted bigint;
 
 -- Supabase exposes the public schema through its REST API. Row level security
 -- with no policies denies every request made that way; the app connects as the

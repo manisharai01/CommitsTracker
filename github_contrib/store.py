@@ -3,9 +3,11 @@
 The database holds the bare minimum, on purpose (see ``schema.sql``):
 
 * ``users``   — the GitHub numeric user id and when it first signed in;
-* ``reports`` — id (= the job id), owner, created_at, period, status.
+* ``reports`` — id (= the job id), owner, created_at, period, status, and
+  once a report is done its headline numbers (:data:`NUMBER_COLUMNS`), so the
+  history still shows them after the report's files are gone.
 
-No tokens, logins, emails, report files, summaries or options are stored.
+No tokens, logins, emails, report files or options are stored.
 
 :class:`PostgresStore` talks to Postgres (e.g. Supabase) through asyncpg;
 :class:`MemoryStore` keeps the same data in memory, for tests and for running
@@ -21,7 +23,7 @@ import abc
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -49,11 +51,21 @@ create table if not exists reports (
 
 create index if not exists reports_user_created_idx on reports (user_id, created_at desc);
 
+alter table reports add column if not exists commits integer;
+alter table reports add column if not exists pull_requests integer;
+alter table reports add column if not exists repositories integer;
+alter table reports add column if not exists active_days integer;
+alter table reports add column if not exists lines_added bigint;
+alter table reports add column if not exists lines_deleted bigint;
+
 alter table users enable row level security;
 alter table reports enable row level security;
 """
 
 UNFINISHED = ("queued", "running")
+
+#: A finished report's headline numbers, one nullable column each.
+NUMBER_COLUMNS = ("commits", "pull_requests", "repositories", "active_days", "lines_added", "lines_deleted")
 
 
 class StoreError(RuntimeError):
@@ -67,6 +79,12 @@ class ReportRow:
     created_at: datetime
     period: str  # "<since>..<until>"; ".." = all time
     status: str
+    numbers: dict[str, int] = field(default_factory=dict)  # NUMBER_COLUMNS that are set
+
+
+def _numbers(values: dict[str, int] | None) -> dict[str, int]:
+    """Only the known number columns, as ints (anything else is dropped)."""
+    return {key: int(values[key]) for key in NUMBER_COLUMNS if (values or {}).get(key) is not None}
 
 
 def _uuid(report_id: str) -> uuid.UUID | None:
@@ -95,7 +113,8 @@ class Store(abc.ABC):
     async def add_report(self, report_id: str, user_id: int, period: str, status: str) -> None: ...
 
     @abc.abstractmethod
-    async def set_status(self, report_id: str, status: str) -> None: ...
+    async def set_status(self, report_id: str, status: str, numbers: dict[str, int] | None = None) -> None:
+        """Update the status, and with ``numbers`` the headline numbers too."""
 
     @abc.abstractmethod
     async def list_reports(self, user_id: int, limit: int = 100) -> list[ReportRow]: ...
@@ -128,11 +147,12 @@ class MemoryStore(Store):
             str(key), ReportRow(str(key), int(user_id), datetime.now(timezone.utc), period, status)
         )
 
-    async def set_status(self, report_id: str, status: str) -> None:
+    async def set_status(self, report_id: str, status: str, numbers: dict[str, int] | None = None) -> None:
         key = str(_uuid(report_id))
         row = self.reports.get(key)
         if row is not None:
-            self.reports[key] = ReportRow(row.id, row.user_id, row.created_at, row.period, status)
+            kept = _numbers(numbers) if numbers is not None else row.numbers
+            self.reports[key] = replace(row, status=status, numbers=kept)
 
     async def list_reports(self, user_id: int, limit: int = 100) -> list[ReportRow]:
         rows = [row for row in self.reports.values() if row.user_id == int(user_id)]
@@ -250,22 +270,33 @@ class PostgresStore(Store):
                     key, int(user_id), period, status,
                 )
 
-    async def set_status(self, report_id: str, status: str) -> None:
+    async def set_status(self, report_id: str, status: str, numbers: dict[str, int] | None = None) -> None:
         key = _uuid(report_id)
         if key is None:
             return
         pool = await self._connect()
-        await pool.execute("update reports set status = $2 where id = $1", key, status)
+        if numbers is None:
+            await pool.execute("update reports set status = $2 where id = $1", key, status)
+            return
+        values = _numbers(numbers)
+        columns = ", ".join(f"{name} = ${i}" for i, name in enumerate(NUMBER_COLUMNS, start=3))
+        await pool.execute(
+            f"update reports set status = $2, {columns} where id = $1",
+            key, status, *(values.get(name) for name in NUMBER_COLUMNS),
+        )
 
     async def list_reports(self, user_id: int, limit: int = 100) -> list[ReportRow]:
         pool = await self._connect()
         rows = await pool.fetch(
-            "select id, user_id, created_at, period, status from reports "
+            f"select id, user_id, created_at, period, status, {', '.join(NUMBER_COLUMNS)} from reports "
             "where user_id = $1 order by created_at desc limit $2",
             int(user_id), max(0, int(limit)),
         )
         return [
-            ReportRow(str(r["id"]), int(r["user_id"]), r["created_at"], r["period"], r["status"])
+            ReportRow(
+                str(r["id"]), int(r["user_id"]), r["created_at"], r["period"], r["status"],
+                _numbers({name: r[name] for name in NUMBER_COLUMNS}),
+            )
             for r in rows
         ]
 

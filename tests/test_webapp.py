@@ -220,6 +220,12 @@ def test_job_output_parsing():
     job.add_output("2026-10-06 10:00:01 | WARNING | github_contrib.report | token lacks 'read:org'")
     job.add_output("2026-10-06 10:00:01 | WARNING | github_contrib.report | token lacks 'read:org'")
     assert job.warnings == ["token lacks 'read:org'"]
+    # A rate-limit pause is the live status of the moment, not a finding of the report.
+    pause = "[alice] Rate limited (403); sleeping 1508s before retry 1/5."
+    job.add_output(f"2026-10-06 10:00:02 | WARNING | github_contrib.client | {pause}")
+    job.add_output("2026-10-06 10:00:02 | WARNING | github_contrib.client | [alice] GraphQL rate limited; sleeping 61s before retry 1/5.")
+    assert job.warnings == ["token lacks 'read:org'"] and "GraphQL rate limited" in job.message
+    assert pause in job.log[-2], "still in the run log"
     job.add_output(f"leaked {TOKEN} in C:\\srv\\reports\\j\\report.pdf")
     assert TOKEN not in job.log[-1] and "••••" in job.log[-1] and "<report>" in job.log[-1]
     job.add_output("Configuration error: Missing GitHub token(s) for: alice")
@@ -335,29 +341,27 @@ def test_pdf_is_printed_after_the_report_is_done():
                 assert record["pdf"] == "ready" and commands[-1][1].endswith("report.html")
                 assert (await client.get(job["files"]["pdf"])).status == 200
 
-                # A PDF that fails leaves a complete report and says why.
-                mode["value"] = "fail"
-                job_id = await start()
-                await until(lambda: _pdf_is(client, job_id, "failed"))
-                job = await job_state(client, job_id)
-                assert job["status"] == "done" and "pdf" not in job["files"] and "html" in job["files"]
-                assert webapp.PDF_FAILED in job["warnings"]
-                assert any("took longer than 900 seconds" in w for w in job["warnings"])
+                # A PDF that fails (too slow, or the server short of memory)
+                # leaves a complete report; why is the server log's business,
+                # never the card's or the run log's (the card offers Save as PDF).
+                async def run_log(job_id: str) -> str:
+                    return "\n".join((await (await client.get(f"/api/jobs/{job_id}/log")).json())["lines"])
 
-                # Stopped before the server ran out of memory: the report stays, and says so.
-                mode["value"] = "nomem"
-                job_id = await start()
-                await until(lambda: _pdf_is(client, job_id, "failed"))
-                job = await job_state(client, job_id)
-                assert job["status"] == "done" and "html" in job["files"]
-                assert webapp.PDF_NO_MEMORY in job["warnings"] and webapp.PDF_FAILED not in job["warnings"]
+                for failing in ("fail", "nomem"):
+                    mode["value"] = failing
+                    job_id = await start()
+                    await until(lambda: _pdf_is(client, job_id, "failed"))
+                    job = await job_state(client, job_id)
+                    assert job["status"] == "done" and "pdf" not in job["files"] and "html" in job["files"]
+                    assert job["warnings"] == ["[nopdf] classic token lacks 'read:org'"], job["warnings"]
+                    assert "PDF export" not in await run_log(job_id)
 
                 # No browser at all: no PDF step is started.
                 webapp.find_browser = lambda: None
                 count = len(commands)
                 job_id = await start()
                 await until(lambda: _pdf_is(client, job_id, "failed"))
-                assert webapp.PDF_NO_BROWSER in (await job_state(client, job_id))["warnings"]
+                assert (await job_state(client, job_id))["warnings"] == ["[nopdf] classic token lacks 'read:org'"]
                 assert len(commands) == count
                 webapp.find_browser = lambda: "chromium"
 
@@ -382,10 +386,10 @@ def test_pdf_is_printed_after_the_report_is_done():
     # A server that stopped mid-PDF: the report stays, the PDF is marked failed.
     with tempfile.TemporaryDirectory() as tmp:
         record = {"accounts": [{"login": "a"}], "created_at": "2026-10-06T10:00:00+00:00",
-                  "status": "done", "pdf": "rendering", "warnings": []}
+                  "status": "done", "pdf": "rendering",
+                  "warnings": ["[a] Rate limited (403); sleeping 1508s before retry 1/5.", "token lacks 'read:org'"]}
         job = Job.from_record(record, Path(tmp) / "x")
-        from github_contrib.webapp import PDF_STOPPED
-        assert job.status == "done" and job.pdf == "failed" and job.warnings == [PDF_STOPPED]
+        assert job.status == "done" and job.pdf == "failed" and job.warnings == ["token lacks 'read:org'"]
     print("ok  test_pdf_is_printed_after_the_report_is_done")
 
 

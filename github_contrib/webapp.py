@@ -106,6 +106,21 @@ SUMMARY_KEYS: tuple[str, ...] = (
     "data_completeness_warnings",
 )
 
+#: A finished report's card numbers kept in its history row (column -> summary
+#: metric), so the history still shows them once the report's files are gone.
+HISTORY_NUMBERS: dict[str, str] = {
+    "commits": "total_lifetime_commits",
+    "pull_requests": "total_pull_requests",
+    "repositories": "repositories_contributed_to",
+    "active_days": "active_days",
+    "lines_added": "total_lines_added",
+    "lines_deleted": "total_lines_deleted",
+}
+
+#: Warnings of the moment, not about the report (a rate-limit pause before a
+#: retry): they show as the live status while the run lasts, not on the card.
+_TRANSIENT_WARNING_RE = re.compile(r"\brate limited\b.*\bsleeping\b", re.IGNORECASE)
+
 #: Environment variables the form replaces, keyed by form field name.
 FORM_ENV_VARS: dict[str, str] = {
     "author_emails": "AUTHOR_EMAILS",
@@ -136,21 +151,6 @@ CHILD_ENV_ALLOWLIST = frozenset(
     )
 )
 
-#: What a report card says when its PDF couldn't be made. "Save as PDF" (the
-#: card's button) makes it in the reader's own browser instead.
-PDF_NO_BROWSER = (
-    "This server can't make PDFs (it needs Microsoft Edge or Google Chrome). "
-    "Use Save as PDF to make it on your device."
-)
-PDF_FAILED = (
-    "The PDF could not be made on this server. Use Save as PDF to make it on your "
-    "device (the report itself is complete)."
-)
-PDF_NO_MEMORY = (
-    "This report's PDF needs more memory than the server has. Use Save as PDF to make "
-    "it on your device (the report itself is complete)."
-)
-PDF_STOPPED = "The server stopped before the PDF was ready. Use Save as PDF to make it on your device."
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ACTIVE_STATUSES = frozenset({"queued", "running"})
@@ -714,19 +714,15 @@ def _split_period(period: str) -> tuple[str, str]:
     return (since if _DATE_RE.match(since) else "", until if _DATE_RE.match(until) else "")
 
 
-def expired_report_json(
-    row: ReportRow, login: str, retention_hours: float = 0.0, now: datetime | None = None
-) -> dict:
-    """A history row whose files are gone, shaped like a job for the page."""
+def expired_report_json(row: ReportRow, login: str) -> dict:
+    """A history row whose files are gone, shaped like a job for the page:
+    its period, status and (once done) its numbers."""
     since, until = _split_period(row.period)
     status = row.status if row.status not in ACTIVE_STATUSES else "failed"  # its run died elsewhere
     created = row.created_at
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    # Files are deleted once the retention period is over; gone sooner, they
-    # were lost when the server restarted (its disk doesn't survive one).
-    age = (now or datetime.now(timezone.utc)) - created
-    lost = retention_hours <= 0 or age < timedelta(hours=retention_hours)
+    summary = {HISTORY_NUMBERS[name]: str(value) for name, value in row.numbers.items() if name in HISTORY_NUMBERS}
     return {
         "id": row.id,
         "status": status,
@@ -736,14 +732,26 @@ def expired_report_json(
         "accounts": [{"login": login, "emails": []}],
         "logins": [login],
         "files": {},
-        "summary": {},
+        "summary": summary,
         "warnings": [],
         "error": "",
         "share_url": "",
         "log_count": 0,
         "expired": True,
-        "lost": lost,
     }
+
+
+def history_numbers(job: Job) -> dict[str, int]:
+    """A finished report's card numbers for its history row."""
+    numbers: dict[str, int] = {}
+    for name, metric in HISTORY_NUMBERS.items():
+        if name == "pull_requests" and job.options.get("pull_requests") is False:
+            continue  # not collected: 0 would be wrong
+        try:
+            numbers[name] = int(float(job.summary[metric]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return numbers
 
 
 @dataclass(eq=False)
@@ -860,7 +868,7 @@ class Job:
             finished_at=data.get("finished_at", ""),
             status=data.get("status", "failed"),
             error=data.get("error", ""),
-            warnings=list(data.get("warnings", [])),
+            warnings=[w for w in data.get("warnings", []) if not _TRANSIENT_WARNING_RE.search(str(w))],
             summary=dict(data.get("summary", {})),
         )
         token = str(data.get("share_token") or "")
@@ -872,9 +880,8 @@ class Job:
             job.status = "failed"
             job.error = job.error or "The server stopped before this report finished."
             job.finished_at = job.finished_at or job.created_at
-        if job.pdf == "rendering":  # ... or while printing the PDF
+        if job.pdf == "rendering":  # ... or while printing the PDF: Save as PDF instead
             job.pdf = "failed"
-            job.warnings.append(PDF_STOPPED)
         return job
 
     def redact(self, text: str) -> str:
@@ -904,7 +911,12 @@ class Job:
 
         match = _LOG_LINE_RE.match(text)
         level, msg = (match["level"], match["msg"]) if match else ("", text)
-        if level == "WARNING" and msg not in self.warnings and len(self.warnings) < MAX_WARNINGS:
+        if (
+            level == "WARNING"
+            and not _TRANSIENT_WARNING_RE.search(msg)
+            and msg not in self.warnings
+            and len(self.warnings) < MAX_WARNINGS
+        ):
             self.warnings.append(msg)
         elif level in ("ERROR", "CRITICAL") or msg.startswith("Configuration error") or ": error:" in msg:
             self.error = msg
@@ -1087,9 +1099,11 @@ class JobManager:
                     status = job.status
                     await store.add_report(job.id, user_id, job.period, status)
                     job.db_added, job.db_status = True, status
+                    if status == "done":  # finished before its row was first written
+                        await store.set_status(job.id, status, history_numbers(job))
                 elif job.db_status != job.status:
                     status = job.status
-                    await store.set_status(job.id, status)
+                    await store.set_status(job.id, status, history_numbers(job) if status == "done" else None)
                     job.db_status = status
             except Exception as exc:  # noqa: BLE001 - history is best effort
                 log.warning("report history: could not update %s (%s)", job.id, exc.__class__.__name__)
@@ -1247,13 +1261,18 @@ class JobManager:
     async def _render_pdf(self, job: Job) -> None:
         """Print report.html to report.pdf, in a process of its own started
         after the report run has exited (so its memory is free again). Never
-        raises: without a PDF the report is still complete."""
+        raises: without a PDF the report is still complete, and its card
+        offers Save as PDF (the reader's browser prints it) instead.
+
+        The PDF step's output goes to the server log only: why this server
+        couldn't print a PDF (memory, time, no browser) is the operator's
+        business, not the report reader's."""
         if job.pdf != "rendering":
             return
         html_path = job.out_dir / REPORT_FILES["html"]
         if find_browser() is None or not html_path.is_file():
             job.pdf = "failed"
-            job.warnings.append(PDF_NO_BROWSER)
+            log.warning("report %s: no PDF (this server has no Edge/Chrome/Chromium)", job.id)
             self._save(job)
             return
         job.phase = "Rendering PDF"
@@ -1272,8 +1291,13 @@ class JobManager:
             job.process = process
             assert process.stdout is not None
 
+            def to_server_log(line: str) -> None:
+                line = job.redact(line).strip()
+                if line:
+                    log.info("report %s PDF: %s", job.id, line)
+
             async def drain() -> int:
-                await pump_lines(process.stdout, job.add_output)
+                await pump_lines(process.stdout, to_server_log)
                 return await process.wait()
 
             try:
@@ -1288,7 +1312,8 @@ class JobManager:
             job.process = None
         job.pdf = "ready" if (job.out_dir / REPORT_FILES["pdf"]).is_file() else "failed"
         if job.pdf == "failed" and not job.delete_requested:
-            job.warnings.append(PDF_NO_MEMORY if code == EXIT_NO_MEMORY else PDF_FAILED)
+            reason = "the server ran short of memory" if code == EXIT_NO_MEMORY else f"exit code {code}"
+            log.warning("report %s: no PDF (%s); its card offers Save as PDF", job.id, reason)
         if job.delete_requested:
             self._remove(job)
         else:
@@ -1677,7 +1702,7 @@ async def _list_jobs(request: web.Request) -> web.Response:
         # History rows whose files are gone (expired, or lost with a restart).
         rows = await manager.history(session.uid)
         items += [
-            expired_report_json(row, session.login, manager.settings.retention_hours)
+            expired_report_json(row, session.login)
             for row in rows
             if row.id not in manager.jobs and row.id not in manager.forgotten
         ]

@@ -213,8 +213,8 @@ class RecordingStore(MemoryStore):
         await super().add_report(report_id, user_id, period, status)
         self.statuses.setdefault(report_id, []).append(status)
 
-    async def set_status(self, report_id, status):
-        await super().set_status(report_id, status)
+    async def set_status(self, report_id, status, numbers=None):
+        await super().set_status(report_id, status, numbers)
         self.statuses.setdefault(report_id, []).append(status)
 
 
@@ -227,7 +227,7 @@ class BrokenStore(Store):
     async def add_report(self, report_id, user_id, period, status):
         raise StoreError("down")
 
-    async def set_status(self, report_id, status):
+    async def set_status(self, report_id, status, numbers=None):
         raise OSError("down")
 
     async def list_reports(self, user_id, limit=100):
@@ -657,17 +657,20 @@ def test_history_merges_live_jobs_with_expired_rows():
                 "share_url": "",
                 "log_count": 0,
                 "expired": True,
-                "lost": False,  # older than the retention period: deleted on schedule
             }
             assert jobs[2]["status"] == "failed" and jobs[2]["options"]["since"] == ""
 
-            # Files expire after the retention period; the entry stays, as expired.
+            # A finished report's card numbers go into its row (nothing else
+            # from the report)...
             manager = app[MANAGER]
             await _until(lambda: store.reports.get(live_id) and store.reports[live_id].status == "done")
+            assert store.reports[live_id].numbers == {"commits": 3, "active_days": 2}
+            # ... so once its files are gone, the entry still shows them.
             assert manager.expire(datetime.now(timezone.utc) + timedelta(hours=48)) == 1
             assert not (settings.jobs_dir / live_id).exists()
             expired = next(j for j in await _jobs(client) if j["id"] == live_id)
             assert expired["expired"] is True and expired["status"] == "done" and expired["files"] == {}
+            assert expired["summary"] == {"total_lifetime_commits": "3", "active_days": "2"}
 
             # Deleting an expired entry deletes its row; nobody else's rows can be deleted.
             assert (await client.delete(f"/api/jobs/{old_done}", json={}, headers=ORIGIN)).status == 200
@@ -691,17 +694,34 @@ def test_history_merges_live_jobs_with_expired_rows():
     print("ok  test_history_merges_live_jobs_with_expired_rows")
 
 
-def test_expired_entries_say_why_their_files_are_gone():
-    created = datetime(2026, 10, 9, 5, 0, tzinfo=timezone.utc)
-    row = ReportRow(str(uuid.uuid4()), UID, created, "..", "done")
-    minutes_later, next_day = created + timedelta(minutes=4), created + timedelta(hours=25)
-    # Gone within the retention period: lost when the server restarted.
-    assert webapp.expired_report_json(row, LOGIN, 24, now=minutes_later)["lost"] is True
-    # Gone after it: deleted on schedule.
-    assert webapp.expired_report_json(row, LOGIN, 24, now=next_day)["lost"] is False
-    # Nothing is deleted on schedule without a retention period.
-    assert webapp.expired_report_json(row, LOGIN, 0, now=next_day)["lost"] is True
-    print("ok  test_expired_entries_say_why_their_files_are_gone")
+def test_history_rows_keep_only_the_card_numbers():
+    from github_contrib.store import NUMBER_COLUMNS
+
+    assert tuple(webapp.HISTORY_NUMBERS) == NUMBER_COLUMNS
+    job = Job(id="j", out_dir=Path("."), accounts=[{"login": LOGIN, "emails": []}], options={},
+              summary={"total_lifetime_commits": "1805", "total_pull_requests": "261",
+                       "repositories_contributed_to": "43", "active_days": "291",
+                       "total_lines_added": "2679127", "total_lines_deleted": "175300",
+                       "first_contribution_date": "2025-02-02"})
+    assert webapp.history_numbers(job) == {"commits": 1805, "pull_requests": 261, "repositories": 43,
+                                           "active_days": 291, "lines_added": 2679127, "lines_deleted": 175300}
+    # Pull requests turned off: their 0 would be wrong, so it isn't kept.
+    job.options = {"pull_requests": False}
+    assert "pull_requests" not in webapp.history_numbers(job)
+
+    async def scenario() -> None:
+        store = MemoryStore()
+        report_id = str(uuid.uuid4())
+        await store.add_report(report_id, UID, "..", "running")
+        await store.set_status(report_id, "done", {"commits": 1805, "emails": 3})
+        await store.set_status(report_id, "done")  # a later status write keeps them
+        row = (await store.list_reports(UID))[0]
+        assert row.numbers == {"commits": 1805}
+        shown = webapp.expired_report_json(row, LOGIN)
+        assert shown["summary"] == {"total_lifetime_commits": "1805"}
+
+    asyncio.run(scenario())
+    print("ok  test_history_rows_keep_only_the_card_numbers")
 
 
 def test_store_failures_never_break_sign_in_or_runs():
@@ -896,8 +916,11 @@ def test_postgres_store_with_a_fake_pool():
 
     report_id = str(uuid.uuid4())
     created_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    numbers = {"commits": 1805, "pull_requests": 261, "repositories": 43, "active_days": 291,
+               "lines_added": 2679127, "lines_deleted": None}
     pool = _FakePool(
-        [{"id": uuid.UUID(report_id), "user_id": UID, "created_at": created_at, "period": "..", "status": "done"}]
+        [{"id": uuid.UUID(report_id), "user_id": UID, "created_at": created_at, "period": "..", "status": "done",
+          **numbers}]
     )
     options: dict = {}
 
@@ -913,6 +936,7 @@ def test_postgres_store_with_a_fake_pool():
         assert options["statement_cache_size"] == 0, "needed by Supabase's poolers"
         assert pool.calls[0][0].startswith("create table if not exists users")
         assert "enable row level security" in pool.calls[0][0]
+        assert "alter table reports add column if not exists commits integer" in pool.calls[0][0], "upgrades old tables"
 
         pool.calls.clear()
         await store.add_report(report_id, UID, "2026-01-01..", "queued")
@@ -922,8 +946,16 @@ def test_postgres_store_with_a_fake_pool():
         assert pool.calls[2][1] == (uuid.UUID(report_id), UID, "2026-01-01..", "queued")
         await store.set_status(report_id, "running")
         assert pool.calls[-1] == ("update reports set status = $2 where id = $1", (uuid.UUID(report_id), "running"))
+        # Done: the card's numbers too (unknown keys never reach the database).
+        await store.set_status(report_id, "done", {"commits": 5, "active_days": 2, "emails": 7})
+        assert pool.calls[-1] == (
+            "update reports set status = $2, commits = $3, pull_requests = $4, repositories = $5, "
+            "active_days = $6, lines_added = $7, lines_deleted = $8 where id = $1",
+            (uuid.UUID(report_id), "done", 5, None, None, 2, None, None),
+        )
         rows = await store.list_reports(UID, limit=5)
-        assert rows == [ReportRow(report_id, UID, created_at, "..", "done")]
+        stored = {k: v for k, v in numbers.items() if v is not None}
+        assert rows == [ReportRow(report_id, UID, created_at, "..", "done", stored)]
         assert pool.calls[-1][1] == (UID, 5)
         assert await store.delete_report(report_id, UID) is True
         assert await store.fail_unfinished() == 2

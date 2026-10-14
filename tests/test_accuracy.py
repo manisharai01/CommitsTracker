@@ -314,19 +314,25 @@ def test_owned_repos_never_hide_commits_with_unlinked_emails():
     coverage = Coverage()
     asyncio.run(_check_unlinked_commits(repos, commits, config, lambda _repo: client, coverage))
     notes = coverage.notes
-    assert any(n.startswith("neha/video-automate: 3 commit(s) were not counted")
-               and f"Local AI Video Studio <{work}> (3)" in n and "Settings > Emails" in n for n in notes), notes
-    assert any(n.startswith("neha/app: 1 commit(s)") and "<neha@laptop.local> (1)" in n for n in notes), notes
+    assert any(n.startswith("neha/video-automate: 3 commit(s) weren't counted")
+               and f"{work} (3, git name Local AI Video Studio)" in n and "this email isn't on any GitHub account" in n
+               and "Settings > Emails" in n for n in notes), notes
+    assert any(n.startswith("neha/app: 1 commit(s)") and "neha@laptop.local (1, git name Neha)" in n for n in notes), notes
     assert not any("teammate" in n for n in notes), "commits linked to other accounts aren't the report's"
     assert any(n.startswith("neha/gap: 1 commit(s) by the tracked accounts were not collected") for n in notes), notes
     assert not any(n.startswith(("neha/fork", "neha/empty", "acme/")) for n in notes), notes
     assert "/repos/acme/org-app/commits" not in [path for path, _ in client.calls], "only own repos are sampled"
 
-    # Outside the report period: not this report's commits.
-    coverage = Coverage()
-    later = replace(config, since=datetime(2026, 6, 1, tzinfo=UTC))
-    asyncio.run(_check_unlinked_commits(repos, commits, later, lambda _repo: client, coverage))
-    assert coverage.notes == [], coverage.notes
+    # Outside the report period, or in repositories the report leaves out:
+    # not this report's commits, so nothing to say about them.
+    for narrower in (
+        replace(config, since=datetime(2026, 6, 1, tzinfo=UTC)),
+        replace(config, exclude_own_repos=True),
+        replace(config, exclude_owners=["Neha"]),
+    ):
+        coverage = Coverage()
+        asyncio.run(_check_unlinked_commits(repos, commits, narrower, lambda _repo: client, coverage))
+        assert coverage.notes == [], coverage.notes
     # A repository that can't be read says so instead of passing as clean.
     coverage = Coverage()
     broken = FakeClient({"/repos/neha/app/commits": GitHubError("Access denied (403)")})

@@ -793,11 +793,50 @@ function statusHTML(job) {
   }
 }
 
+// The report's "<owner>/<repo>: N commit(s) … weren't counted. They were made
+// with a@b.c (N, git name …), …" warnings (report.py _check_unlinked_commits).
+const UNLINKED_RE = /^([^/\s]+)\/[^:\s]+: \d+ commit\(s\).* weren't counted\. They were made with /;
+
+// owner login (lower case) -> emails the report couldn't credit in their repos.
+function unlinkedEmails(job) {
+  const found = new Map();
+  for (const warning of job.warnings || []) {
+    const match = UNLINKED_RE.exec(warning);
+    if (!match) continue;
+    const listed = warning.slice(match[0].length).split(", and th")[0];
+    const emails = found.get(match[1].toLowerCase()) || new Set();
+    for (const [email] of listed.matchAll(/[^\s,()<>"]+@[^\s,()<>"]+/g)) emails.add(email);
+    found.set(match[1].toLowerCase(), emails);
+  }
+  return found;
+}
+
 function warningsHTML(job) {
   if (!job.warnings?.length || job.status === "queued") return "";
   const items = job.warnings.slice(0, 3).map((warning) => `<li>${esc(warning)}</li>`).join("");
   const more = job.warnings.length > 3 ? `<li class="muted">${job.warnings.length - 3} more in the log</li>` : "";
-  return `<div class="notice">${icon("alert")}<ul>${items}${more}</ul></div>`;
+  const add = !job.expired && unlinkedEmails(job).size
+    ? `<button type="button" class="btn btn-outline btn-sm notice-action" data-action="add-emails">` +
+      `${icon("plus")}Add these emails and run again</button>`
+    : "";
+  return `<div class="notice">${icon("alert")}<div><ul>${items}${more}</ul>${add}</div></div>`;
+}
+
+// Fill the form for a new run of ``job`` with the emails its report couldn't
+// credit added to each owner's Commit emails (the user checks, then runs it).
+function addEmailsAndRunAgain(job) {
+  const found = unlinkedEmails(job);
+  runAgain(job);
+  const rows = $$("#accounts .account");
+  for (const [owner, emails] of found) {
+    const row = rows.find((r) => loginOf(r).toLowerCase() === owner) || rows[0];
+    if (!row) continue;
+    const input = $("[name=emails]", row);
+    const current = splitList(input.value);
+    const known = new Set(current.map((email) => email.toLowerCase()));
+    input.value = [...current, ...[...emails].filter((email) => !known.has(email.toLowerCase()))].join(", ");
+  }
+  toast("Emails added under Commit emails. Check them, then generate the report.");
 }
 
 function actionsHTML(job, logOpen) {
@@ -864,12 +903,18 @@ function cardBody(job) {
   const options = job.options || {};
   const range = rangeText(options.since || "", options.until || "");
   const combined = job.logins.length > 1 ? ` · ${job.logins.length} accounts combined` : "";
+  // Options that leave work out, so a smaller count never goes unexplained.
+  const narrowed = [
+    options.exclude_own_repos && "personal repos excluded",
+    options.default_branch_only && "default branches only",
+    options.skip_forks && "forks skipped",
+  ].filter(Boolean).map((text) => ` · ${text}`).join("");
   const shared = job.share_url ? ' · <span class="shared-flag">Shared by link</span>' : "";
   return `<div class="report-head">` +
       `<span class="report-name" title="${esc(names)}">${esc(names)}</span>` +
       `<span class="report-meta">· <time datetime="${esc(job.created_at)}" title="${esc(fullDate(job.created_at))}">` +
       `${esc(relativeTime(job.created_at))}</time></span>${statusChip(job.status, job.expired)}</div>` +
-    `<p class="report-sub report-period">${esc(range)}${esc(combined)}${shared}</p>` +
+    `<p class="report-sub report-period">${esc(range)}${esc(combined)}${esc(narrowed)}${shared}</p>` +
     statusHTML(job) + warningsHTML(job) + actionsHTML(job, state.logs.has(job.id));
 }
 
@@ -1417,6 +1462,7 @@ async function init() {
     if (action === "log") toggleLog(job.id);
     else if (action === "cancel") cancelJob(job);
     else if (action === "again") runAgain(job);
+    else if (action === "add-emails") addEmailsAndRunAgain(job);
     else if (action === "delete") deleteJob(job);
     else if (action === "share") openShare(job);
     else if (action === "linkedin") openLinkedIn(job);

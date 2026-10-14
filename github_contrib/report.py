@@ -180,9 +180,12 @@ async def _check_unlinked_commits(
     and name every such email, with what to do about it. Commits linked to
     other GitHub accounts are other people's work and stay out of it.
     """
+    if config.exclude_own_repos:
+        return  # the report leaves the accounts' own repositories out
     tracked = {login.lower() for login in config.target_logins}
+    left_out = {owner.lower() for owner in config.exclude_owners}
     counted = {(c.full_name, c.sha) for c in commits}
-    owned = [r for r in repos if r.owner.lower() in tracked]
+    owned = [r for r in repos if r.owner.lower() in tracked and r.owner.lower() not in left_out]
 
     async def check(repo: RepoRecord) -> None:
         try:
@@ -194,7 +197,7 @@ async def _check_unlinked_commits(
             return
         items = items if isinstance(items, list) else []  # empty repository: nothing to count
         sample = f" of its latest {len(items)}" if len(items) >= UNLINKED_SAMPLE else ""
-        missed: dict[str, int] = {}
+        missed: dict[str, list] = {}  # email -> [commits, git names used with it]
         not_collected = 0
         for item in items:
             author = (item.get("commit") or {}).get("author") or {}
@@ -210,8 +213,9 @@ async def _check_unlinked_commits(
             if linked.lower() in tracked:
                 not_collected += 1  # should never happen: a gap in collection
             elif not linked:
-                who = f"{author.get('name') or '?'} <{author.get('email') or '?'}>"
-                missed[who] = missed.get(who, 0) + 1
+                entry = missed.setdefault(str(author.get("email") or "?"), [0, set()])
+                entry[0] += 1
+                entry[1].add(str(author.get("name") or "?"))
             # else: linked to someone else's account, so not this report's work
         if not_collected:
             coverage.warn(
@@ -219,12 +223,18 @@ async def _check_unlinked_commits(
                 "not collected, so the counts miss them. Run the report again."
             )
         if missed:
-            total = sum(missed.values())
-            names = ", ".join(f"{who} ({n})" for who, n in sorted(missed.items(), key=lambda kv: (-kv[1], kv[0])))
+            # What git wrote into the commits on the computer that made them:
+            # the email decides whose they are; the name is only a label.
+            total = sum(n for n, _names in missed.values())
+            emails = ", ".join(
+                f"{email} ({n}, git name {' / '.join(sorted(names))})"
+                for email, (n, names) in sorted(missed.items(), key=lambda kv: (-kv[1][0], kv[0]))
+            )
+            these = "this email isn't" if len(missed) == 1 else "these emails aren't"
             coverage.warn(
-                f"{repo.full_name}: {total} commit(s){sample} were not counted because their email "
-                f"isn't linked to any GitHub account: {names}. If they are yours, add the email to "
-                "your GitHub account (Settings > Emails) or under Commit emails, and run again."
+                f"{repo.full_name}: {total} commit(s){sample} weren't counted. They were made with "
+                f"{emails}, and {these} on any GitHub account. If it's yours, add it to your GitHub "
+                "account (Settings > Emails) or under Commit emails, and run again."
             )
 
     await asyncio.gather(*(check(r) for r in owned))

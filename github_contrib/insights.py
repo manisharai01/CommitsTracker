@@ -128,6 +128,7 @@ class RepoWork:
     total_deletions: int = 0
     total_files_changed: int = 0
     most_impactful_commit: str = ""  # "message (±N lines)"
+    technologies: list[str] = field(default_factory=list)  # found in the repository (stack.py)
 
     def headline(self) -> str:
         span = ""
@@ -270,7 +271,15 @@ def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSu
     _take(lambda w: [h for h in w.highlights if "(PR #" not in h], 14)
 
     strengths: list[tuple[str, str]] = []
-    if insights.languages:
+    # Detected technologies (analytics / stack.py), else the repositories' main languages.
+    languages_used = str(summary.get("languages_used") or "")
+    frameworks_used = str(summary.get("frameworks_used") or "")
+    data_and_infra = str(summary.get("data_and_infrastructure_used") or "")
+    if languages_used or frameworks_used:
+        strengths.append(("Technologies", " · ".join(x for x in (languages_used, frameworks_used) if x)))
+        if data_and_infra:
+            strengths.append(("Data & infrastructure", data_and_infra))
+    elif insights.languages:
         strengths.append((
             "Technologies",
             ", ".join(f"{lang} ({c} commits)" for lang, _r, c in insights.languages[:6]
@@ -413,6 +422,7 @@ def _build_repo_work(
         total_deletions=total_deletions,
         total_files_changed=total_files_changed,
         most_impactful_commit=most_impactful,
+        technologies=list(repo.technologies),
     )
 
 

@@ -75,6 +75,7 @@ def apply_owner_exclusions(
     repos = [r for r in data.repos if _owner_of(r.full_name, r.owner) not in owners]
     commits = [c for c in data.commits if _owner_of(c.full_name, c.owner) not in owners]
     prs = [p for p in data.pull_requests if _owner_of(p.full_name) not in owners]
+    reviews = [r for r in data.reviews if _owner_of(r.full_name, r.owner) not in owners]
     organizations = aggregate_organizations(repos, commits, prs, _member_orgs(data, owners))
 
     removed = {
@@ -91,7 +92,7 @@ def apply_owner_exclusions(
             removed["pull_requests"],
         )
     filtered = replace(data, repos=repos, commits=commits, pull_requests=prs,
-                       organizations=organizations)
+                       organizations=organizations, reviews=reviews)
     return filtered, removed
 
 
@@ -117,12 +118,13 @@ def apply_date_range(
 
     commits = [c for c in data.commits if inside(c.authored_date)]
     prs = [p for p in data.pull_requests if inside(p.created_at)]
+    reviews = [r for r in data.reviews if inside(r.submitted_at)]
     removed = {
         "commits": len(data.commits) - len(commits),
         "pull_requests": len(data.pull_requests) - len(prs),
     }
     organizations = aggregate_organizations(data.repos, commits, prs, _member_orgs(data))
-    return replace(data, commits=commits, pull_requests=prs, organizations=organizations), removed
+    return replace(data, commits=commits, pull_requests=prs, organizations=organizations, reviews=reviews), removed
 
 
 @dataclass(slots=True)
@@ -267,7 +269,8 @@ def localize(data: CollectedData, tz: tzinfo) -> CollectedData:
         replace(r, pushed_at=_local(r.pushed_at, tz), created_at=_local(r.created_at, tz))
         for r in data.repos
     ]
-    return replace(data, commits=commits, pull_requests=prs, repos=repos)
+    reviews = [replace(r, submitted_at=_local(r.submitted_at, tz)) for r in data.reviews]
+    return replace(data, commits=commits, pull_requests=prs, repos=repos, reviews=reviews)
 
 
 @dataclass(slots=True)

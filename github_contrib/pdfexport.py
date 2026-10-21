@@ -131,18 +131,20 @@ def appendix_rows(html: str) -> list[bool]:
     return [bool(month) for month in _ROW_RE.findall(match.group(1))] if match else []
 
 
-def plan_parts(rows: list[bool], size: int) -> list[tuple[int, int]]:
-    """Split the appendix rows into parts [start, end) of at most ``size`` rows,
+def plan_parts(rows: list[bool], size: int, first: int | None = None) -> list[tuple[int, int]]:
+    """Split the appendix rows into parts [start, end) of at most ``size`` rows
+    (``first`` for the first part, which also prints the rest of the report),
     each cut just before a month header when one falls in its second half. A
     tail of under a quarter part joins the last part instead of making its own."""
     parts: list[tuple[int, int]] = []
     start = 0
     while start < len(rows):
-        end = min(start + size, len(rows))
+        limit = first if first and not parts else size
+        end = min(start + limit, len(rows))
         if len(rows) - end < size // 4:
             end = len(rows)
         elif end < len(rows):
-            end = next((i for i in range(end, start + size // 2, -1) if rows[i]), end)
+            end = next((i for i in range(end, start + limit // 2, -1) if rows[i]), end)
         parts.append((start, end))
         start = end
     return parts
@@ -307,7 +309,24 @@ def _fragments(html_path: Path) -> list[str]:
     if importlib.util.find_spec("pypdf") is None:
         log.warning("pypdf is not installed: printing the PDF in one go, which needs far more memory.")
         return ["print"]
-    return [f"print={start}-{end}" for start, end in plan_parts(rows, size)]
+    # The first part prints the whole report besides its rows: a quarter of
+    # the rows keeps it from being the part that needs the most memory.
+    return [f"print={start}-{end}" for start, end in plan_parts(rows, size, first=max(size // 4, 1))]
+
+
+def complete_pdf(path: Path) -> bool:
+    """Whether ``path`` is a whole PDF: it starts with "%PDF-" and ends with
+    the "%%EOF" marker, written last (a browser stopped or crashed mid-write
+    leaves a file without it)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(5)
+            fh.seek(max(size - 1024, 0))
+            tail = fh.read()
+    except OSError:
+        return False
+    return head == b"%PDF-" and b"%%EOF" in tail
 
 
 def _join(parts: list[Path], target: Path) -> None:
@@ -367,12 +386,15 @@ def _export(html_path: Path, pdf_path: Path | None, timeout: float | None) -> tu
                     )
                 if outcome != "done":
                     return None, outcome
-                if part.is_file() and part.stat().st_size > 0:
+                if complete_pdf(part):
                     modes = [headless]
                     break
+                part.unlink(missing_ok=True)  # nothing, or cut off: try the other mode
             else:
                 errors = _read(str(work / "browser.log"))
-                log.warning("PDF export produced no output (browser exit code %s): %s", code, errors.strip()[:400])
+                log.warning(
+                    "PDF export produced no complete PDF (browser exit code %s): %s", code, errors.strip()[:400]
+                )
                 return None, "failed"
             printed.append(part)
 

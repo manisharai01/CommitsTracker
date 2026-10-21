@@ -16,6 +16,7 @@ or with pytest:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sys
 import tempfile
@@ -282,8 +283,17 @@ def _api_commit(sha, *, login=None, name="Neha", email="neha@x.com", when="2026-
             "commit": {"author": {"name": name, "email": email, "date": when}}}
 
 
+class _LogCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
 def test_owned_repos_never_hide_commits_with_unlinked_emails():
-    from github_contrib.report import _check_unlinked_commits
+    from github_contrib.report import _check_unlinked_commits, mask_email
 
     work = "studio@work.example"
     routes = {
@@ -297,8 +307,12 @@ def test_owned_repos_never_hide_commits_with_unlinked_emails():
             _api_commit("a1", login="neha"), _api_commit("a2", login="teammate"),
             _api_commit("a3", email="neha@laptop.local"),
         ],
-        # A fork's history from before it was forked is upstream work.
-        "/repos/neha/fork/commits": [_api_commit("f1", email="upstream@dev.example", when="2020-01-01T00:00:00Z")],
+        # A fork's history from before it was forked is upstream work; after
+        # it, an upstream author's commit synced in looks the same as hers.
+        "/repos/neha/fork/commits": [
+            _api_commit("f1", email="upstream@dev.example", when="2020-01-01T00:00:00Z"),
+            _api_commit("f2", name="Upstream Dev", email="upstream@dev.example"),
+        ],
         # Linked to the account but not collected: a gap, reported as one.
         "/repos/neha/gap/commits": [_api_commit("g1", login="Neha")],
         "/repos/neha/empty/commits": None,  # GitHub answers 409 for an empty repository
@@ -312,16 +326,35 @@ def test_owned_repos_never_hide_commits_with_unlinked_emails():
     config = AppConfig(accounts=[], target_logins=["neha"])
 
     coverage = Coverage()
-    asyncio.run(_check_unlinked_commits(repos, commits, config, lambda _repo: client, coverage))
+    capture = _LogCapture()
+    logger = logging.getLogger("github_contrib.coverage")
+    logger.addHandler(capture)
+    try:
+        found = asyncio.run(_check_unlinked_commits(repos, commits, config, lambda _repo: client, coverage))
+    finally:
+        logger.removeHandler(capture)
     notes = coverage.notes
-    assert any(n.startswith("neha/video-automate: 3 commit(s) weren't counted")
-               and f"{work} (3, git name Local AI Video Studio)" in n and "this email isn't on any GitHub account" in n
-               and "Settings > Emails" in n for n in notes), notes
-    assert any(n.startswith("neha/app: 1 commit(s)") and "neha@laptop.local (1, git name Neha)" in n for n in notes), notes
+    # One note for every email (not one per repository), masked: the report gets shared.
+    uncounted = [n for n in notes if "weren't counted" in n]
+    assert len(uncounted) == 1, notes
+    assert uncounted[0].startswith("5 commit(s) in 3 of the tracked accounts' own repositories weren't counted: "
+                                   "they were made with 3 emails that aren't on any GitHub account (s•••@work.example "
+                                   "in neha/video-automate, "), uncounted
+    assert work not in uncounted[0] and "Local AI Video Studio" not in uncounted[0], "no one's email or name"
+    # The log (only for whoever runs the report) names them in full.
+    detail = next(m for m in capture.messages if "weren't counted" in m)
+    assert f"{work} (3 commit(s), git name Local AI Video Studio, in neha/video-automate)" in detail, detail
+    assert "only in forks, so possibly upstream work" in detail and "Settings > Emails" in detail, detail
+    # ... and the web app gets them as data, for the user to pick their own.
+    assert [(e["email"], e["commits"], e["names"], e["in_forks_only"]) for e in found] == [
+        (work, 3, ["Local AI Video Studio"], False), ("neha@laptop.local", 1, ["Neha"], False),
+        ("upstream@dev.example", 1, ["Upstream Dev"], True),
+    ], found
+    assert found[0]["repositories"] == [["neha/video-automate", 3]] and found[0]["owner"] == "neha"
     assert not any("teammate" in n for n in notes), "commits linked to other accounts aren't the report's"
     assert any(n.startswith("neha/gap: 1 commit(s) by the tracked accounts were not collected") for n in notes), notes
-    assert not any(n.startswith(("neha/fork", "neha/empty", "acme/")) for n in notes), notes
     assert "/repos/acme/org-app/commits" not in [path for path, _ in client.calls], "only own repos are sampled"
+    assert mask_email("ayaan.r@gmail.com") == "a•••@gmail.com" and mask_email("no-at-sign") == "•••"
 
     # Outside the report period, or in repositories the report leaves out:
     # not this report's commits, so nothing to say about them.

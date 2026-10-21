@@ -754,6 +754,7 @@ function doneHTML(job) {
   const options = job.options || {};
   const rows = [[summary.total_lifetime_commits, "commit", "commits"]];
   if (options.pull_requests !== false) rows.push([summary.total_pull_requests, "pull request", "pull requests"]);
+  if (Number(summary.pull_request_reviews)) rows.push([summary.pull_request_reviews, "review", "reviews"]);
   rows.push([summary.repositories_contributed_to, "repository", "repositories"]);
   rows.push([summary.active_days, "active day", "active days"]);
   const stats = rows
@@ -793,50 +794,65 @@ function statusHTML(job) {
   }
 }
 
-// The report's "<owner>/<repo>: N commit(s) … weren't counted. They were made
-// with a@b.c (N, git name …), …" warnings (report.py _check_unlinked_commits).
-const UNLINKED_RE = /^([^/\s]+)\/[^:\s]+: \d+ commit\(s\).* weren't counted\. They were made with /;
-
-// owner login (lower case) -> emails the report couldn't credit in their repos.
-function unlinkedEmails(job) {
-  const found = new Map();
-  for (const warning of job.warnings || []) {
-    const match = UNLINKED_RE.exec(warning);
-    if (!match) continue;
-    const listed = warning.slice(match[0].length).split(", and th")[0];
-    const emails = found.get(match[1].toLowerCase()) || new Set();
-    for (const [email] of listed.matchAll(/[^\s,()<>"]+@[^\s,()<>"]+/g)) emails.add(email);
-    found.set(match[1].toLowerCase(), emails);
-  }
-  return found;
-}
-
 function warningsHTML(job) {
   if (!job.warnings?.length || job.status === "queued") return "";
   const items = job.warnings.slice(0, 3).map((warning) => `<li>${esc(warning)}</li>`).join("");
   const more = job.warnings.length > 3 ? `<li class="muted">${job.warnings.length - 3} more in the log</li>` : "";
-  const add = !job.expired && unlinkedEmails(job).size
-    ? `<button type="button" class="btn btn-outline btn-sm notice-action" data-action="add-emails">` +
-      `${icon("plus")}Add these emails and run again</button>`
+  // Emails of commits in the accounts' own repositories that weren't counted
+  // (report.py _check_unlinked_commits): the user picks which are theirs.
+  const review = !job.expired && job.unlinked?.length
+    ? `<button type="button" class="btn btn-outline btn-sm notice-action" data-action="review-emails">` +
+      `${icon("plus")}Review uncounted emails</button>`
     : "";
-  return `<div class="notice">${icon("alert")}<div><ul>${items}${more}</ul>${add}</div></div>`;
+  return `<div class="notice">${icon("alert")}<div><ul>${items}${more}</ul>${review}</div></div>`;
 }
 
-// Fill the form for a new run of ``job`` with the emails its report couldn't
-// credit added to each owner's Commit emails (the user checks, then runs it).
-function addEmailsAndRunAgain(job) {
-  const found = unlinkedEmails(job);
+const emailsSheet = { job: null };
+
+// The emails a run couldn't credit, each with its commits, git names and
+// repositories. None starts ticked: only the user knows which are theirs (a
+// git name is a label anyone can set), and an added email counts every
+// commit made with it, in every repository the report reads.
+function openEmails(job) {
+  emailsSheet.job = job;
+  $("#emails-list").innerHTML = job.unlinked.map((entry, index) => {
+    const where = entry.repositories.map(([name, n]) => `${name} (${n})`).join(", ");
+    const names = entry.names.length ? `git name ${entry.names.join(" / ")} · ` : "";
+    const fork = entry.in_forks_only ? " · only in forks: may be upstream work" : "";
+    return `<label class="sheet-row email-row"><input type="checkbox" value="${index}">` +
+      `<span class="sheet-row-text"><b>${esc(entry.email)}</b>` +
+      `<span>${entry.commits} commit${entry.commits === 1 ? "" : "s"} · ${esc(names)}${esc(where)}${esc(fork)}</span>` +
+      `</span></label>`;
+  }).join("");
+  updateEmailsButton();
+  $("#emails-dialog").showModal();
+}
+
+function updateEmailsButton() {
+  $("#emails-add").disabled = !$$("#emails-list input:checked").length;
+}
+
+// A new run of the report with the ticked emails added to Commit emails
+// (under the account whose repositories hold most of their commits).
+function addPickedEmails() {
+  const job = emailsSheet.job;
+  if (!job) return;
+  const picked = $$("#emails-list input:checked").map((box) => job.unlinked[Number(box.value)]).filter(Boolean);
+  $("#emails-dialog").close();
+  if (!picked.length) return;
   runAgain(job);
   const rows = $$("#accounts .account");
-  for (const [owner, emails] of found) {
-    const row = rows.find((r) => loginOf(r).toLowerCase() === owner) || rows[0];
+  for (const entry of picked) {
+    const row = rows.find((r) => loginOf(r).toLowerCase() === entry.owner.toLowerCase()) || rows[0];
     if (!row) continue;
     const input = $("[name=emails]", row);
     const current = splitList(input.value);
-    const known = new Set(current.map((email) => email.toLowerCase()));
-    input.value = [...current, ...[...emails].filter((email) => !known.has(email.toLowerCase()))].join(", ");
+    if (!current.some((email) => email.toLowerCase() === entry.email.toLowerCase())) {
+      input.value = [...current, entry.email].join(", ");
+    }
   }
-  toast("Emails added under Commit emails. Check them, then generate the report.");
+  toast(`${picked.length === 1 ? "Email" : `${picked.length} emails`} added under Commit emails. ` +
+    "Check the form, then generate the report.");
 }
 
 function actionsHTML(job, logOpen) {
@@ -904,8 +920,11 @@ function cardBody(job) {
   const range = rangeText(options.since || "", options.until || "");
   const combined = job.logins.length > 1 ? ` · ${job.logins.length} accounts combined` : "";
   // Options that leave work out, so a smaller count never goes unexplained.
+  const owners = options.exclude_owners || [];
   const narrowed = [
     options.exclude_own_repos && "personal repos excluded",
+    owners.length === 1 && `${owners[0]} excluded`,
+    owners.length > 1 && `${owners.length} owners excluded`,
     options.default_branch_only && "default branches only",
     options.skip_forks && "forks skipped",
   ].filter(Boolean).map((text) => ` · ${text}`).join("");
@@ -1295,6 +1314,9 @@ function initDialogs() {
   $("#linkedin-text").addEventListener("input", updatePostCount);
   $("#linkedin-copy").addEventListener("click", copyPost);
   $("#linkedin-open").addEventListener("click", postOnLinkedIn);
+  $("#emails-dialog").addEventListener("close", () => { emailsSheet.job = null; });
+  $("#emails-list").addEventListener("change", updateEmailsButton);
+  $("#emails-add").addEventListener("click", addPickedEmails);
 }
 
 // ---------- polling ----------
@@ -1462,7 +1484,7 @@ async function init() {
     if (action === "log") toggleLog(job.id);
     else if (action === "cancel") cancelJob(job);
     else if (action === "again") runAgain(job);
-    else if (action === "add-emails") addEmailsAndRunAgain(job);
+    else if (action === "review-emails") openEmails(job);
     else if (action === "delete") deleteJob(job);
     else if (action === "share") openShare(job);
     else if (action === "linkedin") openLinkedIn(job);

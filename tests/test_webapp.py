@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiohttp  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
+from github_contrib.reportscript import REPORT_CSP, SCRIPT, is_current, with_current_script  # noqa: E402
 from github_contrib.webapp import (  # noqa: E402
     CHILD_ENV_ALLOWLIST,
     MANAGER,
@@ -37,12 +38,14 @@ from github_contrib.webapp import (  # noqa: E402
     Settings,
     build_command,
     build_env,
+    clean_unlinked,
     create_app,
     env_token_logins,
     parse_job_request,
     public_settings,
     pump_lines,
     read_summary,
+    redact_paths,
 )
 
 TOKEN = "ghp_" + "a1B2c3D4e5" * 4  # 44 chars, looks like a classic token
@@ -79,6 +82,14 @@ FAKE_CLI = textwrap.dedent(
         fh.write("2026-10-06 10:00:00 | DEBUG   | x | header Authorization: Bearer " + token + "\\n")
     with open(os.path.join(out, "contribution_summary.csv"), "w", encoding="utf-8-sig") as fh:
         fh.write("metric,value\\ntotal_lifetime_commits,2\\nactive_days,1\\nemails_seen," + os.environ["AUTHOR_EMAILS"] + "\\n")
+    import json
+    with open(os.path.join(out, "collection.json"), "w", encoding="utf-8") as fh:
+        json.dump({"meta": {"unlinked_emails": [
+            {"email": "alice@laptop.local", "commits": 3, "names": ["Alice"], "repositories": [["alice/app", 3]],
+             "owner": "alice", "in_forks_only": False},
+            {"email": "not an email", "commits": 1},
+            {"email": "x@y.z", "commits": "many"},
+        ]}, "notes": []}, fh)
     names = ["report.html", "github_contributions.xlsx"]
     if "nopdf" not in users:  # "nopdf": the web app must print the PDF itself
         names.append("report.pdf")
@@ -107,6 +118,17 @@ FAKE_PDF = textwrap.dedent(
     log("INFO", "wrote report.pdf (via chromium, 1s)")
     """
 )
+
+
+def _old_report() -> str:
+    """A report.html as an earlier version wrote it: another script, and a
+    policy allowing only that one."""
+    return (
+        "<!DOCTYPE html><html><head>"
+        "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; script-src 'sha256-OLD'\">"
+        "</head><body><p>Fix &lt;script&gt;alert(1)&lt;/script&gt; in titles</p>"
+        "<script>\n(function () { /* an older version */ })();\n</script></body></html>"
+    )
 
 
 def _payload(*logins: str, token: str = TOKEN, **options) -> dict:
@@ -233,6 +255,41 @@ def test_job_output_parsing():
     lines, nxt = job.log_since(2)
     assert nxt == len(job.log) and lines == job.log[2:]
     print("ok  test_job_output_parsing")
+
+
+def test_path_redaction_keeps_repository_names():
+    # In a container the app lives in /app: "neha/app" is a repository, not it.
+    pairs = [("/app/output-web", "<reports>"), ("/app", "<app>"), ("C:\\srv\\app", "<app>")]
+    line = "neha/app: 3 commit(s) weren't counted; see /app/github_contrib/report.py and /app."
+    assert redact_paths(line, pairs) == (
+        "neha/app: 3 commit(s) weren't counted; see <app>/github_contrib/report.py and <app>.")
+    assert redact_paths("/app-v2, /app.py, x/app and https://github.com/neha/app", pairs) == (
+        "/app-v2, /app.py, x/app and https://github.com/neha/app")
+    assert redact_paths("wrote /app/output-web/j/report.pdf", pairs) == "wrote <reports>/j/report.pdf"
+    assert redact_paths("in 'C:\\srv\\app\\x'", pairs) == "in '<app>\\x'"
+    # Tokens are still replaced wherever they appear.
+    job = Job(id="j", out_dir=Path("."), accounts=[], options={}, redactions=[(TOKEN, "••••")],
+              path_redactions=pairs)
+    assert job.redact(f"x{TOKEN}y neha/app /app/z") == "x••••y neha/app <app>/z"
+    print("ok  test_path_redaction_keeps_repository_names")
+
+
+def test_old_reports_get_the_current_script_and_unlinked_is_checked():
+    page = _old_report()
+    new = with_current_script(page)
+    assert new.endswith(f"<script>{SCRIPT}</script></body></html>") and "an older version" not in new
+    assert f"content=\"{REPORT_CSP}\"" in new and "sha256-OLD" not in new
+    assert "Fix &lt;script&gt;alert(1)&lt;/script&gt; in titles" in new, "escaped text is never touched"
+    assert with_current_script(new) == new and is_current(new[-3000:].encode("utf-8"))
+    assert not is_current(page.encode("utf-8"))
+    assert with_current_script("report.html") == "report.html", "no script: left alone"
+    # Entries the card gets: well-formed only, and at most 20.
+    good = {"email": "a@b.c", "commits": 2, "names": ["A"], "repositories": [["a/x", 2]], "owner": "a"}
+    cleaned = clean_unlinked([good, {"email": "nope"}, {"email": "d@e.f", "repositories": [["a/x", "lots"]]},
+                              "junk", *([good] * 30)])
+    assert len(cleaned) == 20 and cleaned[0]["email"] == "a@b.c" and cleaned[0]["in_forks_only"] is False
+    assert clean_unlinked(None) == [] and clean_unlinked({"email": "a@b.c"}) == []
+    print("ok  test_old_reports_get_the_current_script_and_unlinked_is_checked")
 
 
 def test_pump_lines_splits_progress_redraws():
@@ -442,6 +499,10 @@ def test_web_end_to_end_local():
             assert job["warnings"] == ["[alice] classic token lacks 'read:org'"]
             assert set(job["files"]) == {"pdf", "html", "xlsx"}
             assert job["options"]["since"] == "2026-01-01" and "owner" not in job
+            # Emails of uncounted commits, as data for the card (malformed entries dropped).
+            unlinked = [{"email": "alice@laptop.local", "commits": 3, "names": ["Alice"],
+                         "repositories": [["alice/app", 3]], "owner": "alice", "in_forks_only": False}]
+            assert job["unlinked"] == unlinked, job["unlinked"]
 
             pdf = await client.get(job["files"]["pdf"])
             assert pdf.status == 200 and await pdf.text() == "report.pdf"
@@ -450,6 +511,12 @@ def test_web_end_to_end_local():
             assert html.headers["Content-Disposition"].startswith("inline")
             assert html.headers["Content-Security-Policy"].startswith("sandbox allow-scripts")
             assert (await client.get(f"/api/jobs/{job['id']}/files/run.log")).status == 404
+            # A report written before the script changed is served with the current one.
+            (jobs_dir / job["id"] / "report.html").write_text(_old_report(), encoding="utf-8")
+            served = await client.get(job["files"]["html"])
+            text = await served.text()
+            assert f"<script>{SCRIPT}</script>" in text and REPORT_CSP in text and "sha256-OLD" not in text
+            assert served.headers["Content-Security-Policy"].startswith("sandbox allow-scripts")
 
             log = await (await client.get(f"/api/jobs/{job['id']}/log?since=0")).json()
             text = "\n".join(log["lines"])
@@ -473,6 +540,7 @@ def test_web_end_to_end_local():
             jobs = (await (await client.get("/api/jobs")).json())["jobs"]
             assert [j["status"] for j in jobs] == ["failed", "done"]
             assert jobs[1]["files"]["pdf"].endswith("/files/pdf")
+            assert jobs[1]["unlinked"][0]["email"] == "alice@laptop.local", "kept in job.json"
             # Deleting removes the report and its folder.
             deleted = await client.delete(f"/api/jobs/{jobs[1]['id']}", json={})
             assert deleted.status == 200 and not (jobs_dir / jobs[1]["id"]).exists()

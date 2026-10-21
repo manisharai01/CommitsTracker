@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from .analytics import WEEKDAYS, WORK_TYPES, Analytics
 from .logging_config import get_logger
 from .models import CollectedData
 
@@ -40,6 +41,15 @@ class Statistics:
     lines_by_repo: pd.DataFrame          # additions/deletions/net per repo
     top_commits_by_impact: pd.DataFrame  # top commits ranked by lines changed
     summary_dict: dict[str, object] = field(default_factory=dict)
+    # Insights & analytics (see analytics.py; attached by attach_analytics).
+    analytics: Analytics | None = None
+    highlights: pd.DataFrame = field(default_factory=pd.DataFrame)
+    quarterly: pd.DataFrame = field(default_factory=pd.DataFrame)
+    work_mix: pd.DataFrame = field(default_factory=pd.DataFrame)
+    pr_delivery: pd.DataFrame = field(default_factory=pd.DataFrame)
+    working_rhythm: pd.DataFrame = field(default_factory=pd.DataFrame)
+    technologies: pd.DataFrame = field(default_factory=pd.DataFrame)
+    reviews: pd.DataFrame = field(default_factory=pd.DataFrame)  # code reviews given (reviews.csv)
 
 
 def _records_to_df(records: list, columns: list[str]) -> pd.DataFrame:
@@ -66,12 +76,17 @@ _PR_COLS = [
     "repository", "full_name", "organization", "number", "title",
     "author_login", "state", "effective_state", "merged", "created_at",
     "updated_at", "closed_at", "merged_at", "base_branch", "head_branch", "url",
-    "merge_commit_sha", "commit_shas",
+    "merge_commit_sha", "commit_shas", "additions", "deletions", "changed_files",
 ]
 _REPO_COLS = [
     "full_name", "name", "owner", "organization", "is_private", "is_fork",
     "is_archived", "default_branch", "language", "stargazers", "forks",
     "pushed_at", "created_at", "discovered_via", "affiliated", "description", "html_url",
+    "languages", "technologies", "stack_read",
+]
+_REVIEW_COLS = [
+    "reviewer", "full_name", "owner", "organization", "pr_number", "pr_title", "pr_author",
+    "state", "submitted_at", "url",
 ]
 _ORG_COLS = [
     "login", "name", "is_member", "repos_contributed", "commit_count",
@@ -97,6 +112,11 @@ def compute_statistics(data: CollectedData) -> Statistics:
     """Compute every statistic table from collected data."""
     commits_df = _records_to_df(data.commits, _COMMIT_COLS)
     prs_df = _records_to_df(data.pull_requests, _PR_COLS)
+    # A size that wasn't recorded stays blank (and recorded ones stay "12", not "12.0").
+    for column in ("additions", "deletions", "changed_files"):
+        prs_df[column] = pd.array(
+            [None if pd.isna(v) else int(v) for v in prs_df[column].tolist()], dtype="Int64"
+        )
     repos_df = _records_to_df(data.repos, _REPO_COLS)
     orgs_df = _records_to_df(data.organizations, _ORG_COLS)
 
@@ -205,6 +225,71 @@ def compute_statistics(data: CollectedData) -> Statistics:
         lines_by_repo=lines_by_repo,
         top_commits_by_impact=top_commits,
         summary_dict=summary_dict,
+        reviews=_records_to_df(data.reviews, _REVIEW_COLS),
+    )
+
+
+def attach_analytics(stats: Statistics, analytics: Analytics) -> None:
+    """Keep ``analytics`` on ``stats`` (for the reports), and as tables for
+    the Excel workbook."""
+    stats.analytics = analytics
+    stats.highlights = pd.DataFrame({"highlight": analytics.highlights}, dtype="object")
+    stats.quarterly = pd.DataFrame(
+        [
+            {
+                "quarter": q.label,
+                "partial": q.partial,
+                "commits": q.commits,
+                "change_vs_previous_pct": round(q.change * 100, 1) if q.change is not None else None,
+                "prs_opened": q.prs_opened,
+                "prs_merged": q.prs_merged,
+                "code_reviews": q.reviews,
+                "repositories": q.repositories,
+                "active_days": q.active_days,
+                "lines_added": q.additions,
+                "lines_deleted": q.deletions,
+                "shipped": "; ".join(
+                    f"{text} ({repo}{', ' + ref if ref else ''})" for text, repo, ref in q.shipped
+                ),
+            }
+            for q in analytics.quarters
+        ]
+    )
+    mix = analytics.work_mix
+    stats.work_mix = pd.DataFrame(
+        [
+            {"work_type": kind, "commits": mix.counts[kind], "share_pct": round(mix.share(kind) * 100, 1)}
+            for kind in WORK_TYPES
+        ]
+        + [{"work_type": "Merge commits (not counted in the shares)", "commits": mix.merges, "share_pct": None}]
+    )
+    rows: list[dict[str, object]] = []
+    delivery = analytics.delivery
+    if delivery is not None:
+        rows += [{"measure": "Time to merge", "bucket": b, "pull_requests": n} for b, n in delivery.time_buckets]
+        rows += [{"measure": "Size of merged PRs", "bucket": b, "pull_requests": n} for b, n in delivery.size_buckets]
+    stats.pr_delivery = pd.DataFrame(rows, columns=["measure", "bucket", "pull_requests"])
+    rhythm = analytics.rhythm
+    if rhythm is not None:
+        stats.working_rhythm = pd.DataFrame(
+            [[WEEKDAYS[day], *rhythm.heatmap[day]] for day in range(7)],
+            columns=["weekday", *(f"{hour:02d}:00" for hour in range(24))],
+        )
+    stack = analytics.stack
+    stats.technologies = pd.DataFrame(
+        [
+            {
+                "category": use.category,
+                "technology": use.name,
+                "repositories": len(use.repositories),
+                "commits_in_those_repositories": use.commits,
+                "last_commit": use.last_used.isoformat() if use.last_used else "",
+                "repository_names": ", ".join(use.repositories),
+            }
+            for use in ([*stack.languages, *stack.technologies] if stack is not None else [])
+        ],
+        columns=["category", "technology", "repositories", "commits_in_those_repositories",
+                 "last_commit", "repository_names"],
     )
 
 

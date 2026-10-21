@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 
 SCRIPT = """
 (function () {
@@ -77,3 +78,26 @@ REPORT_CSP = (
     "default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
     f"script-src '{SCRIPT_HASH}'; base-uri 'none'; form-action 'none'"
 )
+
+_META_CSP_RE = re.compile(r"<meta http-equiv='Content-Security-Policy' content=\"[^\"]*\">")
+
+
+def is_current(tail: bytes) -> bool:
+    """Whether the end of a report.html holds this version's script."""
+    return (f"<script>{SCRIPT}</script>").encode("utf-8") in tail
+
+
+def with_current_script(page: str) -> str:
+    """A report.html written by an earlier version, with this version's
+    script and the policy that allows it: the server's policy only lets the
+    current script run, so an older report's own script would be blocked
+    (its buttons and "Save as PDF" would do nothing). The script is always
+    the page's last element; anything a commit message could put in the
+    page is escaped, so it can't be mistaken for it."""
+    start = page.rfind("<script>")
+    end = page.find("</script>", start)
+    if start < 0 or end < 0 or page[start + len("<script>"):end] == SCRIPT:
+        return page
+    page = page[: start + len("<script>")] + SCRIPT + page[end:]
+    meta = f"<meta http-equiv='Content-Security-Policy' content=\"{REPORT_CSP}\">"
+    return _META_CSP_RE.sub(lambda _m: meta, page, count=1)

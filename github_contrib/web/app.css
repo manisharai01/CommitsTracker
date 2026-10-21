@@ -472,6 +472,9 @@ dialog.sheet::backdrop { background: rgba(91, 112, 131, 0.4); }
 .sheet-row > .icon { width: 20px; height: 20px; }
 .sheet-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sheet-row-text span { color: var(--muted); font-size: 13px; line-height: 16px; }
+.email-row { align-items: flex-start; }
+.email-row input { flex: none; width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--accent); }
+.email-row b { overflow-wrap: anywhere; }
 .share-url { display: flex; gap: 8px; margin-top: 12px; }
 .share-url input {
   flex: 1; min-width: 0; padding: 8px 12px;

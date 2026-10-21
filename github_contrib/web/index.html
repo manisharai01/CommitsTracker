@@ -248,6 +248,22 @@
     </form>
   </dialog>
 
+  <dialog id="emails-dialog" class="sheet" aria-labelledby="emails-title">
+    <form method="dialog" class="sheet-inner">
+      <div class="sheet-head">
+        <button class="icon-btn" value="close" aria-label="Close"><span data-icon="close"></span></button>
+        <h2 id="emails-title">Uncounted commits</h2>
+      </div>
+      <p class="sheet-sub">These commits in your own repositories were made with emails that aren't on any GitHub account, so GitHub links them to no one. Tick only the emails that are yours: an added email counts every commit made with it, in every repository the report reads, so someone else's would count their work as yours.</p>
+      <div id="emails-list" class="sheet-list"></div>
+      <div class="sheet-foot">
+        <span class="muted">Adding them to your GitHub account (Settings → Emails) also works.</span>
+        <span class="spacer"></span>
+        <button type="button" id="emails-add" class="btn btn-primary btn-sm">Add ticked and run again</button>
+      </div>
+    </form>
+  </dialog>
+
   <template id="account-template">
     <div class="account">
       <span class="avatar" data-initial="?" aria-hidden="true"></span>

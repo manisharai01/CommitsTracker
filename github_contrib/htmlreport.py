@@ -13,11 +13,23 @@ from __future__ import annotations
 
 import base64
 import html
-from datetime import datetime
+import math
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 
+from .analytics import (
+    SMALL_COMMIT_LINES,
+    WEEKDAYS,
+    WORK_TYPES,
+    Analytics,
+    Rhythm,
+    TechUse,
+    Timeline,
+    clean_title,
+    human_duration,
+)
 from .filters import ReportScope
 from .insights import ExecSummary, Insights, RepoWork, build_exec_summary
 from .logging_config import get_logger
@@ -239,6 +251,9 @@ def render_markdown(
             out.append(f"- **{label}:** {value}")
         out.append("")
 
+    out.extend(_markdown_stack(stats.analytics))
+    out.extend(_markdown_analytics(stats.analytics, scope))
+
     out.append("## Activity insights\n")
     out.append(f"- **Busiest day of week:** {ins.get('busiest_day') or 'n/a'}")
     out.append(f"- **Busiest month:** {ins.get('busiest_month') or 'n/a'}")
@@ -277,6 +292,8 @@ def render_markdown(
             for item in work.highlights:
                 out.append(f"- {item}")
             out.append("")
+        if work.technologies:
+            out.append(f"**Stack:** {', '.join(work.technologies)}\n")
         if work.themes:
             out.append(f"**Recurring themes:** {', '.join(work.themes)}\n")
         if work.conv_types:
@@ -336,6 +353,8 @@ tr:nth-child(even) td { background:#fafbfe; }
 .repo ul { margin:6px 0 0; padding-left:20px; }
 .repo li { margin:2px 0; }
 .themes { margin-top:10px; }
+.stackline { margin:-4px 0 10px; font-size:13px; color:var(--muted); }
+.stackline .chip { background:#e8f3ec; color:#1d5b33; }
 .chip { display:inline-block; background:#eef2f9; color:#33476a; border-radius:999px; padding:2px 10px; margin:3px 4px 0 0; font-size:12.5px; }
 .note { color:var(--muted); font-size:13.5px; font-style:italic; }
 .impact { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 10px; }
@@ -382,6 +401,50 @@ button.toggle:hover { background:#eef2f9; }
               min-width:3px; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
 .dash td.dmeta { color:var(--muted); font-size:12.5px; white-space:nowrap; }
 .dash .nobr { white-space:nowrap; }
+/* Insights & analytics */
+#analytics h3 { margin:26px 0 10px; }
+#analytics .hl h3 { margin:0 0 4px; }
+#analytics .card .v { font-size:22px; white-space:nowrap; }
+.hl ul { margin:6px 0 0; padding-left:20px; }
+.hl li { margin:5px 0; }
+.agrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; margin-top:14px; }
+.atable { margin-top:14px; }
+.atable h4, .shipped h4 { margin:0 0 6px; font-size:13.5px; color:var(--muted); font-weight:600; }
+table.bars { font-size:13px; }
+table.bars td { padding:5px 10px; }
+table.bars td.alabel, table.bars td.anum, table.bars td.ashare { white-space:nowrap; width:1%; }
+table.bars td.anum, table.bars td.ashare, .abig td.anum { text-align:right; white-space:nowrap; }
+table.bars td.ashare { color:var(--muted); }
+.abar { height:12px; border-radius:4px; background:linear-gradient(90deg,var(--accent),var(--accent2));
+        print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+.abig table { font-size:13px; }
+.atag { display:inline-block; font-size:11px; font-weight:500; color:var(--muted); border:1px solid var(--line);
+        border-radius:6px; padding:0 5px; margin-left:4px; }
+.anote { font-size:12.5px; color:var(--muted); margin:8px 0 0; }
+.shipped { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
+.shipped .sq { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 16px; }
+.shipped ul { margin:0; padding-left:18px; font-size:13.5px; }
+.shipped li { margin:3px 0; }
+.shipped .frepo { color:var(--muted); font-size:12px; }
+table.heat { table-layout:fixed; border-collapse:separate; border-spacing:2px; border:none; background:none; }
+table.heat th { background:none; color:var(--muted); font-weight:500; font-size:10.5px; padding:0 1px; text-align:left; }
+table.heat th.day { width:36px; }
+table.heat td { height:18px; padding:0; border:none; border-radius:3px; background:#eef2f8;
+                print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+.tl { margin-top:6px; }
+.tlrow { display:grid; grid-template-columns:minmax(140px,28%) 1fr; gap:12px; align-items:center;
+         padding:5px 0; border-bottom:1px solid var(--line); }
+.tlrow.tlaxis { border-bottom:none; padding:0 0 2px; }
+.tlname { font-size:13px; line-height:1.3; overflow-wrap:anywhere; }
+.tlname b { font-weight:600; }
+.tlname span { display:block; color:var(--muted); font-size:11.5px; }
+.tltrack { position:relative; height:20px; }
+.tlaxis .tltrack { height:15px; }
+.tltick { position:absolute; top:0; bottom:0; border-left:1px dashed #d3dbe8; }
+.tllabel { position:absolute; top:0; padding-left:3px; font-size:10.5px; color:var(--muted); white-space:nowrap; }
+.tlspan, .tlm { position:absolute; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+.tlspan { top:9px; height:2px; background:#c3cee0; }
+.tlm { top:3px; height:14px; min-width:2px; border-radius:2px; }
 /* Commit timeline appendix */
 #commit-timeline tr.month th { background:#eef2f9; color:#33476a; font-size:12.5px; letter-spacing:.04em;
                                text-transform:uppercase; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
@@ -403,6 +466,9 @@ button.toggle:hover { background:#eef2f9; }
   .dash td.dname, .dash td.dmeta { white-space:normal; overflow-wrap:break-word; }
   .dash td.dmeta { font-size:11px; }
   .card, .charts figure, .exec .proj, tr { break-inside:avoid; }
+  .atable, .shipped .sq, #analytics .cards, .tlrow, .tlwrap { break-inside:avoid; }
+  .tllabel { font-size:9.5px; }
+  #analytics h3, #stack h2, #stack > .note { break-after:avoid; }
   section { break-inside:auto; }
   h2 { break-after:avoid; }
   a { color:inherit; text-decoration:none; }
@@ -622,6 +688,465 @@ def _render_commit_timeline(commits_df: pd.DataFrame) -> str:
     )
 
 
+def _analytics_cards(pairs: list[tuple[str, str]]) -> str:
+    cells = "".join(
+        f"<div class='card'><div class='v'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>"
+        for value, label in pairs
+    )
+    return f"<div class='cards'>{cells}</div>"
+
+
+def _bar_table(title: str, rows: list[tuple[str, int]]) -> str:
+    """A small table of labelled counts, each with a bar and its share."""
+    total = sum(n for _label, n in rows) or 1
+    peak = max((n for _label, n in rows), default=0) or 1
+    body = "".join(
+        f"<tr><td class='alabel'>{_esc(label)}</td>"
+        f"<td class='abarcell'><div class='abar' style='width:{(max(n / peak * 100, 1.5) if n else 0):.1f}%'></div></td>"
+        f"<td class='anum'>{n:,}</td><td class='ashare'>{n / total:.0%}</td></tr>"
+        for label, n in rows
+    )
+    return f"<div class='atable'><h4>{_esc(title)}</h4><table class='bars'><tbody>{body}</tbody></table></div>"
+
+
+def _heatmap(rhythm: Rhythm) -> str:
+    """Commits by weekday (rows) and hour (columns), darker = more."""
+    peak = max(max(day) for day in rhythm.heatmap) or 1
+    head = "<tr><th class='day'></th>" + "".join(
+        f"<th>{hour:02d}</th>" if hour % 3 == 0 else "<th></th>" for hour in range(24)
+    ) + "</tr>"
+    rows = []
+    for day, counts in enumerate(rhythm.heatmap):
+        cells = "".join(
+            f"<td title='{WEEKDAYS[day]} {hour:02d}:00 · {n} commit{'' if n == 1 else 's'}'"
+            + (f" style='background:rgba(48,84,150,{0.15 + 0.85 * n / peak:.2f})'" if n else "")
+            + "></td>"
+            for hour, n in enumerate(counts)
+        )
+        rows.append(f"<tr><th class='day'>{WEEKDAYS[day]}</th>{cells}</tr>")
+    return f"<table class='heat'><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
+
+
+def _month_after(day: date) -> date:
+    return date(day.year + 1, 1, 1) if day.month == 12 else date(day.year, day.month + 1, 1)
+
+
+def _months(first: date, last: date) -> str:
+    return f"{first:%b %Y}" if (first.year, first.month) == (last.year, last.month) else f"{first:%b %Y} – {last:%b %Y}"
+
+
+def _timeline(t: Timeline) -> str:
+    """When each repository was worked on: a line from its first to its
+    latest commit, and a block for every month with commits (darker = more)."""
+    origin = date(t.start.year, t.start.month, 1)
+    stop = _month_after(t.end)
+    span = (stop - origin).days
+
+    def x(day: date) -> float:
+        return min(max((day - origin).days / span * 100, 0.0), 100.0)
+
+    months = (stop.year - origin.year) * 12 + stop.month - origin.month
+    step = 1 if months <= 8 else 3 if months <= 24 else 6 if months <= 48 else 12
+    ticks: list[tuple[float, str]] = []
+    day = origin
+    while day < stop:
+        if (day.month - 1) % step == 0:
+            if step == 12:
+                label = f"{day.year}"
+            elif step == 1 and ticks and day.month != 1:
+                label = f"{day:%b}"
+            else:
+                label = f"{day:%b %Y}"
+            ticks.append((x(day), label))
+        day = _month_after(day)
+    grid = "".join(f"<div class='tltick' style='left:{left:.2f}%'></div>" for left, _label in ticks if left > 0)
+    labels = "".join(
+        f"<div class='tllabel' style='left:{left:.2f}%'>{_esc(label)}</div>" for left, label in ticks if left < 92
+    )
+    peak = max((n for row in t.rows for n in row.by_month.values()), default=1)
+    rows = [f"<div class='tlrow tlaxis'><div class='tlname'></div><div class='tltrack'>{labels}</div></div>"]
+    for row in t.rows:
+        blocks = []
+        for key, n in sorted(row.by_month.items()):
+            month = date(int(key[:4]), int(key[5:7]), 1)
+            left = x(month)
+            blocks.append(
+                f"<div class='tlm' title='{month:%b %Y} · {n:,} commit{'' if n == 1 else 's'}' "
+                f"style='left:{left:.2f}%;width:{x(_month_after(month)) - left:.2f}%;"
+                f"background:rgba(48,84,150,{0.22 + 0.78 * math.sqrt(n / peak):.2f})'></div>"
+            )
+        line_left = x(row.first)
+        line = (
+            f"<div class='tlspan' style='left:{line_left:.2f}%;"
+            f"width:{max(x(row.last) - line_left, 0):.2f}%'></div>"
+        )
+        rows.append(
+            f"<div class='tlrow'><div class='tlname'><b>{_esc(row.repository)}</b>"
+            f"<span>{row.commits:,} commit{'' if row.commits == 1 else 's'} · {_months(row.first, row.last)}</span></div>"
+            f"<div class='tltrack'>{grid}{line}{''.join(blocks)}</div></div>"
+        )
+    return f"<div class='tl'>{''.join(rows)}</div>"
+
+
+def _use_table(title: str, uses: list[TechUse], top: int = 10) -> str:
+    """Technologies (or languages) with a bar for the commits in the
+    repositories that use each, and how many repositories those are."""
+    peak = max((u.commits for u in uses), default=0) or 1
+    rows = "".join(
+        f"<tr title='{_esc(_use_tip(u))}'><td class='alabel'>{_esc(u.name)}</td>"
+        f"<td class='abarcell'><div class='abar' style='width:{(max(u.commits / peak * 100, 1.5) if u.commits else 0):.1f}%'></div></td>"
+        f"<td class='anum'>{u.commits:,}</td>"
+        f"<td class='ashare'>{len(u.repositories)} repo{'' if len(u.repositories) == 1 else 's'}</td></tr>"
+        for u in uses[:top]
+    )
+    more = uses[top:]
+    extra = f"<p class='anote'>Also: {_esc(', '.join(u.name for u in more))}.</p>" if more else ""
+    return f"<div class='atable'><h4>{_esc(title)}</h4><table class='bars'><tbody>{rows}</tbody></table>{extra}</div>"
+
+
+def _use_tip(use: TechUse) -> str:
+    last = f"last commit {use.last_used:%b %Y}; " if use.last_used else ""
+    return f"{last}{', '.join(use.repositories[:8])}{' …' if len(use.repositories) > 8 else ''}"
+
+
+def _render_stack(a: Analytics | None) -> str:
+    """The 'Technologies' section (see stack.py and analytics._stack)."""
+    s = a.stack if a is not None else None
+    if s is None or not (s.languages or s.technologies):
+        return ""
+
+    def repos(n: int) -> str:
+        return f"{n} repositor{'y' if n == 1 else 'ies'}"
+
+    unread = f" The technologies of {repos(s.unread)} more couldn't be read." if s.unread else ""
+    parts = [
+        "<section id='stack'><h2>Technologies</h2>",
+        f"<p class='note'>Found in the {repos(s.read)} with commits in this report: GitHub's language "
+        "statistics, dependency files (package.json, pubspec.yaml, requirements.txt, go.mod, pom.xml, …) and "
+        "telltale files (Dockerfile, CI workflows, Terraform, …). Each is weighted by the commits in the "
+        "repositories that use it; a technology being used in a repository doesn't show which parts of it were "
+        f"worked on.{unread}</p>",
+    ]
+    if s.languages:
+        parts.append(_use_table("Languages · commits in repositories using each", s.languages, top=8))
+    groups = s.by_category()
+    if groups:
+        parts.append(
+            "<div class='agrid'>"
+            + "".join(_use_table(category, uses, top=8) for category, uses in groups)
+            + "</div>"
+        )
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _markdown_stack(a: Analytics | None) -> list[str]:
+    s = a.stack if a is not None else None
+    if s is None or not (s.languages or s.technologies):
+        return []
+    out = [
+        "## Technologies\n",
+        "_Found in the repositories with commits (GitHub's language statistics, dependency files and "
+        "telltale files such as Dockerfiles and CI workflows), each weighted by the commits in the "
+        "repositories that use it._\n",
+    ]
+    if s.languages:
+        out.append(_md_table(pd.DataFrame(
+            [(u.name, u.commits, len(u.repositories)) for u in s.languages],
+            columns=["language", "commits in repos using it", "repos"],
+        )))
+        out.append("")
+    for category, uses in s.by_category():
+        out.append(f"- **{category}:** " + ", ".join(f"{u.name} ({u.commits:,})" for u in uses))
+    out.append("")
+    return out
+
+
+def _render_analytics(a: Analytics | None, scope: ReportScope | None = None) -> str:
+    """The 'Insights & analytics' section (see analytics.py for every definition)."""
+    if a is None or not (a.work_mix.total or a.work_mix.merges or a.delivery or a.reviews):
+        return ""
+    parts = ["<section id='analytics'><h2>Insights &amp; analytics</h2>"]
+    if a.highlights:
+        items = "".join(f"<li>{_esc(line)}</li>" for line in a.highlights)
+        parts.append(f"<div class='card hl'><h3>Highlights</h3><ul>{items}</ul></div>")
+
+    d = a.delivery
+    if d is not None:
+        cards = [(f"{d.merged:,}", f"pull requests merged, of {d.opened:,} opened")]
+        if d.merge_rate is not None:
+            cards.append((f"{d.merge_rate:.0%}", "of closed pull requests merged"))
+        if d.median_hours is not None:
+            cards.append((human_duration(d.median_hours), "median time to merge"))
+            cards.append((f"{d.within_day / len(d.hours_to_merge):.0%}", "merged within a day"))
+        if d.p90_hours is not None and len(d.hours_to_merge) >= 10:
+            cards.append((human_duration(d.p90_hours), "9 in 10 merged within"))
+        if d.median_size is not None:
+            cards.append((f"{d.median_size:,.0f}", "median lines per merged pull request"))
+        parts.append("<h3>Delivery</h3>" + _analytics_cards(cards))
+        tables = []
+        if d.time_buckets:
+            tables.append(_bar_table("Time from opening to merge", d.time_buckets))
+        if d.size_buckets:
+            tables.append(_bar_table(f"Size of merged pull requests ({d.sized:,} with a recorded size)", d.size_buckets))
+        if tables:
+            parts.append(f"<div class='agrid'>{''.join(tables)}</div>")
+        if d.biggest:
+            rows = "".join(
+                f"<tr><td>{_esc(clean_title(p.title))}</td><td class='dname'>{_esc(p.full_name)}</td>"
+                f"<td class='anum'>+{p.additions or 0:,} / −{p.deletions or 0:,}</td>"
+                f"<td class='anum'>{p.changed_files or 0:,}</td>"
+                f"<td class='anum'>{_esc(human_duration((p.merged_at - p.created_at).total_seconds() / 3600) if p.merged_at and p.created_at else '—')}</td></tr>"
+                for p in d.biggest
+            )
+            parts.append(
+                "<div class='atable abig'><h4>Largest merged pull requests</h4><div class='table-scroll'><table>"
+                "<thead><tr><th>Pull request</th><th>Repository</th><th>Lines</th><th>Files</th>"
+                f"<th>Time to merge</th></tr></thead><tbody>{rows}</tbody></table></div></div>"
+            )
+        parts.append(
+            "<p class='anote'>Time to merge runs from opening a pull request to merging it, so it includes "
+            "the wait for review. A pull request's size counts every line its diff changes, including "
+            "commits teammates added to it.</p>"
+        )
+
+    rv = a.reviews
+    if rv is not None:
+        cards = [
+            (f"{rv.total:,}", "code reviews given"),
+            (f"{rv.pull_requests:,}", "pull requests reviewed"),
+            (f"{rv.authors:,}", f"teammate{'' if rv.authors == 1 else 's'} whose work was reviewed"),
+            (f"{len(rv.repositories):,}", f"repositor{'y' if len(rv.repositories) == 1 else 'ies'}"),
+        ]
+        parts.append(
+            "<h3>Code reviews</h3>" + _analytics_cards(cards)
+            + "<div class='agrid'>" + _bar_table("Review outcomes", rv.states)
+            + _bar_table("Repositories reviewed most", [(name, n) for name, n in rv.repositories[:8]])
+            + "</div><p class='anote'>Reviews submitted on other people's pull requests, from GitHub's "
+            "contribution history (reviews of the tracked accounts' own pull requests are left out).</p>"
+        )
+
+    mix = a.work_mix
+    if mix.total:
+        rows = [(kind, mix.counts[kind]) for kind in WORK_TYPES if mix.counts[kind]]
+        merges = f" {mix.merges:,} merge commit(s) are left out." if mix.merges else ""
+        parts.append(
+            "<h3>Work mix</h3>" + _bar_table(f"{mix.total:,} commits by kind of work", rows)
+            + "<p class='anote'>Read from the first line of each commit message: conventional prefixes "
+            "(feat:, fix:, refactor:, …) first, then words such as “fix”, “add”, “update”, “refactor” or "
+            f"“test”. It is an estimate: terse messages land in Other.{merges}</p>"
+        )
+
+    if a.quarters:
+        lines = any(q.additions or q.deletions for q in a.quarters)
+        reviewed = any(q.reviews for q in a.quarters)
+        peak = max(q.commits for q in a.quarters) or 1
+        head = (
+            "<tr><th>Quarter</th><th>Commits</th><th></th><th>vs previous</th><th>PRs merged</th>"
+            + ("<th>Reviews</th>" if reviewed else "")
+            + "<th>Repos</th><th>Active days</th>" + ("<th>Lines</th>" if lines else "") + "</tr>"
+        )
+        rows = []
+        for q in a.quarters:
+            width = max(q.commits / peak * 100, 1.5) if q.commits else 0
+            partial = " <span class='atag'>partial</span>" if q.partial else ""
+            change = f"{q.change:+.0%}" if q.change is not None else "—"
+            line_cell = f"<td class='dmeta'>+{q.additions:,} / −{q.deletions:,}</td>" if lines else ""
+            review_cell = f"<td class='dnum'>{q.reviews:,}</td>" if reviewed else ""
+            rows.append(
+                f"<tr><td class='dname'>{q.label}{partial}</td><td class='dnum'>{q.commits:,}</td>"
+                f"<td class='dbarcell'><div class='dbar' style='width:{width:.1f}%'></div></td>"
+                f"<td class='dshare'>{change}</td><td class='dnum'>{q.prs_merged:,}</td>{review_cell}"
+                f"<td class='dnum'>{q.repositories:,}</td><td class='dnum'>{q.active_days:,}</td>{line_cell}</tr>"
+            )
+        parts.append(
+            "<h3>Quarter by quarter</h3><div class='table-scroll'><table class='dash aq'>"
+            f"<thead>{head}</thead><tbody>{''.join(rows)}</tbody></table></div>"
+            "<p class='anote'>A partial quarter is one the report (or the work) covers only in part, so it "
+            "isn't compared with the quarter before.</p>"
+        )
+        shipped = [q for q in a.quarters if q.shipped]
+        if shipped:
+            blocks = "".join(
+                f"<div class='sq'><h4>{q.label}</h4><ul>"
+                + "".join(
+                    f"<li>{_esc(what)} <span class='frepo'>— {_esc(repo)}{' · ' + _esc(ref) if ref else ''}</span></li>"
+                    for what, repo, ref in q.shipped
+                )
+                + "</ul></div>"
+                for q in shipped
+            )
+            parts.append(
+                "<h3>What shipped each quarter</h3><p class='anote'>Merged pull requests, largest first (by "
+                "lines changed, or by number of commits when the size isn't recorded). A quarter without any "
+                "lists the commits that describe features, improvements or fixes.</p>"
+                f"<div class='shipped'>{blocks}</div>"
+            )
+
+    t = a.timeline
+    if t is not None and len(t.rows) >= 2:
+        hidden = (
+            f" {t.hidden:,} more repositor{'y' if t.hidden == 1 else 'ies'} with fewer commits "
+            f"{'is' if t.hidden == 1 else 'are'} left off."
+            if t.hidden else ""
+        )
+        parts.append(
+            "<div class='tlwrap'><h3>Project timeline</h3>"
+            "<p class='anote'>When each repository was worked on, in the order the work began: a line from "
+            "its first to its latest commit in this report, and a block for every month with commits "
+            f"(darker = more commits).{hidden}</p>{_timeline(t)}</div>"
+        )
+
+    r = a.rhythm
+    if r is not None:
+        zone = scope.timezone if scope is not None else "UTC"
+        cards = [
+            (f"{r.active_weeks} of {r.weeks_in_span}", f"weeks with commits ({r.consistency:.0%})"),
+            (f"{r.best_30_commits:,}",
+             f"commits in the best 30 days ({r.best_30_start:%d %b} – {r.best_30_end:%d %b %Y})"),
+            (f"{r.peak_start:02d}:00–{(r.peak_start + 3) % 24:02d}:00", f"busiest hours ({r.peak_share:.0%} of commits)"),
+            (f"{r.weekend_share:.0%}", "of commits on weekends"),
+        ]
+        weeks = ""
+        if r.span_start and r.span_end:
+            span = f"{r.span_start:%d %b %Y} – {r.span_end:%d %b %Y}"
+            weeks = (
+                f"<p class='anote'>Weeks are counted across the report period, as far as it has run: {span}.</p>"
+                if r.span_is_period else
+                f"<p class='anote'>Weeks are counted from the first commit to the latest: {span}.</p>"
+            )
+        parts.append(
+            "<h3>Working rhythm</h3>" + _analytics_cards(cards) + weeks
+            + f"<div class='atable'><h4>Commits by day and hour ({_esc(zone)})</h4>{_heatmap(r)}</div>"
+        )
+
+    f = a.footprint
+    if f is not None:
+        cards = [
+            (f"{f.median_lines:,.0f}", "median lines changed per commit"),
+            (f"{f.small_share:.0%}", f"of commits change under {SMALL_COMMIT_LINES} lines"),
+            (f"{f.p90_lines:,.0f}", "lines or fewer in 9 of 10 commits"),
+        ]
+        if f.removed_per_100_added is not None:
+            cards.append((f"{f.removed_per_100_added:,.0f}", "lines removed per 100 added"))
+        parts.append(
+            "<h3>Code footprint</h3>" + _analytics_cards(cards)
+            + f"<p class='anote'>From {f.measured:,} commits with line counts (merge commits left out). Line "
+            "counts include generated and vendored files committed to the repositories (lock files, builds, "
+            "assets), which can make totals large; the medians are barely affected.</p>"
+        )
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _markdown_analytics(a: Analytics | None, scope: ReportScope | None = None) -> list[str]:
+    """The 'Insights & analytics' section of report.md."""
+    if a is None or not (a.work_mix.total or a.work_mix.merges or a.delivery or a.reviews):
+        return []
+    out = ["## Insights & analytics\n"]
+    if a.highlights:
+        out.append("**Highlights:**\n")
+        out.extend(f"- {line}" for line in a.highlights)
+        out.append("")
+    d = a.delivery
+    if d is not None:
+        out.append("### Delivery\n")
+        out.append(f"- **Pull requests merged:** {d.merged:,} of {d.opened:,} opened")
+        if d.merge_rate is not None:
+            out.append(f"- **Closed pull requests merged:** {d.merge_rate:.0%}")
+        if d.median_hours is not None:
+            out.append(f"- **Median time to merge:** {human_duration(d.median_hours)} "
+                       f"({d.within_day / len(d.hours_to_merge):.0%} within a day)")
+        if d.median_size is not None:
+            out.append(f"- **Median lines per merged pull request:** {d.median_size:,.0f}")
+        out.append("")
+        for title, buckets in (("Time to merge", d.time_buckets), ("Size of merged pull requests", d.size_buckets)):
+            if buckets:
+                total = sum(n for _b, n in buckets) or 1
+                out.append(_md_table(pd.DataFrame(
+                    [(b, n, f"{n / total:.0%}") for b, n in buckets], columns=[title, "pull requests", "share"]
+                )))
+                out.append("")
+        if d.biggest:
+            out.append("**Largest merged pull requests:**\n")
+            out.append(_md_table(pd.DataFrame(
+                [(clean_title(p.title), p.full_name, f"+{p.additions or 0:,} / −{p.deletions or 0:,}",
+                  p.changed_files or 0) for p in d.biggest],
+                columns=["pull request", "repository", "lines", "files"],
+            )))
+            out.append("")
+    rv = a.reviews
+    if rv is not None:
+        out.append("### Code reviews\n")
+        out.append(f"- **Code reviews given:** {rv.total:,} on {rv.pull_requests:,} pull requests by "
+                   f"{rv.authors:,} teammate(s), in {len(rv.repositories):,} repositories")
+        out.append("- **Outcomes:** " + ", ".join(f"{label} {n:,}" for label, n in rv.states))
+        out.append("- **Reviewed most:** " + ", ".join(f"{name} ({n:,})" for name, n in rv.repositories[:5]))
+        out.append("")
+    mix = a.work_mix
+    if mix.total:
+        out.append("### Work mix\n")
+        out.append(_md_table(pd.DataFrame(
+            [(kind, mix.counts[kind], f"{mix.share(kind):.0%}") for kind in WORK_TYPES if mix.counts[kind]],
+            columns=["kind of work", "commits", "share"],
+        )))
+        out.append("\n_Estimated from commit message wording; merge commits left out._\n")
+    if a.quarters:
+        out.append("### Quarter by quarter\n")
+        quarters = pd.DataFrame(
+            [
+                (q.label + (" (partial)" if q.partial else ""), q.commits,
+                 f"{q.change:+.0%}" if q.change is not None else "—", q.prs_merged, q.reviews,
+                 q.repositories, q.active_days, f"+{q.additions:,} / −{q.deletions:,}")
+                for q in a.quarters
+            ],
+            columns=["quarter", "commits", "vs previous", "PRs merged", "reviews", "repos", "active days", "lines"],
+        )
+        if not any(q.additions or q.deletions for q in a.quarters):
+            quarters = quarters.drop(columns=["lines"])  # no line counts were collected
+        if not any(q.reviews for q in a.quarters):
+            quarters = quarters.drop(columns=["reviews"])  # no code reviews were collected
+        out.append(_md_table(quarters))
+        out.append("")
+        for q in a.quarters:
+            if q.shipped:
+                out.append(f"**{q.label} — what shipped:**\n")
+                out.extend(f"- {what} _({repo}{', ' + ref if ref else ''})_" for what, repo, ref in q.shipped)
+                out.append("")
+    t = a.timeline
+    if t is not None and len(t.rows) >= 2:
+        out.append("### Project timeline\n")
+        out.append(_md_table(pd.DataFrame(
+            [(row.repository, row.commits, f"{row.first:%d %b %Y}", f"{row.last:%d %b %Y}", len(row.by_month))
+             for row in t.rows],
+            columns=["repository", "commits", "first commit", "latest commit", "months with commits"],
+        )))
+        if t.hidden:
+            out.append(f"\n_{t.hidden:,} more repositories with fewer commits are left off._")
+        out.append("")
+    r = a.rhythm
+    if r is not None:
+        zone = scope.timezone if scope is not None else "UTC"
+        out.append("### Working rhythm\n")
+        span = f", {r.span_start:%d %b %Y} – {r.span_end:%d %b %Y}" if r.span_start and r.span_end else ""
+        out.append(f"- **Weeks with commits:** {r.active_weeks} of {r.weeks_in_span} ({r.consistency:.0%}{span})")
+        out.append(f"- **Best 30 days:** {r.best_30_commits:,} commits "
+                   f"({r.best_30_start:%d %b %Y} – {r.best_30_end:%d %b %Y})")
+        out.append(f"- **Busiest hours ({zone}):** {r.peak_start:02d}:00–{(r.peak_start + 3) % 24:02d}:00 "
+                   f"({r.peak_share:.0%} of commits)")
+        out.append(f"- **Commits on weekends:** {r.weekend_share:.0%}")
+        out.append("")
+    f = a.footprint
+    if f is not None:
+        out.append("### Code footprint\n")
+        out.append(f"- **Median lines changed per commit:** {f.median_lines:,.0f} "
+                   f"({f.small_share:.0%} of commits under {SMALL_COMMIT_LINES} lines)")
+        if f.removed_per_100_added is not None:
+            out.append(f"- **Lines removed per 100 added:** {f.removed_per_100_added:,.0f}")
+        out.append("")
+    return out
+
+
 def _render_exec_summary(exec_summary: ExecSummary) -> str:
     """The promotion-ready 'Executive summary' section."""
     parts: list[str] = [
@@ -716,6 +1241,10 @@ def render_html(
 
     # Executive summary (promotion-ready narrative)
     parts.append(_render_exec_summary(exec_summary))
+
+    # Technologies, then insights & analytics (delivery, work mix, quarters, rhythm, footprint)
+    parts.append(_render_stack(stats.analytics))
+    parts.append(_render_analytics(stats.analytics, scope))
 
     # Activity insights
     parts.append("<section><h2>Activity insights</h2><div class='cards'>")
@@ -821,12 +1350,17 @@ def _render_repo_card(work: RepoWork, commit_rows: list[dict] | None = None) -> 
             )
 
     commits_html = _render_commit_list(commit_rows or [])
+    stack_html = (
+        "<div class='stackline'>Stack: "
+        + "".join(f"<span class='chip'>{_esc(t)}</span>" for t in work.technologies)
+        + "</div>"
+    ) if work.technologies else ""
 
     return (
         "<div class='repo'>"
         f"<div class='name'>{_esc(work.full_name)}<span class='badge {badge}'>{badge}</span></div>"
         f"<div class='sub'>{_esc(work.headline())}{lang}</div>"
-        f"{impact_html}{items_html}{themes_html}{commits_html}"
+        f"{stack_html}{impact_html}{items_html}{themes_html}{commits_html}"
         "</div>"
     )
 

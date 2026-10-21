@@ -78,7 +78,7 @@ be `https://<service>.onrender.com`. It's used in step 1.
 | `RETENTION_HOURS` | no | Hours to keep report files after a run finishes. Default 24. |
 | `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. |
 | `PDF_TIMEOUT` | no | Seconds the PDF may take. Default 900 (15 minutes). |
-| `PDF_PART_ROWS` | no | Commit-appendix rows printed per part of the PDF. Default 200, which keeps the PDF step at about 330 MB however long the report is. `0` prints in one go (over 900 MB for 1,800 commits). |
+| `PDF_PART_ROWS` | no | Commit-appendix rows printed per part of the PDF. Default 200, which keeps the PDF step at about 350 MB however long the report is (measured with 1,800 commits and every section). `0` prints in one go (over 900 MB for 1,800 commits). |
 | `PDF_MEMORY_LIMIT_MB` | no | The memory the PDF step must stay under. Default: the container's limit. It stops the browser 64 MB before that, so the server never runs out. |
 | `PORT`, `RENDER`, `RENDER_EXTERNAL_URL` | set by Render | Port, `0.0.0.0` binding and trusted proxy headers. |
 
@@ -129,3 +129,11 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
   period, status and, once it is done, six numbers (commits, pull requests,
   repositories, active days, lines added and deleted). Row level security is
   on with no policies, so Supabase's public REST API can't read it.
+- **Other people's emails** stay out of shared reports. When commits in a
+  tracked account's own repository were made with an email no GitHub account
+  has, the report (HTML, PDF, Markdown) shows that email masked
+  (`a•••@gmail.com`); only the report's owner sees it in full, on the report
+  card and in the run log. Nothing is added to a report without the owner
+  ticking it.
+- **Older reports** still on disk after an update are served with the current
+  report script and policy, so their buttons and Save as PDF keep working.

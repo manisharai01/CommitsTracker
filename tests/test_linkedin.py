@@ -115,6 +115,23 @@ def test_post_edge_cases():
     print("ok  test_post_edge_cases")
 
 
+def test_post_uses_the_analytics_when_they_mean_something():
+    base = {"total_lifetime_commits": "1805", "total_pull_requests": "261", "merged_pull_requests": "235",
+            "repositories_contributed_to": "43", "active_weeks": "73", "weeks_in_span": "88",
+            "median_hours_to_merge": "0.82"}
+    post = build_linkedin_post(base)
+    assert "• Shipped code in 73 of 88 weeks" in post, post
+    assert "• Half of my merged pull requests were merged within 49 min of opening" in post, post
+    assert "within a minute of opening" in build_linkedin_post({**base, "median_hours_to_merge": "0.01"})
+    # Too short a span, too few merged pull requests, or no figures: nothing said.
+    quiet = build_linkedin_post({**base, "weeks_in_span": "2", "merged_pull_requests": "2"})
+    assert "weeks" not in quiet and "merged within" not in quiet, quiet
+    assert "merged within" not in build_linkedin_post({**base, "median_hours_to_merge": ""})
+    # Code in under half the weeks isn't worth a highlight.
+    assert "weeks" not in build_linkedin_post({**base, "active_weeks": "40"})
+    print("ok  test_post_uses_the_analytics_when_they_mean_something")
+
+
 def _all_tests():
     return [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 

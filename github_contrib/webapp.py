@@ -68,7 +68,12 @@ from .config import (
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
 from .pdfexport import EXIT_NO_MEMORY, find_browser, pdf_timeout
-from .reportscript import REPORT_CSP  # not htmlreport: pandas would cost the server ~40 MB
+from .reportscript import (  # not htmlreport: pandas would cost the server ~40 MB
+    REPORT_CSP,
+    SCRIPT,
+    is_current,
+    with_current_script,
+)
 from .store import ReportRow, Store, make_store
 
 log = get_logger("webapp")
@@ -92,6 +97,7 @@ REPORT_FILES: dict[str, str] = {
 SUMMARY_KEYS: tuple[str, ...] = (
     "total_lifetime_commits",
     "total_pull_requests",
+    "pull_request_reviews",
     "merged_pull_requests",
     "repositories_contributed_to",
     "organizations_contributed_to",
@@ -182,6 +188,8 @@ _PROGRESS_PHASES: dict[str, str] = {
     "Pull requests": "Collecting pull requests",
     "PR commits": "Reading pull-request commits",
     "Line stats": "Fetching line stats",
+    "Technologies": "Reading technologies",
+    "Reviews": "Reading code reviews",
 }
 #: Log message fragments that start a new phase, in pipeline order.
 _LOG_PHASES: tuple[tuple[str, str], ...] = (
@@ -668,6 +676,52 @@ def _path_redactions(*paths: Path) -> list[tuple[str, str]]:
     return sorted(pairs, key=lambda pair: -len(pair[0]))
 
 
+def redact_paths(text: str, pairs: list[tuple[str, str]]) -> str:
+    """Replace each server path only where it stands as a path of its own: in
+    a container the app lives in "/app", which "neha/app: 3 commits …" (a
+    repository) must keep, and so must "/app-v2" or "/app.py"."""
+    for path, label in pairs:
+        if path and path in text:
+            text = re.sub(rf"(?<![\w.-]){re.escape(path)}(?![\w-]|\.\w)", lambda _m, label=label: label, text)
+    return text
+
+
+def read_unlinked(out_dir: Path) -> list[dict]:
+    """The emails of commits a finished run couldn't credit in the accounts'
+    own repositories (report._check_unlinked_commits, via collection.json),
+    for the card to offer: the user picks which, if any, are theirs."""
+    try:
+        meta = json.loads((out_dir / "collection.json").read_text(encoding="utf-8")).get("meta") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    return clean_unlinked(meta.get("unlinked_emails") if isinstance(meta, dict) else None)
+
+
+def clean_unlinked(items: object) -> list[dict]:
+    """Only well-formed entries (they come from a file on disk), at most 20."""
+    out: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not _EMAIL_RE.match(str(item.get("email") or "")):
+            continue
+        try:
+            repositories = [
+                [str(pair[0])[:200], int(pair[1])]
+                for pair in item.get("repositories") or []
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+            out.append({
+                "email": str(item["email"])[:254],
+                "commits": int(item.get("commits") or 0),
+                "names": [str(name)[:100] for name in item.get("names") or []][:5],
+                "repositories": repositories[:10],
+                "owner": str(item.get("owner") or "")[:100],
+                "in_forks_only": bool(item.get("in_forks_only")),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out[:20]
+
+
 def _kill_tree(process: asyncio.subprocess.Process) -> None:
     """Stop a run and everything it started (the browser rendering the PDF)."""
     if process.returncode is not None:
@@ -780,8 +834,12 @@ class Job:
     delete_requested: bool = False
     timed_out: bool = False
     client: str = ""  # address that created it (rate limiting; never stored)
-    # (secret or server path, replacement) applied to everything shown
+    # (secret, replacement) applied to everything shown, wherever it appears
     redactions: list[tuple[str, str]] = field(default_factory=list)
+    # (server path, placeholder): public mode, for whole paths only
+    path_redactions: list[tuple[str, str]] = field(default_factory=list)
+    # Emails of commits the report couldn't credit (see read_unlinked).
+    unlinked: list[dict] = field(default_factory=list)
     # Secret part of the read-only link the owner shared ("" = not shared).
     share_token: str = ""
     # The PDF of a finished report: "rendering" while a browser prints it (the
@@ -838,6 +896,7 @@ class Job:
             "summary": self.summary,
             "share_token": self.share_token,
             "pdf": self.pdf,
+            "unlinked": self.unlinked,
         }
 
     def to_json(self, share_base: str = "") -> dict:
@@ -870,6 +929,7 @@ class Job:
             error=data.get("error", ""),
             warnings=[w for w in data.get("warnings", []) if not _TRANSIENT_WARNING_RE.search(str(w))],
             summary=dict(data.get("summary", {})),
+            unlinked=clean_unlinked(data.get("unlinked")),
         )
         token = str(data.get("share_token") or "")
         job.share_token = token if _SHARE_RE.match(token) else ""
@@ -888,7 +948,7 @@ class Job:
         for secret, replacement in self.redactions:
             if secret:
                 text = text.replace(secret, replacement)
-        return text
+        return redact_paths(text, self.path_redactions)
 
     def add_output(self, line: str) -> None:
         """Record one line of the child's output and update the live status."""
@@ -1005,7 +1065,7 @@ class JobManager:
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 log.warning("skipping unreadable %s: %s", path, exc)
                 continue
-            job.redactions = self._server_paths(job.out_dir)
+            job.path_redactions = self._server_paths(job.out_dir)
             self.jobs[job.id] = job
 
     def _server_paths(self, out_dir: Path) -> list[tuple[str, str]]:
@@ -1032,7 +1092,8 @@ class JobManager:
             owner=owner,
             request=request,
             client=client,
-            redactions=secrets_ + self._server_paths(out_dir),
+            redactions=secrets_,
+            path_redactions=self._server_paths(out_dir),
         )
         self.jobs[job.id] = job
         if self.settings.max_jobs_per_hour:
@@ -1248,7 +1309,7 @@ class JobManager:
             job.status = "cancelled" if job.cancel_requested else "failed"
         self._scrub_run_log(job)
         job.request = job.process = job.progress = None  # drop the tokens
-        job.redactions = self._server_paths(job.out_dir)
+        job.redactions = []
         job.finished_at = _now()
         if job.status == "done":  # decided before anyone sees the job as done
             job.pdf = "ready" if "pdf" in job.files() else "rendering"
@@ -1363,6 +1424,7 @@ class JobManager:
         elif code == 0:
             job.status = "done"
             job.summary = read_summary(job.out_dir)
+            job.unlinked = read_unlinked(job.out_dir)
         else:
             job.status = "failed"
             job.error = job.error or (job.log[-1].strip() if job.log else f"The run exited with code {code}.")
@@ -1827,7 +1889,24 @@ async def _job_log(request: web.Request) -> web.Response:
     return web.json_response({"lines": lines, "next": next_index})
 
 
-async def _job_file(request: web.Request) -> web.FileResponse:
+def _report_file(path: Path, kind: str) -> web.StreamResponse:
+    """A report file as written; report.html from before the report's script
+    last changed gets the current one (see reportscript.with_current_script)."""
+    if kind != "html":
+        return web.FileResponse(path)
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(path.stat().st_size - len(SCRIPT.encode("utf-8")) - 64, 0))
+            tail = fh.read()
+        if is_current(tail):
+            return web.FileResponse(path)
+        page = with_current_script(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        raise web.HTTPNotFound(text="That file isn't available for this report.") from None
+    return web.Response(text=page, content_type="text/html")
+
+
+async def _job_file(request: web.Request) -> web.StreamResponse:
     job = _job(request)
     kind = request.match_info["kind"]
     name = REPORT_FILES.get(kind)
@@ -1836,7 +1915,7 @@ async def _job_file(request: web.Request) -> web.FileResponse:
         raise web.HTTPNotFound(text="That file isn't available for this report.")
     # HTML opens in a tab; everything else (and ?download) saves to disk.
     disposition = "inline" if kind == "html" and "download" not in request.query else "attachment"
-    response = web.FileResponse(path)
+    response = _report_file(path, kind)
     response.headers["Content-Disposition"] = f'{disposition}; filename="{job.download_name(kind)}"'
     if kind == "html":
         response.headers["Content-Security-Policy"] = _REPORT_HTML_CSP
@@ -1892,6 +1971,8 @@ async def _shared_page(request: web.Request) -> web.Response:
     stats = [(summary.get("total_lifetime_commits"), "commit", "commits")]
     if options.get("pull_requests", True):
         stats.append((summary.get("total_pull_requests"), "pull request", "pull requests"))
+    if summary.get("pull_request_reviews") not in (None, "", "0"):
+        stats.append((summary.get("pull_request_reviews"), "review", "reviews"))
     stats += [
         (summary.get("repositories_contributed_to"), "repository", "repositories"),
         (summary.get("active_days"), "active day", "active days"),
@@ -1962,14 +2043,14 @@ async def _shared_page(request: web.Request) -> web.Response:
     return response
 
 
-async def _shared_file(request: web.Request) -> web.FileResponse:
+async def _shared_file(request: web.Request) -> web.StreamResponse:
     job = _shared_job(request)
     kind = request.match_info["kind"]
     path = job.out_dir / REPORT_FILES[kind] if kind in SHARED_FILES else None
     if path is None or not path.is_file():
         raise web.HTTPNotFound(text="That file isn't available for this report.")
     disposition = "attachment" if "download" in request.query else "inline"
-    response = web.FileResponse(path)
+    response = _report_file(path, kind)
     response.headers["Content-Disposition"] = f'{disposition}; filename="{job.download_name(kind)}"'
     if kind == "html":
         response.headers["Content-Security-Policy"] = _REPORT_HTML_CSP

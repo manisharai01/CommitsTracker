@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 
 from . import graphql
+from .analytics import compute_analytics
 from .client import GitHubClient, GitHubError
 from .commits import collect_commits_for_repo, collect_pr_commits, enrich_commits_with_stats
 from .config import AppConfig
@@ -60,11 +61,14 @@ from .models import (
     OrgRecord,
     PullRequestRecord,
     RepoRecord,
+    ReviewRecord,
     parse_github_datetime,
 )
 from .organizations import aggregate_organizations
 from .pull_requests import collect_pr_from_search, collect_prs_for_repo
-from .statistics import Statistics, compute_statistics
+from .reviews import collect_reviews
+from .stack import collect_stacks
+from .statistics import Statistics, attach_analytics, compute_statistics
 
 log = get_logger("report")
 
@@ -161,6 +165,15 @@ def _warn_about_token(client: GitHubClient, account, scopes: str | None, coverag
 
 #: Latest commits sampled per owned repository by :func:`_check_unlinked_commits`.
 UNLINKED_SAMPLE = 100
+#: Emails spelled out in its warning; the rest are counted ("and 3 more").
+UNLINKED_NAMED = 5
+
+
+def mask_email(email: str) -> str:
+    """"ayaan.r@gmail.com" -> "a•••@gmail.com": recognisable to its owner,
+    without publishing anyone's address in a report that gets shared."""
+    local, at, domain = email.partition("@")
+    return f"{local[:1]}•••@{domain}" if at and local else "•••"
 
 
 async def _check_unlinked_commits(
@@ -169,37 +182,49 @@ async def _check_unlinked_commits(
     config: AppConfig,
     client_for: Callable[[RepoRecord], GitHubClient],
     coverage: Coverage,
-) -> None:
+) -> list[dict[str, Any]]:
     """Never skip a tracked account's own repository silently.
 
     A commit counts when GitHub links it to a tracked account (its email is
     verified there) or its email is a --author-email. Commits made with any
     other email are linked to nobody, so they can't be counted — in a
-    repository the account owns they are almost always its own work (another
-    machine, a work address). Sample each owned repository's latest commits
-    and name every such email, with what to do about it. Commits linked to
-    other GitHub accounts are other people's work and stay out of it.
+    repository the account owns they are often its own work (another
+    machine, a work address), but can be a collaborator's or, in a fork,
+    upstream work. Sample each owned repository's latest commits and name
+    every such email in one warning. The report itself shows the emails
+    masked (it gets shared); the log (only for whoever runs the report) has
+    them in full, and the returned list — saved in collection.json — lets
+    the web app list them, for the user to pick their own. Nothing is
+    guessed: a git name is only a label anyone can set, and an email added
+    counts every commit made with it, in every repository read.
+
+    Commits linked to other GitHub accounts are other people's work and stay
+    out of it.
     """
     if config.exclude_own_repos:
-        return  # the report leaves the accounts' own repositories out
+        return []  # the report leaves the accounts' own repositories out
     tracked = {login.lower() for login in config.target_logins}
     left_out = {owner.lower() for owner in config.exclude_owners}
     counted = {(c.full_name, c.sha) for c in commits}
     owned = [r for r in repos if r.owner.lower() in tracked and r.owner.lower() not in left_out]
+    missed: dict[str, dict[str, Any]] = {}  # email -> commits, git names, repositories
+    capped = False
 
     async def check(repo: RepoRecord) -> None:
+        nonlocal capped
         try:
             items = await client_for(repo).get_json(
                 f"/repos/{repo.full_name}/commits", params={"per_page": UNLINKED_SAMPLE}
             )
-        except GitHubError as exc:
+        except Exception as exc:  # noqa: BLE001 - a check that fails is a note, never the end of the run
             coverage.warn(f"{repo.full_name}: could not check it for commits that weren't counted ({exc}).")
             return
         items = items if isinstance(items, list) else []  # empty repository: nothing to count
         sample = f" of its latest {len(items)}" if len(items) >= UNLINKED_SAMPLE else ""
-        missed: dict[str, list] = {}  # email -> [commits, git names used with it]
         not_collected = 0
         for item in items:
+            if not isinstance(item, dict):
+                continue
             author = (item.get("commit") or {}).get("author") or {}
             when = parse_github_datetime(author.get("date"))
             if (
@@ -213,31 +238,77 @@ async def _check_unlinked_commits(
             if linked.lower() in tracked:
                 not_collected += 1  # should never happen: a gap in collection
             elif not linked:
-                entry = missed.setdefault(str(author.get("email") or "?"), [0, set()])
-                entry[0] += 1
-                entry[1].add(str(author.get("name") or "?"))
+                # What git wrote into the commit on the computer that made it:
+                # the email decides whose it is; the name is only a label.
+                email = str(author.get("email") or "").strip()
+                if not email:
+                    continue
+                entry = missed.setdefault(email.lower(), {"email": email, "commits": 0, "names": set(), "repos": {}})
+                entry["commits"] += 1
+                entry["names"].add(str(author.get("name") or "").strip() or "?")
+                entry["repos"][repo.full_name] = entry["repos"].get(repo.full_name, 0) + 1
+                capped = capped or bool(sample)
             # else: linked to someone else's account, so not this report's work
         if not_collected:
             coverage.warn(
                 f"{repo.full_name}: {not_collected} commit(s){sample} by the tracked accounts were "
                 "not collected, so the counts miss them. Run the report again."
             )
-        if missed:
-            # What git wrote into the commits on the computer that made them:
-            # the email decides whose they are; the name is only a label.
-            total = sum(n for n, _names in missed.values())
-            emails = ", ".join(
-                f"{email} ({n}, git name {' / '.join(sorted(names))})"
-                for email, (n, names) in sorted(missed.items(), key=lambda kv: (-kv[1][0], kv[0]))
-            )
-            these = "this email isn't" if len(missed) == 1 else "these emails aren't"
-            coverage.warn(
-                f"{repo.full_name}: {total} commit(s){sample} weren't counted. They were made with "
-                f"{emails}, and {these} on any GitHub account. If it's yours, add it to your GitHub "
-                "account (Settings > Emails) or under Commit emails, and run again."
-            )
 
     await asyncio.gather(*(check(r) for r in owned))
+    if not missed:
+        return []
+
+    by_name = {r.full_name: r for r in owned}
+    found: list[dict[str, Any]] = []
+    for entry in sorted(missed.values(), key=lambda e: (-e["commits"], e["email"].lower())):
+        repos_in = sorted(entry["repos"].items(), key=lambda kv: (-kv[1], kv[0]))
+        owners: dict[str, int] = {}
+        for name, n in repos_in:
+            owner = by_name[name].owner
+            owners[owner] = owners.get(owner, 0) + n
+        found.append({
+            "email": entry["email"],
+            "commits": entry["commits"],
+            "names": sorted(entry["names"]),
+            "repositories": [[name, n] for name, n in repos_in],
+            "owner": max(owners, key=lambda o: (owners[o], o)),
+            "in_forks_only": all(by_name[name].is_fork for name, _n in repos_in),
+        })
+
+    total = sum(e["commits"] for e in found)
+    repo_count = len({name for e in found for name, _n in e["repositories"]})
+    checked = f" (from the latest {UNLINKED_SAMPLE} commits of each)" if capped else ""
+
+    def listed(entry: dict[str, Any], full: bool) -> str:
+        where = ", ".join(name for name, _n in entry["repositories"][:3])
+        more = len(entry["repositories"]) - 3
+        where += f" and {more} more" if more > 0 else ""
+        if not full:
+            return f"{mask_email(entry['email'])} in {where}"
+        fork = "; only in forks, so possibly upstream work" if entry["in_forks_only"] else ""
+        return (
+            f"{entry['email']} ({entry['commits']} commit(s), git name {' / '.join(entry['names'])}, "
+            f"in {where}{fork})"
+        )
+
+    def emails(full: bool) -> str:
+        text = ", ".join(listed(e, full) for e in found[:UNLINKED_NAMED])
+        return text + (f" and {len(found) - UNLINKED_NAMED} more" if len(found) > UNLINKED_NAMED else "")
+
+    commits_in = f"{total} commit(s){checked} in {repo_count} of the tracked accounts' own repositories"
+    with_emails = "an email that isn't" if len(found) == 1 else f"{len(found)} emails that aren't"
+    coverage.warn(
+        f"{commits_in} weren't counted: they were made with {with_emails} on any GitHub account "
+        f"({emails(full=False)}). Emails added to the account, or as author emails, count on the next run.",
+        detail=(
+            f"{commits_in} weren't counted. They were made with {with_emails} on any GitHub account: "
+            f"{emails(full=True)}. If one is yours, add it to your GitHub account (Settings > Emails) or "
+            "under Commit emails, and run again. Other people's emails stay out: they would count their "
+            "commits as yours."
+        ),
+    )
+    return found
 
 
 def _search_window(config: AppConfig) -> tuple[datetime, datetime]:
@@ -569,8 +640,25 @@ async def collect(config: AppConfig) -> CollectedData:
                 log.info("recovered %d commit(s) found only in pull requests", recovered)
 
         # --- the accounts' own repos: commits no account is linked to ------
+        unlinked: list[dict[str, Any]] = []
         if config.collect_commits and scan_repos:
-            await _check_unlinked_commits(scan_repos, commits, config, client_for, coverage)
+            unlinked = await _check_unlinked_commits(scan_repos, commits, config, client_for, coverage)
+
+        # --- technologies of the repositories with commits (never fatal) ----
+        worked_in = {c.full_name for c in commits}
+        stack_repos = [r for r in scan_repos if r.full_name in worked_in]
+        if stack_repos:
+            unread = await collect_stacks(stack_repos, client_for, inflight=config.concurrency)
+            if unread:
+                log.info("technologies of %d repositor(ies) could not be read", unread)
+
+        # --- code reviews given on other people's pull requests ------------
+        reviews: list[ReviewRecord] = []
+        if config.collect_prs:
+            reviews = await collect_reviews(
+                clients, config.target_logins, since=config.since, until=config.until,
+                coverage=coverage, inflight=config.concurrency,
+            )
 
         # --- line-level stats (one request per commit in the period) ------
         if config.fetch_commit_stats and commits:
@@ -614,6 +702,7 @@ async def collect(config: AppConfig) -> CollectedData:
         "skip_forks": config.skip_forks,
         "collect_prs": config.collect_prs,
         "fetch_commit_stats": config.fetch_commit_stats,
+        "collect_reviews": config.collect_prs,
         "search_discovery": config.use_search_discovery,
         "since": config.since.isoformat() if config.since else None,
         "until": config.until.isoformat() if config.until else None,
@@ -621,6 +710,9 @@ async def collect(config: AppConfig) -> CollectedData:
         "api": "graphql" if use_graphql else "rest",
         "api_requests": total_requests,
         "graphql_queries": graphql_queries,
+        # Emails of uncounted commits in the accounts' own repositories (the
+        # web app offers them; never shown in the report itself).
+        "unlinked_emails": unlinked,
     }
     return CollectedData(
         repos=repo_list,
@@ -629,6 +721,7 @@ async def collect(config: AppConfig) -> CollectedData:
         organizations=organizations,
         notes=list(coverage.notes),
         meta=meta,
+        reviews=reviews,
     )
 
 
@@ -759,11 +852,26 @@ def generate_outputs(
 
     stats = compute_statistics(data)
     insights = compute_insights(data)
+    # The data covers up to when it was collected (later, for --regen).
+    collected = parse_github_datetime(str(data.meta.get("collected_at") or ""))
+    analytics_summary: dict[str, object] = {}
+    try:
+        analytics = compute_analytics(
+            data, since=scope.since, until=scope.until, now=collected or datetime.now(timezone.utc)
+        )
+        attach_analytics(stats, analytics)
+        analytics_summary = analytics.summary()
+    except Exception:  # noqa: BLE001 - the analytics are a section, never the whole report
+        log.warning("The 'Insights & analytics' section could not be computed; the report goes out without it.")
+        log.info("Analytics failure details:", exc_info=True)
 
     # Fold the activity insights and the report scope into the headline
     # summary so they also appear in contribution_summary.csv, the Summary
     # sheet and summary_report.txt.
-    extra = {**insights.to_summary_dict(), **_scope_summary(scope), **_project_summary(data, config)}
+    extra = {
+        **insights.to_summary_dict(), **analytics_summary,
+        **_scope_summary(scope), **_project_summary(data, config),
+    }
     stats.summary_dict.update(extra)
     stats.summary = pd.concat(
         [stats.summary, pd.DataFrame([{"metric": k, "value": v} for k, v in extra.items()])],

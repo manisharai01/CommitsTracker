@@ -13,7 +13,7 @@ from typing import Any
 
 from .client import GitHubClient, GitHubError
 from .logging_config import get_logger
-from .models import Coverage, PullRequestRecord, RepoRecord, parse_github_datetime
+from .models import Coverage, PullRequestRecord, RepoRecord, optional_int, parse_github_datetime
 
 log = get_logger("pull_requests")
 
@@ -40,6 +40,10 @@ def _pr_from_payload(payload: dict[str, Any], repo: RepoRecord) -> PullRequestRe
         head_branch=str(head.get("ref") or ""),
         url=str(payload.get("html_url", "")),
         merge_commit_sha=str(payload.get("merge_commit_sha") or "") if merged_at else "",
+        # Only a single-pull-request answer has the size; listings do not.
+        additions=optional_int(payload.get("additions")),
+        deletions=optional_int(payload.get("deletions")),
+        changed_files=optional_int(payload.get("changed_files")),
     )
 
 

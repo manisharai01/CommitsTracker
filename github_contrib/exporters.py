@@ -38,6 +38,14 @@ _EXCEL_SHEETS: list[tuple[str, str]] = [
     ("PR Summary", "pr_summary"),
     ("Lines By Repo", "lines_by_repo"),
     ("Top Commits Impact", "top_commits_by_impact"),
+    # Insights & analytics (analytics.py)
+    ("Highlights", "highlights"),
+    ("Quarterly", "quarterly"),
+    ("Work Mix", "work_mix"),
+    ("PR Delivery", "pr_delivery"),
+    ("Working Rhythm", "working_rhythm"),
+    ("Technologies", "technologies"),
+    ("Code Reviews", "reviews"),
 ]
 
 # CSV file name -> attribute on Statistics.
@@ -46,6 +54,7 @@ _CSV_FILES: list[tuple[str, str]] = [
     ("pull_requests.csv", "pull_requests"),
     ("repositories.csv", "repositories"),
     ("organizations.csv", "organizations"),
+    ("reviews.csv", "reviews"),
     ("contribution_summary.csv", "summary"),
 ]
 

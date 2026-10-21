@@ -19,6 +19,8 @@ import re
 from datetime import date
 from typing import Mapping
 
+from .analytics import within
+
 #: LinkedIn's limit for the text of a post.
 LINKEDIN_LIMIT = 3000
 
@@ -166,13 +168,31 @@ def build_linkedin_post(metrics: Mapping[str, object]) -> str:
     if active:
         line = _count(active, "active coding day")
         highlights.append(line + (f", with a longest streak of {streak} days" if streak > 1 else ""))
+    weeks, span = _int(metrics, "active_weeks"), _int(metrics, "weeks_in_span")
+    if span >= 4 and weeks * 2 >= span:  # under half the weeks: not a highlight
+        highlights.append(f"Shipped code in {weeks:,} of {span:,} weeks")
+    try:
+        median_hours = float(str(metrics.get("median_hours_to_merge") or ""))
+    except ValueError:
+        median_hours = None
+    if median_hours is not None and merged >= 3:
+        highlights.append(f"Half of my merged pull requests were merged {within(median_hours)} of opening")
+    reviewed = _int(metrics, "prs_reviewed")
+    if reviewed >= 3:
+        mates = _int(metrics, "teammates_reviewed")
+        highlights.append(
+            f"Reviewed {reviewed:,} pull requests" + (f" from {_count(mates, 'teammate')}" if mates else "")
+        )
     busiest = _busiest_month(metrics.get("busiest_month"))
     if busiest and f"({commits} commits)" not in busiest:  # not when one month holds everything
         highlights.append(f"Busiest month: {busiest}")
-    languages = [
-        lang.strip() for lang in str(metrics.get("primary_languages") or "").split(",")
-        if lang.strip() and lang.strip() != "Unknown"
-    ][:3]
+    def listed(key: str) -> list[str]:
+        return [x.strip() for x in str(metrics.get(key) or "").split(",") if x.strip() and x.strip() != "Unknown"]
+
+    # Detected technologies when the report has them: the two main languages
+    # and the two main frameworks; else the repositories' main languages.
+    detected = listed("languages_used")[:2] + listed("frameworks_used")[:2]
+    languages = detected or listed("primary_languages")[:3]
     if languages:
         highlights.append(f"Main stack: {_join(languages)}")
 

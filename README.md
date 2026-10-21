@@ -204,11 +204,14 @@ See `python webui.py --help` for every limit.
 | **Readable reports** | A self-contained **styled HTML report** (`report.html`, charts embedded — open/share in any browser) and a structured **Markdown report** (`report.md`). Every repo card has a **click-to-expand list of all its commits**. |
 | **Executive summary** | A promotion-ready narrative section (key projects & impact, features delivered, profile strengths) generated deterministically from the data. |
 | **Work narrative** | Per-repo "what was worked on", derived deterministically from **PR titles, humanised branch names and recurring commit keywords** — no AI/API key needed. |
+| **Insights & analytics** | Review-ready **highlights**; **delivery** (pull requests merged, merge rate, median and 90th-percentile time to merge, PR size, largest merged PRs); **code reviews** given; **work mix** (features, improvements, fixes, refactoring, tests, docs, chores — from commit wording); **quarter by quarter** (commits, PRs, reviews, repos, lines, change vs the previous complete quarter, and what shipped); **project timeline** (when each of the 12 busiest repositories was worked on, month by month); **working rhythm** (day × hour heatmap in the report's time zone, weeks with commits across the report period, best 30 days); **code footprint** (median commit size, share of small commits). Also in Excel (Highlights, Quarterly, Work Mix, PR Delivery, Working Rhythm sheets). |
+| **Technologies** | Languages, frameworks, databases, cloud/DevOps, testing and AI tools of the repositories worked on — from GitHub's language statistics, dependency files (`package.json`, `pubspec.yaml`, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `Gemfile`, `composer.json`, …) and telltale files (Dockerfile, CI workflows, Terraform). Each is weighted by the commits in the repositories that use it; every repository card lists its stack. Also in Excel (Technologies sheet) and the LinkedIn draft. |
+| **Code reviews** | Reviews the tracked accounts gave on other people's pull requests (approvals, change requests, comments), by repository and quarter, from GitHub's contribution history — read a year at a time with each account's own token. Also in Excel (Code Reviews sheet) and `reviews.csv`. |
 | **PDF export** | `--pdf` renders `report.html` to `report.pdf` with headless Edge/Chrome — commit lists expanded, ready to submit. A long commit appendix is printed in parts that pypdf joins, so the browser's memory stays flat however many commits there are. |
 | **All repos included** | Personal repos (owned by the tracked login) are included by default; opt in to dropping them with `--exclude-own-repos` / `--exclude-owner`. `--regen` restyles reports from cached CSVs without re-collecting. |
 | **Activity insights** | Active days, longest daily streak, busiest day-of-week & month, average commits per active week, and primary languages. |
 | **Any user** | Works for any GitHub login via `--user <login>`. |
-| **Outputs** | 5 CSV files + a 13-sheet formatted Excel workbook + HTML & Markdown reports. |
+| **Outputs** | 6 CSV files + a 22-sheet formatted Excel workbook + HTML & Markdown reports. |
 | **Charts** | Per-year, per-month, day-of-week, top-repository and per-org bar charts, plus a combined dashboard PNG. |
 | **Branches** | Scans **every branch by default** (complete coverage); `--default-branch-only` for a faster run. |
 | **Performance** | GraphQL collection (batched queries, branch comparison, 25 commits' line stats per query) with REST as the fallback; async (`aiohttp`) requests with a shared concurrency limiter, rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |
@@ -237,7 +240,11 @@ CommitsTracker/
 │   ├── exporters.py            # CSV / Excel / text-report writers
 │   ├── charts.py               # matplotlib charts + dashboard
 │   ├── insights.py             # deterministic work narrative + activity insights
+│   ├── analytics.py            # delivery, work mix, quarters, timeline, rhythm, reviews, stack
+│   ├── stack.py                # technologies from languages, dependency and telltale files
+│   ├── reviews.py              # code reviews given (GraphQL contribution history)
 │   ├── htmlreport.py           # styled HTML + Markdown report generation
+│   ├── reportscript.py         # the report's script and Content-Security-Policy
 │   ├── filters.py              # exclusions, time range, count-once rules, time zone
 │   ├── linkedin.py             # LinkedIn post drafted from the report's numbers
 │   ├── report.py               # orchestration (collect → compute → export)
@@ -252,6 +259,10 @@ CommitsTracker/
 │   ├── test_accuracy.py        # collection & counting edge cases (fake GitHub API)
 │   ├── test_graphql.py         # GraphQL collector checked against the REST collector
 │   ├── test_linkedin.py        # LinkedIn summary wording and periods
+│   ├── test_analytics.py       # insights & analytics, timeline, running periods
+│   ├── test_stack.py           # technology detection (fake GraphQL)
+│   ├── test_reviews.py         # code reviews (fake GraphQL)
+│   ├── test_pdfexport.py       # PDF in parts, memory guard, incomplete parts
 │   ├── test_auth.py            # sign-in, sessions, report history
 │   └── test_webapp.py          # web UI tests (fake CLI, no network needed)
 ├── Dockerfile, render.yaml     # Render deployment (see DEPLOY.md)
@@ -271,11 +282,14 @@ output/
 ├── pull_requests.csv
 ├── repositories.csv
 ├── organizations.csv
+├── reviews.csv                   # code reviews given
 ├── contribution_summary.csv
-├── github_contributions.xlsx     # 13-sheet formatted workbook
+├── collection.json               # how the data was collected (for --regen)
+├── github_contributions.xlsx     # 22-sheet formatted workbook
 ├── report.html                   # styled, self-contained, shareable report
 ├── report.md                     # structured Markdown report
 ├── summary_report.txt            # human-readable lifetime summary
+├── linkedin_post.txt             # LinkedIn draft from the report's numbers
 ├── run.log                       # full run log
 └── charts/
     ├── commits_per_year.png
@@ -432,11 +446,22 @@ After that, `python github_report.py --all` runs for both without extra flags.
    tracked account (its email is verified there) or its email is a commit
    email. For every repository a tracked account owns, the latest 100 commits
    are checked: commits made with an email no GitHub account has (another
-   machine, a work address) are listed by name and email in Data completeness
-   and on the report card, so a repository is never skipped silently. Add the
-   email to the GitHub account (Settings → Emails) or as a commit email, and
-   run again.
-6. **Line statistics** (GraphQL) — 25 commits per query, for the commits inside
+   machine, a work address — or a collaborator, or upstream work synced into a
+   fork) are reported in one warning, so a repository is never skipped
+   silently. The report's Data completeness shows those emails masked
+   (`a•••@gmail.com`), since reports get shared; the log and the web app's
+   report card name them in full. On the card, **Review uncounted emails**
+   lists each one with its commits, git names and repositories; nothing is
+   ticked for you, because an added email counts every commit made with it in
+   every repository read. Tick yours (or add them to the GitHub account under
+   Settings → Emails) and run again.
+6. **Technologies and code reviews** — the repositories with commits are read
+   for their language statistics, dependency and telltale files (four batched
+   GraphQL rounds; a repository that can't be read is counted, never guessed).
+   Code reviews come from each account's contribution history, a year at a
+   time, with its own token; reviews of the tracked accounts' own pull
+   requests are left out, and private contributions GitHub hides are noted.
+7. **Line statistics** (GraphQL) — 25 commits per query, for the commits inside
    the period (merge commits are skipped: their diff repeats the merged branch).
 
 Many repositories, branches or commits share one GraphQL query. A query GitHub
@@ -445,9 +470,12 @@ still unreadable is collected again with the REST endpoints
 (`GET /repos/{owner}/{repo}/commits?author=…&sha=…`, `/pulls`, `/commits/{sha}`),
 which also record the data-completeness notes. `--rest-api` uses only those
 REST endpoints (the previous engine).
-6. **Report** — owner exclusions, then the time range, then **each change is
+8. **Report** — owner exclusions, then the time range, then **each change is
    counted once** (below), then dates are expressed in the report time zone;
    statistics, Excel, charts, HTML/Markdown and PDF all use the same data.
+   For a period that is still running (this year, say), the quarters and the
+   weeks with commits are measured up to the day the data was collected, so
+   the current quarter is marked partial rather than compared with the last.
 
 ### Accuracy guarantees
 

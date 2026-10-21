@@ -71,6 +71,12 @@ class RepoRecord:
     # to by pull request: only their default branch and the user's pull
     # requests hold the user's commits, so their other branches are not scanned.
     affiliated: bool = True
+    # Technologies (see stack.py): GitHub's language sizes in bytes, and the
+    # frameworks / tools its dependency files and well-known files name.
+    # ``stack_read`` tells "none found" apart from "not read".
+    languages: dict[str, int] = field(default_factory=dict)
+    technologies: list[str] = field(default_factory=list)
+    stack_read: bool = False
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -91,6 +97,9 @@ class RepoRecord:
             "affiliated": self.affiliated,
             "description": self.description,
             "html_url": self.html_url,
+            "languages": ";".join(f"{name}:{size}" for name, size in self.languages.items()),
+            "technologies": ";".join(self.technologies),
+            "stack_read": self.stack_read,
         }
 
 
@@ -178,6 +187,18 @@ class PullRequestRecord:
     # SHAs of the pull request's own commits (fetched when every branch is
     # scanned); lets squash-merged originals be counted once.
     commit_shas: list[str] = field(default_factory=list)
+    # The whole pull request's diff as GitHub reports it (every author's
+    # commits). None = not recorded (older runs, REST listings).
+    additions: int | None = None
+    deletions: int | None = None
+    changed_files: int | None = None
+
+    @property
+    def size(self) -> int | None:
+        """Lines changed (added + deleted), or None when not recorded."""
+        if self.additions is None or self.deletions is None:
+            return None
+        return self.additions + self.deletions
 
     @property
     def effective_state(self) -> str:
@@ -206,6 +227,39 @@ class PullRequestRecord:
             "url": self.url,
             "merge_commit_sha": self.merge_commit_sha,
             "commit_shas": " ".join(self.commit_shas),
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "changed_files": self.changed_files,
+        }
+
+
+@dataclass(slots=True)
+class ReviewRecord:
+    """A review a tracked user submitted on someone else's pull request."""
+
+    reviewer: str  # the tracked login
+    full_name: str  # repository
+    owner: str
+    organization: str  # owner login when the owner is an organization, else ""
+    pr_number: int
+    pr_title: str
+    pr_author: str
+    state: str  # APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED
+    submitted_at: datetime | None
+    url: str
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "reviewer": self.reviewer,
+            "full_name": self.full_name,
+            "owner": self.owner,
+            "organization": self.organization,
+            "pr_number": self.pr_number,
+            "pr_title": self.pr_title,
+            "pr_author": self.pr_author,
+            "state": self.state,
+            "submitted_at": _iso(self.submitted_at),
+            "url": self.url,
         }
 
 
@@ -251,6 +305,19 @@ class CollectedData:
     # How the data was collected (options, period, time) — saved next to the
     # CSVs as collection.json so --regen describes the report accurately.
     meta: dict[str, Any] = field(default_factory=dict)
+    # Reviews the tracked users gave on other people's pull requests.
+    reviews: list[ReviewRecord] = field(default_factory=list)
+
+
+def optional_int(value: Any) -> int | None:
+    """``value`` as an int, or None when it is missing or not a number
+    (a pull request's size: absent in some API answers)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class Coverage:
@@ -259,10 +326,12 @@ class Coverage:
     def __init__(self) -> None:
         self.notes: list[str] = []
 
-    def warn(self, message: str) -> None:
+    def warn(self, message: str, *, detail: str | None = None) -> None:
+        """``message`` goes into the report; ``detail`` (default: the same
+        text) into the log, which only whoever runs the report sees."""
         if message not in self.notes:
             self.notes.append(message)
-            get_logger("coverage").warning(message)
+            get_logger("coverage").warning(detail or message)
 
 
 __all__ = [
@@ -273,6 +342,7 @@ __all__ = [
     "OrgRecord",
     "CollectedData",
     "Coverage",
+    "optional_int",
     "asdict",
     "fields",
 ]

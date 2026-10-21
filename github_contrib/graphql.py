@@ -35,7 +35,7 @@ from .client import GitHubClient, GitHubError
 from .commits import PR_COMMITS_LIMIT, _authored_by, _commit_from_payload
 from .commits import enrich_commits_with_stats as enrich_commits_with_stats_rest
 from .logging_config import get_logger
-from .models import CommitRecord, Coverage, PullRequestRecord, RepoRecord, parse_github_datetime
+from .models import CommitRecord, Coverage, PullRequestRecord, RepoRecord, optional_int, parse_github_datetime
 
 log = get_logger("graphql")
 
@@ -339,6 +339,9 @@ def pr_record(node: dict[str, Any], repo: RepoRecord) -> PullRequestRecord:
         head_branch=str(node.get("headRefName") or ""),
         url=str(node.get("url") or ""),
         merge_commit_sha=str((node.get("mergeCommit") or {}).get("oid") or "") if merged_at else "",
+        additions=optional_int(node.get("additions")),
+        deletions=optional_int(node.get("deletions")),
+        changed_files=optional_int(node.get("changedFiles")),
     )
 
 
@@ -581,6 +584,7 @@ async def collect_commits(
 
 _PR_FIELDS = (
     "number title state createdAt updatedAt closedAt mergedAt url baseRefName headRefName "
+    "additions deletions changedFiles "
     f"mergeCommit {{ oid }} author {{ login }} repository {{ {REPO_FIELDS} }} "
     f"commits(first: {PAGE}) {{ totalCount {_PAGE_INFO} nodes {{ commit {{ {COMMIT_FIELDS} }} }} }}"
 )

@@ -22,6 +22,7 @@ from .models import (
     OrgRecord,
     PullRequestRecord,
     RepoRecord,
+    ReviewRecord,
     parse_github_datetime,
 )
 
@@ -52,6 +53,15 @@ def _i(row: dict[str, str], key: str) -> int:
         return int(float(text)) if text else 0
     except ValueError:
         return 0
+
+
+def _opt_i(row: dict[str, str], key: str) -> int | None:
+    """An int column that may be blank (not recorded): None, not 0."""
+    text = _s(row, key)
+    try:
+        return int(float(text)) if text else None
+    except ValueError:
+        return None
 
 
 def _b(row: dict[str, str], key: str) -> bool:
@@ -104,6 +114,9 @@ def _pr(row: dict[str, str]) -> PullRequestRecord:
         url=_s(row, "url"),
         merge_commit_sha=_s(row, "merge_commit_sha"),
         commit_shas=_s(row, "commit_shas").split(),
+        additions=_opt_i(row, "additions"),
+        deletions=_opt_i(row, "deletions"),
+        changed_files=_opt_i(row, "changed_files"),
     )
 
 
@@ -128,7 +141,36 @@ def _repo(row: dict[str, str]) -> RepoRecord:
         discovered_via=discovered,
         # Older runs scanned every repository fully.
         affiliated=_s(row, "affiliated").lower() != "false",
+        languages=_languages(_s(row, "languages")),
+        technologies=[t for t in _s(row, "technologies").split(";") if t],
+        stack_read=_b(row, "stack_read"),  # older runs didn't read technologies
     )
+
+
+def _review(row: dict[str, str]) -> ReviewRecord:
+    return ReviewRecord(
+        reviewer=_s(row, "reviewer"),
+        full_name=_s(row, "full_name"),
+        owner=_s(row, "owner"),
+        organization=_s(row, "organization"),
+        pr_number=_i(row, "pr_number"),
+        pr_title=_s(row, "pr_title"),
+        pr_author=_s(row, "pr_author"),
+        state=_s(row, "state"),
+        submitted_at=parse_github_datetime(_s(row, "submitted_at")),
+        url=_s(row, "url"),
+    )
+
+
+def _languages(text: str) -> dict[str, int]:
+    """'TypeScript:1200;Shell:30' -> {'TypeScript': 1200, 'Shell': 30} (a
+    language name may itself hold a colon, so split on the last one)."""
+    out: dict[str, int] = {}
+    for item in text.split(";"):
+        name, _, size = item.rpartition(":")
+        if name and size.isdigit():
+            out[name] = int(size)
+    return out
 
 
 def _org(row: dict[str, str]) -> OrgRecord:
@@ -177,6 +219,8 @@ def load_collected_from_csv(output_dir: Path) -> CollectedData:
         loaded[filename] = [mapper(row) for row in rows]
         log.info("loaded %d row(s) from %s", len(rows), filename)
 
+    # Runs before code reviews were collected have no reviews.csv: not a gap.
+    review_rows = _read_rows(output_dir / "reviews.csv") if (output_dir / "reviews.csv").exists() else []
     meta, notes = _load_collection_file(output_dir)
     data = CollectedData(
         repos=loaded["repositories.csv"],
@@ -185,6 +229,7 @@ def load_collected_from_csv(output_dir: Path) -> CollectedData:
         organizations=loaded["organizations.csv"],
         notes=notes,
         meta=meta,
+        reviews=[_review(row) for row in review_rows],
     )
     if not data.commits and not data.pull_requests:
         log.warning(

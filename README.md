@@ -211,7 +211,7 @@ See `python webui.py --help` for every limit.
 | **All repos included** | Personal repos (owned by the tracked login) are included by default; opt in to dropping them with `--exclude-own-repos` / `--exclude-owner`. `--regen` restyles reports from cached CSVs without re-collecting. |
 | **Activity insights** | Active days, longest daily streak, busiest day-of-week & month, average commits per active week, and primary languages. |
 | **Any user** | Works for any GitHub login via `--user <login>`. |
-| **Outputs** | 6 CSV files + a 22-sheet formatted Excel workbook + HTML & Markdown reports + the summary page the PDF is printed from. Large reports are written as they are made (about 210 MB peak for 30,000 commits). |
+| **Outputs** | 6 CSV files + a 22-sheet formatted Excel workbook + HTML & Markdown reports + the summary page the PDF is printed from. The commits are kept on disk and every output is written as it is made, so memory stays under 200 MB however many commits there are (measured up to 1.2 million); a table longer than Excel's row limit continues on a second sheet. |
 | **Charts** | Per-year, per-month, day-of-week, top-repository and per-org bar charts, plus a combined dashboard PNG. |
 | **Branches** | Scans **every branch by default** (complete coverage); `--default-branch-only` for a faster run. |
 | **Performance** | GraphQL collection (batched queries, branch comparison, 25 commits' line stats per query) with REST as the fallback; async (`aiohttp`) requests with a shared concurrency limiter, rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |

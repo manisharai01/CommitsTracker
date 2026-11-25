@@ -86,7 +86,10 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
 `--max-jobs-per-hour` and `--job-timeout` (default 120 minutes). A run that
 nears its time limit stops collecting 10 minutes before it and writes the
 report from what it read, with a data-completeness note saying so, instead of
-being stopped with nothing to show.
+being stopped with nothing to show. Writing a report takes time in proportion
+to its commits, so a run that is already writing its report when the limit
+comes gets up to 60 more minutes to finish it (a run still collecting then is
+stopped).
 
 ## Plans
 
@@ -101,15 +104,26 @@ being stopped with nothing to show.
   report and the Excel workbook. Its size doesn't grow with the number of
   commits, so printing it takes seconds and about 100 MB (measured on Linux
   for a 30,000-commit report).
-- **Memory**: free and starter have 512 MB. A report run peaks at about 210 MB
-  for 30,000 commits (the workbook and the HTML are written as they are made,
-  never held whole). If the server still gets close to its limit while
-  printing, the PDF step stops and the report stays (running out of memory
-  would restart the whole service and lose the report's files). The report
-  card then offers **Save as PDF**, which prints the same summary in the
-  reader's own browser. Why the server made no PDF is written to the server
-  log (Render → **Logs**: `report <id>: no PDF (...)`), never on the report
-  card.
+- **Memory**: free and starter have 512 MB. A report run's memory doesn't
+  grow with its number of commits: they are kept on disk while it runs (a
+  SQLite file in the report's folder, deleted when the run ends), and the
+  CSV files, the Excel workbook and the HTML are written as they are made,
+  never held whole. Measured peak: under 200 MB for 30,000, 240,000 and
+  1.2 million commits. A run that still gets close to the limit is stopped
+  (with "needed more memory than the server could give it") before it can
+  restart the service; file cache, such as the commit store, doesn't count
+  towards that, since the kernel frees it first. If the server gets close to
+  its limit while printing, the PDF step stops and the report stays. The
+  report card then offers **Save as PDF**, which prints the same summary in
+  the reader's own browser. Why the server made no PDF is written to the
+  server log (Render → **Logs**: `report <id>: no PDF (...)`), never on the
+  report card.
+- **Time and disk for very large reports**: writing the report takes about
+  80 seconds for 240,000 commits and 7½ minutes for 1.2 million on a desktop
+  CPU, so roughly ten times that on a tenth of a CPU. While it runs, the
+  commit store needs about 0.5 KB of disk per commit; the workbook and CSV
+  files stay in the report's folder until it expires. A table longer than
+  Excel's 1,048,576 rows continues on a second sheet ("Commits (2)").
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is

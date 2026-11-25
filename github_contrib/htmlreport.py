@@ -340,7 +340,7 @@ header.hero h1 { margin:0 0 6px; font-size:28px; }
 header.hero .meta { opacity:.92; font-size:14px; }
 h2 { font-size:20px; margin:36px 0 14px; padding-bottom:6px; border-bottom:2px solid var(--line); }
 h3 { font-size:16px; margin:22px 0 4px; }
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr)); gap:14px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; box-shadow:0 1px 2px rgba(16,42,80,.04); }
 .card .v { font-size:26px; font-weight:700; color:var(--accent); }
 .card .l { font-size:12.5px; color:var(--muted); margin-top:2px; text-transform:uppercase; letter-spacing:.03em; }
@@ -350,7 +350,7 @@ th { background:var(--accent); color:#fff; font-weight:600; }
 tr:last-child td { border-bottom:none; }
 tr:nth-child(even) td { background:#fafbfe; }
 .table-scroll { overflow-x:auto; }
-.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:18px; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr)); gap:18px; }
 .charts figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:10px; }
 .charts img { width:100%; height:auto; display:block; border-radius:6px; }
 .charts figcaption { font-size:12.5px; color:var(--muted); text-align:center; padding-top:6px; }
@@ -418,7 +418,7 @@ button.toggle:hover { background:#eef2f9; }
 #analytics .card .v { font-size:22px; white-space:nowrap; }
 .hl ul { margin:6px 0 0; padding-left:20px; }
 .hl li { margin:5px 0; }
-.agrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; margin-top:14px; }
+.agrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); gap:14px; margin-top:14px; }
 .atable { margin-top:14px; }
 .atable h4, .shipped h4 { margin:0 0 6px; font-size:13.5px; color:var(--muted); font-weight:600; }
 table.bars { font-size:13px; }
@@ -438,7 +438,7 @@ table.bars td.ashare { color:var(--muted); }
 .atag { display:inline-block; font-size:11px; font-weight:500; color:var(--muted); border:1px solid var(--line);
         border-radius:6px; padding:0 5px; margin-left:4px; }
 .anote { font-size:12.5px; color:var(--muted); margin:8px 0 0; }
-.shipped { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
+.shipped { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr)); gap:12px; }
 .shipped .sq { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 16px; }
 .shipped ul { margin:0; padding-left:18px; font-size:13.5px; }
 .shipped li { margin:3px 0; }
@@ -831,8 +831,9 @@ def _bar_table(title: str, rows: list[tuple[str, int]]) -> str:
 def _heatmap(rhythm: Rhythm) -> str:
     """Commits by weekday (rows) and hour (columns), darker = more."""
     peak = max(max(day) for day in rhythm.heatmap) or 1
+    # Each hour label heads its three columns, so it has room on any screen.
     head = "<tr><th class='day'></th>" + "".join(
-        f"<th>{hour:02d}</th>" if hour % 3 == 0 else "<th></th>" for hour in range(24)
+        f"<th colspan='3'>{hour:02d}</th>" for hour in range(0, 24, 3)
     ) + "</tr>"
     rows = []
     for day, counts in enumerate(rhythm.heatmap):

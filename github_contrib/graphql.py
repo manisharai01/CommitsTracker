@@ -313,9 +313,12 @@ def note_skipped(walks: list[Walk], coverage: Coverage | None, what: str) -> Non
 
 
 async def run_walks(
-    walks: list[Walk], batch_size: int, *, inflight: int, progress: _Progress | None = None
+    walks: list[Walk], batch_size: int, *, inflight: int, progress: _Progress | None = None,
+    after_batch: Callable[[], None] | None = None,
 ) -> None:
-    """Run every walk to the end (or to an error), keeping ``inflight`` queries busy."""
+    """Run every walk to the end (or to an error), keeping ``inflight`` queries
+    busy. ``after_batch`` runs after each answered query (no walk is being
+    updated then): collect_commits moves what was read to disk there."""
     queue: deque[Walk] = deque()
     for walk in walks:
         if walk.finished:
@@ -334,6 +337,8 @@ async def run_walks(
                     queue.append(walk)
                 elif progress is not None:
                     progress.update()
+        if after_batch is not None:
+            after_batch()
 
 
 class _Progress:
@@ -539,6 +544,9 @@ class _Scan:
     head: str = ""  # head commit of a compared branch
     # Set when a comparison was too large or failed: per-author history walks.
     replaced_by: list[_Scan] | None = None
+    # Where its commits rank when one SHA is found by several scans: lower
+    # wins (the default branch first, then branches by name).
+    priority: int = 0
 
     def leaves(self) -> list[_Scan]:
         return self.replaced_by if self.replaced_by is not None else [self]
@@ -554,6 +562,8 @@ class _RepoPlan:
     # Why the repository couldn't be planned through GraphQL at all.
     unplanned: str = ""
     since: str = ""  # history walks start here (an ISO time; "" = all history)
+    # Where read commits go as they pile up (collect_commits with a store).
+    store: Any = None
 
     def __post_init__(self) -> None:
         self.heads = _heads_walk(self.client, self.repo, self.all_branches)
@@ -580,7 +590,7 @@ class _RepoPlan:
             return
         for login, author in filters:
             walk = _history_walk(self.client, self.repo.full_name, default_head, author, since)
-            self.scans.append(_Scan(default, walk, login, by_author=True))
+            self.scans.append(_Scan(default, walk, login, by_author=True, priority=len(self.scans) * 1000))
 
         seen = {default_head}
         for name in sorted(heads):
@@ -588,7 +598,9 @@ class _RepoPlan:
                 continue  # same head as a branch already scanned: same history
             seen.add(heads[name])
             walk = _compare_walk(self.client, self.repo.full_name, default, name, keep)
-            self.scans.append(_Scan(name, walk, primary, by_author=False, head=heads[name]))
+            self.scans.append(
+                _Scan(name, walk, primary, by_author=False, head=heads[name], priority=len(self.scans) * 1000)
+            )
 
     def replace_failed_compares(self, filters: list[tuple[str, str]]) -> list[Walk]:
         """Per-author history walks for branches whose comparison overflowed or
@@ -597,7 +609,13 @@ class _RepoPlan:
         Those walks re-read history the plan may already hold (every branch
         far ahead of a stale default branch shares most of it): a commit
         already read is dropped as it arrives, so memory holds each commit once."""
-        known = {
+        store = self.store
+        for scan in self.scans:  # what a failed comparison read is read again
+            if not scan.by_author and scan.walk.error:
+                scan.walk.nodes = []
+                if store is not None:
+                    store.delete_repo(self.repo.full_name, scan.priority)
+        self.known = {
             str(node.get("oid") or "")
             for scan in self.scans if not (scan.walk.overflow or scan.walk.error)
             for node in scan.walk.nodes
@@ -605,9 +623,9 @@ class _RepoPlan:
 
         def new_only(node: dict) -> dict | None:
             oid = str(node.get("oid") or "")
-            if oid in known:
+            if oid in self.known or (store is not None and store.has(self.repo.full_name, oid)):
                 return None
-            known.add(oid)
+            self.known.add(oid)
             return node
 
         added: list[Walk] = []
@@ -620,8 +638,9 @@ class _RepoPlan:
                     _history_walk(self.client, self.repo.full_name, scan.head, author, self.since, new_only),
                     login,
                     True,
+                    priority=scan.priority + index + 1,
                 )
-                for login, author in filters
+                for index, (login, author) in enumerate(filters)
             ]
             added.extend(child.walk for child in scan.replaced_by)
         return added
@@ -644,6 +663,40 @@ class _RepoPlan:
             scan.branch for scan in self.scans
             if not scan.by_author and any(leaf.walk.error for leaf in scan.leaves())
         ]
+
+    known: set = field(default_factory=set)  # SHAs replacement walks skip (see replace_failed_compares)
+
+    def held(self) -> int:
+        """Commit nodes this plan holds in memory."""
+        return sum(len(leaf.walk.nodes) for scan in self.scans for leaf in scan.leaves())
+
+    def spill(self, logins: set[str], emails: set[str]) -> None:
+        """Move what was read so far into the store, each scan's commits under
+        its priority: memory stays bounded however big the repository is."""
+        for scan in self.scans:
+            for leaf in scan.leaves():
+                if leaf.walk.nodes and not leaf.walk.error and not leaf.walk.overflow:
+                    self.store.add(self._records(leaf, logins, emails), leaf.priority)
+                    leaf.walk.nodes = []
+        self.known.clear()  # the store answers for them now
+
+    def finish(self, logins: set[str], emails: set[str]) -> None:
+        """The plan is done (not failed): its rows from failed walks go (REST
+        reads those branches), the rest of what it read goes to the store."""
+        for scan in self.scans:
+            for leaf in scan.leaves():
+                if leaf.walk.error:
+                    self.store.delete_repo(self.repo.full_name, leaf.priority)
+                    leaf.walk.nodes = []
+        self.spill(logins, emails)
+
+    def _records(self, leaf: _Scan, logins: set[str], emails: set[str]):
+        for node in leaf.walk.nodes:
+            payload = rest_commit(node)
+            if not leaf.by_author and not _authored_by(payload, logins, emails):
+                continue
+            if payload["sha"]:
+                yield _commit_from_payload(payload, self.repo, leaf.branch, leaf.fallback_login)
 
     def commits(self, logins: set[str], emails: set[str]) -> list[CommitRecord]:
         """De-duplicated by SHA; the first source (default branch first) wins."""
@@ -678,6 +731,10 @@ async def resolve_user_ids(client: GitHubClient, logins: list[str], *, inflight:
     return ids
 
 
+#: Commit nodes collect_commits holds in memory before it moves them to its
+#: store (about 1.8 KB each).
+NODE_BUDGET = 20_000
+
 #: History walks of a period report start this long before the period: the
 #: walk filters by commit date, the report by author date (a commit is
 #: committed after it was authored, by days when it is rebased later).
@@ -694,6 +751,7 @@ async def collect_commits(
     inflight: int,
     since: datetime | None = None,
     coverage: Coverage | None = None,
+    store: Any = None,
 ) -> tuple[list[CommitRecord], list[tuple[RepoRecord, list[str] | None]]] | None:
     """Commits by the tracked logins / emails in ``repos``.
 
@@ -706,6 +764,12 @@ async def collect_commits(
     with the branches to read (``None``: all of it) — or ``None`` when GraphQL
     cannot be used at all. A branch that can't be read through GraphQL costs
     only that branch, never what was read of the rest of its repository.
+
+    With a ``store`` (a :class:`~github_contrib.commitstore.CommitStore`),
+    commits go there instead, each under its scan's priority, whenever more
+    than NODE_BUDGET are in memory: the returned list is then empty and the
+    store keeps the first of each SHA per repository
+    (``keep_first_per_repo_sha``) once everything is read.
     """
     if not repos:
         return [], []
@@ -724,22 +788,29 @@ async def collect_commits(
     )
 
     plans = [_RepoPlan(repo, client_for(repo), scan_all_branches and repo.affiliated) for repo in repos]
+    for plan in plans:
+        plan.store = store
     with _Progress("Branches", len(plans)) as bar:
         await run_walks([p.heads for p in plans], BATCH["heads"], inflight=inflight, progress=bar)
     live = [p for p in plans if not p.heads.error]
     for plan in live:
         plan.plan(filters, primary, keep, since_text)
 
+    def bound_memory() -> None:
+        if store is not None and sum(p.held() for p in live) > NODE_BUDGET:
+            for plan in live:
+                plan.spill(logins, emails)
+
     histories = [s.walk for p in live for s in p.scans if s.by_author]
     compares = [s.walk for p in live for s in p.scans if not s.by_author]
     with _Progress("Commits", len(histories) + len(compares)) as bar:
         await asyncio.gather(
-            run_walks(histories, BATCH["history"], inflight=inflight, progress=bar),
-            run_walks(compares, BATCH["compare"], inflight=inflight, progress=bar),
+            run_walks(histories, BATCH["history"], inflight=inflight, progress=bar, after_batch=bound_memory),
+            run_walks(compares, BATCH["compare"], inflight=inflight, progress=bar, after_batch=bound_memory),
         )
         extra = [walk for p in live for walk in p.replace_failed_compares(filters)]
         bar.add(len(extra))
-        await run_walks(extra, BATCH["history"], inflight=inflight, progress=bar)
+        await run_walks(extra, BATCH["history"], inflight=inflight, progress=bar, after_batch=bound_memory)
 
     commits: list[CommitRecord] = []
     rest: list[tuple[RepoRecord, list[str] | None]] = []
@@ -747,9 +818,14 @@ async def collect_commits(
         reason = plan.failure()
         if reason:
             log.debug("%s: GraphQL failed (%s); using REST", plan.repo.full_name, reason)
+            if store is not None:
+                store.delete_repo(plan.repo.full_name)
             rest.append((plan.repo, None))
             continue
-        commits.extend(plan.commits(logins, emails))
+        if store is not None:
+            plan.finish(logins, emails)
+        else:
+            commits.extend(plan.commits(logins, emails))
         failed = plan.failed_branches()
         if failed:
             log.debug("%s: %d branch(es) to read with REST", plan.repo.full_name, len(failed))
@@ -968,6 +1044,7 @@ async def enrich_commits_with_stats(
     coverage: Coverage,
     *,
     inflight: int,
+    failed: list[str] | None = None,
 ) -> None:
     """Additions / deletions / files changed, 25 commits per query.
 
@@ -1002,4 +1079,4 @@ async def enrich_commits_with_stats(
             commit.stats_fetched = True
     if leftover:
         log.info("measuring %d commit(s) through the REST API", len({c.sha for c in leftover}))
-        await enrich_commits_with_stats_rest(repo_client, leftover, coverage)
+        await enrich_commits_with_stats_rest(repo_client, leftover, coverage, failed=failed)

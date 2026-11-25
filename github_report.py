@@ -376,10 +376,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.regen:
             from github_contrib.offline import load_collected_from_csv
-            from github_contrib.report import generate_outputs
+            from github_contrib.report import close_commits, generate_outputs
 
-            data = load_collected_from_csv(config.output_dir)
-            stats = generate_outputs(data, config, export_source_csvs=False)
+            # The commit store goes next to the report: a temp folder may be held in memory.
+            data = load_collected_from_csv(config.output_dir, store_dir=config.output_dir)
+            try:
+                stats = generate_outputs(data, config, export_source_csvs=False)
+            finally:
+                close_commits(data)  # the on-disk store of the commits
         else:
             from github_contrib.report import run
 

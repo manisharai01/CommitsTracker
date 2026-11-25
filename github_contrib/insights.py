@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
+from .fanout import fan_out
 from .logging_config import get_logger
 from .models import CollectedData, CommitRecord, PullRequestRecord, RepoRecord
 
@@ -499,17 +500,20 @@ def _build_repo_work(
     )
 
 
+def _tally_by_repo(commits: Iterable[CommitRecord]) -> dict[str, _RepoTally]:
+    tallies: dict[str, _RepoTally] = {}
+    for commit in commits:
+        tally = tallies.get(commit.full_name)
+        if tally is None:
+            tally = tallies[commit.full_name] = _RepoTally()
+        tally.add(commit)
+    return tallies
+
+
 def compute_insights(data: CollectedData) -> Insights:
     """Compute activity insights and per-repo work narratives."""
-    activity = _compute_activity(data.commits)
-
-    # One pass over the commits, a tally per repository.
-    commits_by_repo: dict[str, _RepoTally] = {}
-    for commit in data.commits:
-        tally = commits_by_repo.get(commit.full_name)
-        if tally is None:
-            tally = commits_by_repo[commit.full_name] = _RepoTally()
-        tally.add(commit)
+    # One read of the commits: the activity, and a tally per repository.
+    activity, commits_by_repo = fan_out(data.commits, [_compute_activity, _tally_by_repo])
     prs_by_repo: dict[str, list[PullRequestRecord]] = {}
     for pr in data.pull_requests:
         prs_by_repo.setdefault(pr.full_name, []).append(pr)

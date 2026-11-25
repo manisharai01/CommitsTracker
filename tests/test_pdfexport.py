@@ -240,11 +240,11 @@ def test_memory_use_reads_the_container_limit():
     files = {
         "/sys/fs/cgroup/memory.current": "400000000\n",
         "/sys/fs/cgroup/memory.max": "536870912\n",
-        "/sys/fs/cgroup/memory.stat": "anon 300000000\ninactive_file 50000000\nactive_file 1000\n",
+        "/sys/fs/cgroup/memory.stat": "anon 300000000\ninactive_file 40000000\nactive_file 10000000\n",
         "/proc/meminfo": "MemTotal:        8000000 kB\nMemAvailable:    6000000 kB\n",
     }
     with patched(pdfexport, _read=lambda path: files.get(path, "")), env_vars(PDF_MEMORY_LIMIT_MB=None):
-        # cgroup v2; inactive file cache doesn't count (the kernel drops it first).
+        # cgroup v2; file cache doesn't count (the kernel drops it first).
         assert pdfexport.memory_use() == (350_000_000, 536_870_912)
         files["/sys/fs/cgroup/memory.max"] = "max\n"  # no container limit: the machine's memory
         assert pdfexport.memory_use() == (350_000_000, 8_000_000 * 1024)
@@ -253,7 +253,7 @@ def test_memory_use_reads_the_container_limit():
     files = {
         "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300000000\n",
         "/sys/fs/cgroup/memory/memory.limit_in_bytes": "268435456\n",
-        "/sys/fs/cgroup/memory/memory.stat": "cache 1\ntotal_inactive_file 100000000\n",
+        "/sys/fs/cgroup/memory/memory.stat": "cache 1\ntotal_inactive_file 60000000\ntotal_active_file 40000000\n",
     }
     with patched(pdfexport, _read=lambda path: files.get(path, "")), env_vars(PDF_MEMORY_LIMIT_MB=None):
         assert pdfexport.memory_use() == (200_000_000, 268_435_456)  # cgroup v1

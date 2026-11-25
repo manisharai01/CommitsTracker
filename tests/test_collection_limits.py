@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from github_contrib import graphql  # noqa: E402
-from github_contrib.client import DeadlineError, GitHubClient, RateLimitedError  # noqa: E402
+from github_contrib.client import DeadlineError, GitHubClient, GitHubError, RateLimitedError  # noqa: E402
 from github_contrib.discovery import search_all  # noqa: E402
 from github_contrib.models import Coverage  # noqa: E402
 from github_contrib.report import TIME_LIMIT_NOTE, _guard  # noqa: E402
@@ -267,6 +267,153 @@ def test_compared_branches_keep_only_the_tracked_authors():
         graphql._compare_walk = real_compare
     held = {node["oid"] for walk in walks for node in walk.nodes}
     assert "f2" not in held and "f1" in held, "other people's commits are dropped as pages arrive"
+
+
+def _collect_into_store(gql, budget: int):
+    from github_contrib.commitstore import CommitStore
+
+    old_page, old_limit, old_budget = graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET
+    graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET = 2, 4, budget
+    store = CommitStore()
+    try:
+        repos = [_repo("acme/app"), _repo("up/stream", affiliated=False)]
+        legacy = asyncio.run(graphql.collect_commits(
+            repos, lambda _r: gql, ["neha"], ["neha@work.com"], scan_all_branches=True, inflight=3
+        ))
+        streamed = asyncio.run(graphql.collect_commits(
+            repos, lambda _r: gql, ["neha"], ["neha@work.com"], scan_all_branches=True, inflight=3, store=store
+        ))
+        store.keep_first_per_repo_sha()
+        return legacy, streamed, list(store)
+    finally:
+        graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET = old_page, old_limit, old_budget
+        store.close()
+
+
+def _keys(commits):
+    return sorted((c.full_name, c.sha, c.branch, c.author_login, c.parent_count) for c in commits)
+
+
+def test_commits_streamed_to_disk_match_the_in_memory_ones():
+    from tests.test_graphql import _model as model
+
+    for budget in (0, 1, 3, 10_000):  # 0 and 1: every page moves to disk mid-walk
+        legacy, streamed, stored = _collect_into_store(FakeGraphQL(model()), budget)
+        assert streamed[0] == [] and streamed[1] == legacy[1]
+        assert _keys(stored) == _keys(legacy[0]), budget
+        assert {c.sha: c.branch for c in stored}["a2"] == "main", "the default branch still wins"
+
+
+def test_a_failed_branch_leaves_nothing_partial_on_disk():
+    from tests.test_graphql import _model as model
+
+    gql = FakeGraphQL(model())
+    original = gql.graphql
+    calls = {"n": 0}
+
+    async def fails_late(query):
+        data, errors = await original(query)
+        # The "feature" comparison fails after its first page was read.
+        if 'headRef: "refs/heads/feature"' in query and 'after: "' in query:
+            for line, alias in zip(query.strip().splitlines()[1:-1], sorted(data)):
+                if 'headRef: "refs/heads/feature"' in line:
+                    calls["n"] += 1
+                    data[alias] = None
+                    errors = errors + [{"type": "FORBIDDEN", "path": [alias], "message": "gone"}]
+        return data, errors
+
+    gql.graphql = fails_late
+    legacy, streamed, stored = _collect_into_store(gql, 0)
+    assert calls["n"] and streamed[1] == legacy[1]
+    assert _keys(stored) == _keys(legacy[0]), "rows of the failed walk were removed"
+
+
+def _fake_github(model, *, graphql_works: bool = True):
+    """Patches for GitHubClient that answer from the in-memory GitHub of
+    test_graphql (one repository, acme/app, listed by /user/repos)."""
+    from unittest.mock import patch
+
+    from tests.test_graphql import FakeRest
+
+    gql, rest = FakeGraphQL(model), FakeRest(model)
+    payload = {"full_name": "acme/app", "name": "app", "owner": {"login": "acme", "type": "Organization"},
+               "private": True, "default_branch": "main"}
+
+    async def get_viewer(self):
+        self.login = "neha"
+        return "neha", "repo, read:org"
+
+    async def paginate(self, path, *, params=None, accept=None, max_items=None, on_empty=None):
+        if path == "/user/repos":
+            yield payload
+            return
+        if path == "/user/orgs":
+            return
+        async for item in rest.paginate(path, params=params, accept=accept, on_empty=on_empty):
+            yield item
+
+    async def request(self, method, path, *, params=None, accept=None, json_body=None, retries=None):
+        return await rest.request(method, path, params=params, accept=accept)
+
+    async def get_json(self, path, *, params=None, accept=None):
+        return []  # the uncounted-email sample: nothing to report
+
+    async def graph(self, query):
+        if not graphql_works:
+            raise GitHubError("GraphQL is down", status=502)
+        try:
+            return await gql.graphql(query)
+        except (AssertionError, AttributeError, TypeError):  # technologies / reviews: not modelled
+            return {}, [{"message": "not modelled"}]
+
+    return [
+        patch.object(GitHubClient, "get_viewer", get_viewer),
+        patch.object(GitHubClient, "paginate", paginate),
+        patch.object(GitHubClient, "request", request),
+        patch.object(GitHubClient, "get_json", get_json),
+        patch.object(GitHubClient, "graphql", graph),
+    ]
+
+
+def test_a_whole_collection_run_streams_commits_to_disk():
+    """collect() end to end, with both engines: the stored commits are the
+    ones (and on the branches) the REST collector finds on its own."""
+    from contextlib import ExitStack
+
+    from github_contrib.commits import collect_commits_for_repo
+    from github_contrib.config import Account, AppConfig
+    from github_contrib.report import collect
+    from tests.test_graphql import FakeRest
+    from tests.test_graphql import _model as model
+
+    expected = asyncio.run(collect_commits_for_repo(
+        FakeRest(model()), _repo("acme/app"), ["neha"], scan_all_branches=True,
+        author_emails=["neha@work.com"], coverage=Coverage(),
+    ))
+    old = graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET
+    for graphql_works in (True, False):
+        graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET = 2, 4, 1
+        config = AppConfig(
+            accounts=[Account("neha", "ghp_x", "GITHUB_TOKEN_NEHA")], target_logins=["neha"],
+            author_emails=["neha@work.com"], use_search_discovery=False, enumerate_org_repos=False,
+            fetch_commit_stats=True, collect_prs=True, use_graphql=graphql_works,
+        )
+        try:
+            with ExitStack() as stack:
+                for p in _fake_github(model(), graphql_works=graphql_works):
+                    stack.enter_context(p)
+                data = asyncio.run(collect(config))
+        finally:
+            graphql.PAGE, graphql.COMPARE_MAX_AHEAD, graphql.NODE_BUDGET = old
+        try:
+            stored = list(data.commits)
+            assert _keys(stored) == _keys(expected), graphql_works
+            assert all(c.stats_fetched for c in stored if not c.is_merge), "line stats written back to the store"
+            assert {c.sha: c.additions for c in stored}["a1"] == 3
+            assert data.organizations and data.organizations[0].commit_count == len(stored)
+        finally:
+            data.commits.close()
+        assert not data.commits.path.exists(), "the store file is deleted"
 
 
 # ---------------------------------------------------------------------------

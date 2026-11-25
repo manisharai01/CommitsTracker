@@ -57,6 +57,7 @@ from aiohttp import web
 
 from . import __version__
 from . import auth as gh_auth
+from .commitstore import STORE_PREFIX, STORE_SUFFIX
 from .config import (
     DEADLINE_ENV,
     NO_DOTENV_ENV,
@@ -68,13 +69,12 @@ from .config import (
 )
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
-from .pdfexport import EXIT_NO_MEMORY, find_browser, memory_use, pdf_timeout
+from .pdfexport import EXIT_NO_MEMORY, MEMORY_HEADROOM, find_browser, memory_use, pdf_timeout
 from .reportscript import (  # not htmlreport: pandas would cost the server ~40 MB
     REPORT_CSP,
     SCRIPT,
     SUMMARY_FILE,
     is_current,
-    with_current_script,
 )
 from .store import ReportRow, Store, make_store
 
@@ -161,6 +161,9 @@ CHILD_ENV_ALLOWLIST = frozenset(
         # Chromium in a container needs --no-sandbox; slow hosts may need more
         # time for the PDF, small ones smaller parts (see pdfexport).
         "PDF_NO_SANDBOX", "PDF_TIMEOUT", "PDF_PART_ROWS", "PDF_MEMORY_LIMIT_MB",
+        # Memory settings of the container (see the Dockerfile), and where
+        # SQLite sorts a large report's commits.
+        "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "MALLOC_ARENA_MAX", "SQLITE_TMPDIR",
     )
 )
 
@@ -185,9 +188,18 @@ RUN_MEMORY_MB = 600
 #: collection stops at the rest (see REPORT_DEADLINE in config.py), so a slow
 #: run still ends with a report of what it read.
 OUTPUT_RESERVE_SECONDS = 10 * 60
+#: Writing a report takes time in proportion to its commits, and a slow host
+#: can need more than the reserve for a very large one: a run that has
+#: finished collecting is given up to this long to write its report, even
+#: past its time limit (a run still collecting then is stopped).
+BUILD_SECONDS = 60 * 60
+#: Phase a run is in once it writes the report from what it read.
+_BUILDING = "Building report"
 #: The run's output, as the page showed it, saved when the run ends (the
 #: memory copy is dropped then).
 CONSOLE_LOG = "console.log"
+#: How often a running report's memory is checked (Linux), in seconds.
+MEMORY_POLL_SECONDS = 0.5
 
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -220,7 +232,7 @@ _LOG_PHASES: tuple[tuple[str, str], ...] = (
     ("discovering repositories", "Discovering repositories"),
     ("search found", "Searching GitHub"),
     ("Fetching line stats", "Fetching line stats"),
-    ("Finished collection", "Building report"),
+    ("Finished collection", _BUILDING),
     ("wrote report.md and report.html", "Rendering PDF"),
 )
 
@@ -762,6 +774,20 @@ def clean_unlinked(items: object) -> list[dict]:
     return out[:20]
 
 
+def _remove_stores(folder: Path) -> None:
+    """Delete the commit store a stopped run left in its folder (a finished
+    run removes its own): it can be as big as the report's whole history."""
+    try:
+        leftovers = list(folder.glob(f"{STORE_PREFIX}*{STORE_SUFFIX}"))
+    except OSError:
+        return
+    for path in leftovers:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove %s: %s", path.name, exc)
+
+
 def _kill_tree(process: asyncio.subprocess.Process) -> None:
     """Stop a run and everything it started (the browser rendering the PDF)."""
     if process.returncode is not None:
@@ -877,6 +903,9 @@ class Job:
     cancel_requested: bool = False
     delete_requested: bool = False
     timed_out: bool = False
+    #: When the run started writing its report (time.monotonic()), if it has.
+    building_since: float | None = None
+    out_of_memory: bool = False  # stopped by the memory guard
     client: str = ""  # address that created it (rate limiting; never stored)
     # (secret, replacement) applied to everything shown, wherever it appears
     redactions: list[tuple[str, str]] = field(default_factory=list)
@@ -1030,6 +1059,8 @@ class Job:
         for fragment, phase in _LOG_PHASES:
             if fragment in msg:
                 self.phase, self.progress = phase, None
+                if phase == _BUILDING and self.building_since is None:
+                    self.building_since = time.monotonic()
 
     @property
     def log_count(self) -> int:
@@ -1419,6 +1450,7 @@ class JobManager:
         if job.active:
             job.status = "cancelled" if job.cancel_requested else "failed"
         self._scrub_run_log(job)
+        _remove_stores(job.out_dir)
         job.request = job.process = job.progress = None  # drop the tokens
         job.redactions = []
         job.finished_at = _now()
@@ -1497,6 +1529,7 @@ class JobManager:
         assert request is not None
         settings = self.settings
         job.status, job.phase = "running", "Starting"
+        started = time.monotonic()
         self._sync_soon(job)
         job.out_dir.mkdir(parents=True, exist_ok=True)
         env = build_env(request, os.environ, isolated=settings.public)
@@ -1524,18 +1557,51 @@ class JobManager:
             await pump_lines(process.stdout, job.add_output)
             return await process.wait()
 
-        try:
-            code = await asyncio.wait_for(drain(), timeout=settings.job_timeout or None)
-        except asyncio.TimeoutError:
-            job.timed_out = True
-            _kill_tree(process)
-            code = await process.wait()
+        async def guard_memory() -> None:
+            """The last line of defence: a run is stopped before the server
+            runs out of memory (that would restart it, losing every report)."""
+            while process.returncode is None:
+                use = memory_use()
+                if use is not None and use[0] > use[1] - MEMORY_HEADROOM:
+                    job.out_of_memory = True
+                    log.warning(
+                        "report %s stopped: the server was about to run out of memory (%d of %d MB in use)",
+                        job.id, use[0] // (1024 * 1024), use[1] // (1024 * 1024),
+                    )
+                    _kill_tree(process)
+                    return
+                await asyncio.sleep(MEMORY_POLL_SECONDS)
 
-        if job.timed_out:
+        watcher = asyncio.create_task(guard_memory())
+        drained = asyncio.ensure_future(drain())
+        try:
+            code = await self._within_time_limit(job, drained, started)
+            if code is None:
+                job.timed_out = True
+                _kill_tree(process)
+                code = await process.wait()
+        finally:
+            watcher.cancel()
+            if not drained.done():
+                drained.cancel()
+
+        if job.timed_out and job.building_since is not None:
+            job.status = "failed"
+            job.error = (
+                f"Writing the report took longer than {BUILD_SECONDS / 60:.0f} minutes and was stopped. "
+                "Try a shorter time range."
+            )
+        elif job.timed_out:
             job.status = "failed"
             job.error = (
                 f"The report took longer than {settings.job_timeout / 60:.0f} minutes and was "
                 "stopped. Try a shorter time range, or turn off line-level stats."
+            )
+        elif job.out_of_memory:
+            job.status = "failed"
+            job.error = (
+                "This report needed more memory than the server could give it, so it was stopped. "
+                "Try a shorter time range."
             )
         elif job.cancel_requested:
             job.status = "cancelled"
@@ -1546,6 +1612,24 @@ class JobManager:
         else:
             job.status = "failed"
             job.error = job.error or (job.log[-1].strip() if job.log else f"The run exited with code {code}.")
+
+    async def _within_time_limit(self, job: Job, drained: asyncio.Future, started: float) -> int | None:
+        """The run's exit code, or ``None`` once it is out of time: at the
+        time limit while still collecting, or ``BUILD_SECONDS`` after it
+        started writing its report if that ends later."""
+        limit = self.settings.job_timeout
+        if not limit:
+            return await drained
+        while True:
+            stop_at = started + limit
+            if job.building_since is not None:
+                stop_at = max(stop_at, job.building_since + BUILD_SECONDS)
+            remaining = stop_at - time.monotonic()
+            if remaining <= 0:
+                return None
+            done, _ = await asyncio.wait({drained}, timeout=min(remaining, 5.0))
+            if done:
+                return drained.result()
 
     def _scrub_run_log(self, job: Job) -> None:
         """Make sure run.log on disk holds no token (or server path in public mode)."""
@@ -2016,15 +2100,49 @@ def _report_file(path: Path, kind: str) -> web.StreamResponse:
     if kind not in PAGE_KINDS:
         return web.FileResponse(path)
     try:
+        size = path.stat().st_size
         with path.open("rb") as fh:
-            fh.seek(max(path.stat().st_size - len(SCRIPT.encode("utf-8")) - 64, 0))
+            fh.seek(max(size - len(SCRIPT.encode("utf-8")) - 64, 0))
+            if is_current(fh.read()):
+                return web.FileResponse(path)
+            # The old script is the page's last element; its policy is in the
+            # first few KB. The page is streamed with both replaced, never
+            # read whole: a report can be tens of MB.
+            fh.seek(0)
+            head = fh.read(16384)
+            tail_from = max(size - 262144, 0)
+            fh.seek(tail_from)
             tail = fh.read()
-        if is_current(tail):
-            return web.FileResponse(path)
-        page = with_current_script(path.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         raise web.HTTPNotFound(text="That file isn't available for this report.") from None
-    return web.Response(text=page, content_type="text/html")
+    start, end = tail.rfind(b"<script>"), -1
+    if start >= 0:
+        end = tail.find(b"</script>", start)
+    if start < 0 or end < 0:
+        return web.FileResponse(path)
+    script_from, script_to = tail_from + start + len(b"<script>"), tail_from + end
+    meta = _META_CSP_BYTES_RE.search(head)
+    new_meta = f"<meta http-equiv='Content-Security-Policy' content=\"{REPORT_CSP}\">".encode("utf-8")
+
+    async def body():
+        position = 0
+        with path.open("rb") as fh:
+            if meta is not None:
+                yield head[: meta.start()] + new_meta
+                position = meta.end()
+            fh.seek(position)
+            while position < script_from:
+                chunk = fh.read(min(65536, script_from - position))
+                if not chunk:
+                    break
+                position += len(chunk)
+                yield chunk
+            yield SCRIPT.encode("utf-8")
+            fh.seek(script_to)
+            while chunk := fh.read(65536):
+                yield chunk
+
+    return web.Response(body=body(), content_type="text/html", charset="utf-8")
 
 
 async def _job_file(request: web.Request) -> web.StreamResponse:
@@ -2044,6 +2162,9 @@ async def _job_file(request: web.Request) -> web.StreamResponse:
 
 
 # -- shared links (read-only, no session) -----------------------------------
+
+#: The policy tag at the top of a report page (see reportscript.with_current_script).
+_META_CSP_BYTES_RE = re.compile(rb"<meta http-equiv='Content-Security-Policy' content=\"[^\"]*\">")
 
 #: Files a shared link exposes — never the logs, the workbook or the data.
 SHARED_FILES = ("pdf", "html", "summary")

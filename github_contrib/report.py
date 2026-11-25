@@ -35,7 +35,8 @@ import aiohttp
 from . import graphql
 from .analytics import compute_analytics
 from .client import DeadlineError, GitHubClient, GitHubError
-from .commits import collect_commits_for_repo, collect_pr_commits, enrich_commits_with_stats
+from .commits import collect_commits_for_repo, collect_pr_commits, enrich_commits_with_stats, stats_failure_note
+from .commitstore import CommitStore, micros
 from .config import AppConfig, run_deadline
 from .discovery import (
     SEARCH_END,
@@ -129,18 +130,6 @@ async def _gather_with_progress(
     return await asyncio.gather(*coros)
 
 
-def _dedupe_commits(commits: list[CommitRecord]) -> list[CommitRecord]:
-    seen: set[tuple[str, str]] = set()
-    out: list[CommitRecord] = []
-    for c in commits:
-        key = (c.full_name, c.sha)
-        if c.sha and key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    return out
-
-
 def _dedupe_prs(prs: list[PullRequestRecord]) -> list[PullRequestRecord]:
     seen: set[tuple[str, int]] = set()
     out: list[PullRequestRecord] = []
@@ -221,7 +210,13 @@ async def _check_unlinked_commits(
         return []  # the report leaves the accounts' own repositories out
     tracked = {login.lower() for login in config.target_logins}
     left_out = {owner.lower() for owner in config.exclude_owners}
-    counted = {(c.full_name, c.sha) for c in commits}
+    if isinstance(commits, CommitStore):
+        is_counted = commits.has
+    else:
+        counted_keys = {(c.full_name, c.sha) for c in commits}
+
+        def is_counted(full_name: str, sha: str) -> bool:
+            return (full_name, sha) in counted_keys
     owned = [r for r in repos if r.owner.lower() in tracked and r.owner.lower() not in left_out]
     missed: dict[str, dict[str, Any]] = {}  # email -> commits, git names, repositories
     capped = False
@@ -247,7 +242,7 @@ async def _check_unlinked_commits(
             author = (item.get("commit") or {}).get("author") or {}
             when = parse_github_datetime(author.get("date"))
             if (
-                (repo.full_name, item.get("sha")) in counted
+                is_counted(repo.full_name, str(item.get("sha") or ""))
                 or not _in_period(when, config)
                 # A fork's history from before it was forked is upstream work.
                 or (repo.is_fork and repo.created_at and when and when < repo.created_at)
@@ -337,6 +332,26 @@ def _search_window(config: AppConfig) -> tuple[datetime, datetime]:
     return start, end
 
 
+#: Store priorities: what the REST collectors and pull requests add ranks
+#: after what GraphQL read (the first of a SHA in a repository is kept).
+REST_PRIORITY = 10**9
+PR_PRIORITY = 2 * 10**9
+
+
+def _period_sql(config: AppConfig) -> tuple[str, tuple]:
+    """:func:`_in_period` as a condition on the store's rows."""
+    if config.since is None and config.until is None:
+        return "1", ()
+    where, params = ["authored_us is not null"], []
+    if config.since is not None:
+        where.append("authored_us >= ?")
+        params.append(micros(config.since))
+    if config.until is not None:
+        where.append("authored_us <= ?")
+        params.append(micros(config.until))
+    return " and ".join(where), tuple(params)
+
+
 def _in_period(moment: datetime | None, config: AppConfig) -> bool:
     if config.since is None and config.until is None:
         return True
@@ -422,6 +437,18 @@ async def _add_manual_includes(
 
 async def collect(config: AppConfig) -> CollectedData:
     """Discover repos/orgs and collect commits & PRs for the tracked users."""
+    # The commits are kept on disk next to the report (not in a temp folder,
+    # which may be held in memory), and removed when the run ends.
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    commits = CommitStore(config.output_dir)
+    try:
+        return await _collect(config, commits)
+    except BaseException:
+        commits.close()
+        raise
+
+
+async def _collect(config: AppConfig, commits: CommitStore) -> CollectedData:
     coverage = Coverage()
     semaphore = asyncio.Semaphore(config.concurrency)
     started = datetime.now(timezone.utc)
@@ -578,7 +605,8 @@ async def collect(config: AppConfig) -> CollectedData:
         client_for = _make_client_selector(clients)
 
         # --- commits ------------------------------------------------------
-        commits: list[CommitRecord] = []
+        # Straight into a store on disk as they are read: an account's commits
+        # never need to fit in memory.
         if config.collect_commits and scan_repos and not out_of_time():
             rest_work: list[tuple[RepoRecord, list[str] | None]] = [(repo, None) for repo in scan_repos]
             if use_graphql:
@@ -591,11 +619,12 @@ async def collect(config: AppConfig) -> CollectedData:
                     inflight=config.concurrency,
                     since=config.since,
                     coverage=coverage,
+                    store=commits,
                 )
                 if found is None:
                     log.info("Commits could not be read through GraphQL; using the REST API.")
                 else:
-                    commits, rest_work = found
+                    _none, rest_work = found
                     if rest_work:
                         log.info(
                             "%d repo(s) could not be (fully) read through GraphQL; using the REST API for them.",
@@ -611,15 +640,18 @@ async def collect(config: AppConfig) -> CollectedData:
                         author_emails=config.author_emails or None,
                         coverage=coverage,
                         branches=branches,
+                        store=commits,
+                        priority=REST_PRIORITY,
                     ),
                     repo.full_name,
                     coverage,
                 )
                 for repo, branches in rest_work
             ]
-            for batch in await _gather_with_progress(coros, "Commits"):
-                commits.extend(batch)
-        commits = _dedupe_commits(commits)
+            await _gather_with_progress(coros, "Commits")
+        # One row per repository and SHA: the default branch first, then the
+        # other branches, then what REST read (the collectors' order).
+        commits.keep_first_per_repo_sha()
         log.info("collected %d commit(s)", len(commits))
 
         # --- pull requests ------------------------------------------------
@@ -657,7 +689,6 @@ async def collect(config: AppConfig) -> CollectedData:
 
         # --- commits that live only in pull requests ----------------------
         if config.collect_commits and config.scan_all_branches and prs and not out_of_time():
-            present = {(c.full_name, c.sha) for c in commits}
             # A pull request last updated before the period cannot hold
             # commits authored inside it.
             wanted = [
@@ -666,7 +697,10 @@ async def collect(config: AppConfig) -> CollectedData:
                 and (config.since is None or (p.updated_at or p.created_at or SEARCH_END) >= config.since)
             ]
 
+            recovered = 0
+
             async def recover(pr: PullRequestRecord) -> list[CommitRecord]:
+                nonlocal recovered
                 repo = scan_by_name[pr.full_name]
                 if graph_prs is not None and (pr.full_name, pr.number) not in graph_prs.incomplete:
                     shas, records = graph_prs.commits_of(
@@ -677,20 +711,21 @@ async def collect(config: AppConfig) -> CollectedData:
                         client_for(repo), repo, pr, config.target_logins, config.author_emails, coverage
                     )
                 pr.commit_shas = shas
-                return records
+                # Commits found nowhere else go to the store right away (no
+                # await between the check and the write: nothing interleaves).
+                fresh: dict[tuple[str, str], CommitRecord] = {}
+                for commit in records:
+                    key = (commit.full_name, commit.sha)
+                    if key not in fresh and not commits.has(*key):
+                        fresh[key] = commit
+                commits.add(fresh.values(), priority=PR_PRIORITY)
+                recovered += len(fresh)
+                return []
 
-            recovered = 0
-            batches = await _gather_with_progress(
+            await _gather_with_progress(
                 [_guard(recover(p), f"{p.full_name}#{p.number} commits", coverage) for p in wanted],
                 "PR commits",
             )
-            for batch in batches:
-                for commit in batch:
-                    key = (commit.full_name, commit.sha)
-                    if key not in present:
-                        present.add(key)
-                        commits.append(commit)
-                        recovered += 1
             if recovered:
                 log.info("recovered %d commit(s) found only in pull requests", recovered)
 
@@ -700,7 +735,7 @@ async def collect(config: AppConfig) -> CollectedData:
             unlinked = await _check_unlinked_commits(scan_repos, commits, config, client_for, coverage)
 
         # --- technologies of the repositories with commits (never fatal) ----
-        worked_in = {c.full_name for c in commits}
+        worked_in = commits.repositories()
         stack_repos = [r for r in scan_repos if r.full_name in worked_in]
         if stack_repos and not out_of_time():
             unread = await collect_stacks(stack_repos, client_for, inflight=config.concurrency)
@@ -717,23 +752,36 @@ async def collect(config: AppConfig) -> CollectedData:
 
         # --- line-level stats (one request per commit in the period) ------
         if config.fetch_commit_stats and commits and not out_of_time():
-            in_period = [c for c in commits if _in_period(c.authored_date, config)]
             repo_client: dict[str, GitHubClient] = {
                 repo.full_name: client_for(repo) for repo in repo_list
             }
-            wanted_shas = len({c.sha for c in in_period if not c.is_merge})
+            period_sql, period_params = _period_sql(config)
+            wanted_shas = commits.count_shas(f"parent_count <= 1 and {period_sql}", period_params)
             log.info("Fetching line stats for %d commit(s) — use --no-commit-stats to skip.", wanted_shas)
-            if use_graphql:
-                await graphql.enrich_commits_with_stats(
-                    repo_client, in_period, coverage, inflight=config.concurrency
+            failed: list[str] = []
+            # A few hundred SHAs at a time (every copy of one SHA in the same
+            # batch, so it is measured once), written back to the store.
+            for batch in commits.batches_by_sha(f"parent_count <= 1 and {period_sql}", period_params):
+                if out_of_time():
+                    break
+                records = [record for _seq, record in batch]
+                if use_graphql:
+                    await graphql.enrich_commits_with_stats(
+                        repo_client, records, coverage, inflight=config.concurrency, failed=failed
+                    )
+                else:
+                    await enrich_commits_with_stats(
+                        repo_client,
+                        records,
+                        coverage,
+                        gather=lambda coros: _gather_with_progress(coros, "Line stats"),
+                        failed=failed,
+                    )
+                commits.set_line_stats(
+                    (seq, r.additions, r.deletions, r.files_changed) for seq, r in batch if r.stats_fetched
                 )
-            else:
-                await enrich_commits_with_stats(
-                    repo_client,
-                    in_period,
-                    coverage,
-                    gather=lambda coros: _gather_with_progress(coros, "Line stats"),
-                )
+            if failed:
+                coverage.warn(stats_failure_note(failed))
 
         organizations = aggregate_organizations(
             repo_list, commits, prs, list(member_orgs.values())
@@ -869,7 +917,10 @@ def _project_summary(data: CollectedData, config: AppConfig) -> dict[str, object
     (e.g. an app and its admin panel); each of the tracked user's own
     repositories counts as a project of its own.
     """
-    contributed = {c.full_name for c in data.commits} | {p.full_name for p in data.pull_requests}
+    worked_in = data.commits.repositories() if isinstance(data.commits, CommitStore) else {
+        c.full_name for c in data.commits
+    }
+    contributed = worked_in | {p.full_name for p in data.pull_requests}
     repos = {r.full_name: r for r in data.repos}
     own = {login.lower() for login in config.target_logins} or {
         c.author_login.lower() for c in data.commits if c.author_login
@@ -1001,4 +1052,13 @@ def generate_outputs(
 def run(config: AppConfig) -> Statistics:
     """Synchronous entry point: collect then generate outputs."""
     data = asyncio.run(collect(config))
-    return generate_outputs(data, config)
+    try:
+        return generate_outputs(data, config)
+    finally:
+        close_commits(data)
+
+
+def close_commits(data: CollectedData) -> None:
+    """Delete the store file of ``data``'s commits (a list needs nothing)."""
+    if isinstance(data.commits, CommitStore):
+        data.commits.close()

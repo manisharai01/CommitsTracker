@@ -206,16 +206,22 @@ def _field(text: str, key: str) -> int:
 def memory_use() -> tuple[int, int] | None:
     """(bytes in use, limit) for this server — its container's memory cgroup,
     else the machine — or ``None`` where unknown (not Linux).
-    ``PDF_MEMORY_LIMIT_MB`` overrides the limit. In use leaves out inactive
-    file cache, which the kernel drops before it runs out of memory."""
+    ``PDF_MEMORY_LIMIT_MB`` overrides the limit.
+
+    In use leaves out the file cache (files read and written, such as a big
+    report's commit store), which the kernel drops or writes back before it
+    runs out of memory: counting it would stop a run that is in no danger.
+    Shared memory and tmpfs files are not file cache here, so they count."""
     used = limit = 0
-    for folder, usage_file, limit_file, inactive in (
-        ("/sys/fs/cgroup/", "memory.current", "memory.max", "inactive_file"),  # cgroup v2
-        ("/sys/fs/cgroup/memory/", "memory.usage_in_bytes", "memory.limit_in_bytes", "total_inactive_file"),
+    for folder, usage_file, limit_file, prefix in (
+        ("/sys/fs/cgroup/", "memory.current", "memory.max", ""),  # cgroup v2
+        ("/sys/fs/cgroup/memory/", "memory.usage_in_bytes", "memory.limit_in_bytes", "total_"),
     ):
         usage = _read(folder + usage_file).strip()
         if usage.isdigit():
-            used = max(int(usage) - _field(_read(folder + "memory.stat"), inactive), 0)
+            stat = _read(folder + "memory.stat")
+            cache = _field(stat, prefix + "active_file") + _field(stat, prefix + "inactive_file")
+            used = max(int(usage) - cache, 0)
             cap = _read(folder + limit_file).strip()  # "max", or a huge number: no limit
             limit = int(cap) if cap.isdigit() and int(cap) < 1 << 50 else 0
             break

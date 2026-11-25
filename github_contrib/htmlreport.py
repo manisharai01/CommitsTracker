@@ -469,7 +469,13 @@ svg.calsvg text { font-size:9px; fill:var(--muted); }
 .tltrack { position:relative; height:20px; }
 .tlaxis .tltrack { height:15px; }
 .tltick { position:absolute; top:0; bottom:0; border-left:1px dashed #d3dbe8; }
-.tllabel { position:absolute; top:0; padding-left:3px; font-size:10.5px; color:var(--muted); white-space:nowrap; }
+/* Each axis label owns the stretch up to the next label it can meet, and
+   never draws outside it: labels can't overlap or leave the page. Narrow
+   screens show every second, then every fourth, label. */
+.tllabel { position:absolute; top:0; box-sizing:border-box; padding-left:3px; font-size:10.5px;
+           color:var(--muted); white-space:nowrap; overflow:hidden; }
+@media screen and (max-width:700px) { .tll2 { display:none; } }
+@media screen and (max-width:480px) { .tll1 { display:none; } }
 .tlspan, .tlm { position:absolute; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
 .tlspan { top:9px; height:2px; background:#c3cee0; }
 .tlm { top:3px; height:14px; min-width:2px; border-radius:2px; }
@@ -979,8 +985,15 @@ def _timeline(t: Timeline) -> str:
             ticks.append((x(day), label))
         day = _month_after(day)
     grid = "".join(f"<div class='tltick' style='left:{left:.2f}%'></div>" for left, _label in ticks if left > 0)
+    # Levels: every 4th label is 0, every other 2nd is 1, the rest 2 (hidden
+    # on narrow screens, level 2 first). A label's box runs to the next
+    # label of its level or a lower one, so whatever is shown has its room.
+    shown = [(left, label, 0 if i % 4 == 0 else 1 if i % 2 == 0 else 2)
+             for i, (left, label) in enumerate(ticks) if left < 92]
     labels = "".join(
-        f"<div class='tllabel' style='left:{left:.2f}%'>{_esc(label)}</div>" for left, label in ticks if left < 92
+        f"<div class='tllabel tll{level}' style='left:{left:.2f}%;"
+        f"width:{next((x for x, _l, lv in shown[i + 1:] if lv <= level), 100.0) - left:.2f}%'>{_esc(label)}</div>"
+        for i, (left, label, level) in enumerate(shown)
     )
     peak = max((n for row in t.rows for n in row.by_month.values()), default=1)
     rows = [f"<div class='tlrow tlaxis'><div class='tlname'></div><div class='tltrack'>{labels}</div></div>"]
@@ -1559,10 +1572,16 @@ def _report_body(
     # card is written (within REPO_LIST_LIMIT and REPO_LISTS_BUDGET).
     source = stats.commits.source if isinstance(stats.commits, CommitTable) else []
     budget = REPO_LISTS_BUDGET
+    # Each repository gets an even share of what is left (smaller ones leave
+    # theirs to the rest), so every card lists its latest commits.
+    remaining = sum(1 for work in insights.repo_work if work.commits)
     for work in insights.repo_work:
-        limit = min(REPO_LIST_LIMIT, budget)
-        rows = [_list_row(c) for c in repo_commits(source, work.full_name, limit)] if limit and work.commits else []
-        budget -= len(rows)
+        rows: list[dict] = []
+        if work.commits:
+            limit = min(REPO_LIST_LIMIT, budget // remaining)
+            rows = [_list_row(c) for c in repo_commits(source, work.full_name, limit)] if limit else []
+            budget -= len(rows)
+            remaining -= 1
         yield _render_repo_card(work, rows, total=work.commits)
     yield "</section>"
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 from github_contrib import webapp  # noqa: E402
+from github_contrib.commitstore import STORE_PREFIX, STORE_SUFFIX  # noqa: E402
 from github_contrib.webapp import (  # noqa: E402
     CONSOLE_LOG,
     MANAGER,
@@ -100,6 +102,66 @@ def test_the_run_gets_a_deadline_before_the_hard_stop():
         asyncio.run(scenario(Path(tmp)))
 
 
+BUILDING_CLI = textwrap.dedent(
+    """
+    import os, sys, time
+    args = sys.argv[1:]
+    out = args[args.index("--output") + 1]
+    print("2026-10-06 10:00:00 | INFO    | github_contrib.report | Finished collection: 3 API requests", flush=True)
+    time.sleep(float(os.environ.get("BUILD_TIME", "3")))
+    with open(os.path.join(out, "contribution_summary.csv"), "w", encoding="utf-8-sig") as fh:
+        fh.write("metric,value\\ntotal_lifetime_commits,2\\n")
+    for name in ("report.html", "report.pdf"):
+        with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
+            fh.write("x")
+    """
+)
+
+
+def test_a_report_being_written_may_finish_past_the_time_limit():
+    async def scenario(tmp: Path, build_time: float, allowance: float) -> dict:
+        script = tmp / "building_cli.py"
+        script.write_text(BUILDING_CLI, encoding="utf-8")
+        app = create_app(Settings(jobs_dir=tmp / "runs", script=script, job_timeout=1.0))
+        original = webapp.BUILD_SECONDS
+        webapp.BUILD_SECONDS = allowance
+        os.environ["BUILD_TIME"] = str(build_time)
+        try:
+            async with TestClient(TestServer(app)) as client:
+                created = await client.post("/api/jobs", json=_payload("alice"))
+                return await _wait_until_finished(client, (await created.json())["id"])
+        finally:
+            webapp.BUILD_SECONDS = original
+            os.environ.pop("BUILD_TIME", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        job = asyncio.run(scenario(Path(tmp), build_time=2.5, allowance=30))
+        assert job["status"] == "done", job
+    with tempfile.TemporaryDirectory() as tmp:
+        job = asyncio.run(scenario(Path(tmp), build_time=30, allowance=1.5))
+        assert job["status"] == "failed" and "Writing the report took longer" in job["error"], job
+
+
+def test_a_stopped_run_leaves_no_commit_store_behind():
+    async def scenario(tmp: Path) -> None:
+        app = create_app(Settings(jobs_dir=tmp / "runs", script=_fake(tmp), job_timeout=1.0))
+        async with TestClient(TestServer(app)) as client:
+            created = await client.post("/api/jobs", json=_payload("slow"))
+            job_id = (await created.json())["id"]
+            folder = tmp / "runs" / job_id
+            for _ in range(50):
+                if folder.is_dir():
+                    break
+                await asyncio.sleep(0.05)
+            (folder / f"{STORE_PREFIX}abc{STORE_SUFFIX}").write_bytes(b"x" * 1000)
+            job = await _wait_until_finished(client, job_id)
+            assert job["status"] == "failed", job
+            assert not list(folder.glob(f"{STORE_PREFIX}*")), "the killed run's store was removed"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(scenario(Path(tmp)))
+
+
 def test_summary_page_is_served_for_save_as_pdf():
     async def scenario(tmp: Path) -> None:
         app = create_app(Settings(jobs_dir=tmp / "runs", script=_deadline_cli(tmp)))
@@ -157,6 +219,28 @@ def test_parallel_runs_fit_the_servers_memory():
         assert runs_that_fit(3) == 3 and runs_that_fit(0) == 1
     finally:
         webapp.memory_use = original
+
+
+def test_a_run_is_stopped_before_the_server_runs_out_of_memory():
+    async def scenario(tmp: Path) -> None:
+        settings = Settings(jobs_dir=tmp / "runs", script=_fake(tmp))
+        app = create_app(settings)
+        original, poll = webapp.memory_use, webapp.MEMORY_POLL_SECONDS
+        # 500 of 512 MB in use: within the guard's headroom.
+        webapp.memory_use = lambda: (500 * 2**20, 512 * 2**20)
+        webapp.MEMORY_POLL_SECONDS = 0.05
+        try:
+            async with TestClient(TestServer(app)) as client:
+                started = time.monotonic()
+                created = await client.post("/api/jobs", json=_payload("slow"))  # the fake run sleeps 30 s
+                job = await _wait_until_finished(client, (await created.json())["id"])
+                assert job["status"] == "failed" and "more memory" in job["error"], job
+                assert time.monotonic() - started < 15, "stopped at once, not after the run"
+        finally:
+            webapp.memory_use, webapp.MEMORY_POLL_SECONDS = original, poll
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asyncio.run(scenario(Path(tmp)))
 
 
 def test_expiry_tolerates_dates_without_a_zone_and_prunes_rate_limits():

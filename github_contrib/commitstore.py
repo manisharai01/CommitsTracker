@@ -36,6 +36,9 @@ _US = timedelta(microseconds=1)
 _SEC = timedelta(seconds=1)
 #: Rows read from SQLite per fetch while iterating.
 _FETCH = 2000
+#: The store's file name: ``.commits-<random>.sqlite``. A run that is killed
+#: leaves it behind, so whoever ran it can find and remove it.
+STORE_PREFIX, STORE_SUFFIX = ".commits-", ".sqlite"
 
 #: Why a row is left out of the report (0 = it is in it).
 KEPT, OWNER, PERIOD, SAME_SHA, REBASED, SQUASHED = 0, 1, 2, 3, 4, 5
@@ -68,6 +71,11 @@ def _us(moment: datetime | None) -> int | None:
     return None if moment is None else (moment - _EPOCH) // _US
 
 
+def micros(moment: datetime) -> int:
+    """An instant as the store keeps it: microseconds since 1970."""
+    return (moment - _EPOCH) // _US
+
+
 def _owner_key(full_name: str, owner: str) -> str:
     """Same as filters._owner_of."""
     if owner:
@@ -83,7 +91,7 @@ class CommitStore:
     """
 
     def __init__(self, directory: Path | str | None = None) -> None:
-        fd, name = tempfile.mkstemp(prefix="commits-", suffix=".sqlite", dir=directory)
+        fd, name = tempfile.mkstemp(prefix=STORE_PREFIX, suffix=STORE_SUFFIX, dir=directory)
         os.close(fd)
         self.path = Path(name)
         self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
@@ -136,14 +144,28 @@ class CommitStore:
         for c in records:
             batch.append(self._row(c, priority))
             if len(batch) >= _FETCH:
-                self._db.executemany(insert, batch)
+                self._many(insert, batch)
                 added += len(batch)
                 batch.clear()
         if batch:
-            self._db.executemany(insert, batch)
+            self._many(insert, batch)
             added += len(batch)
         self._count = None
         return added
+
+    def _many(self, sql: str, rows: Iterable[tuple]) -> None:
+        """``executemany`` as one transaction: the file is written once per
+        batch, not once per row (several times faster)."""
+        if self._db.in_transaction:
+            self._db.executemany(sql, rows)
+            return
+        self._db.execute("begin")
+        try:
+            self._db.executemany(sql, rows)
+        finally:
+            # Without a journal there is no rollback: keep what was written,
+            # as a statement-per-row insert would have.
+            self._db.execute("commit")
 
     @staticmethod
     def _row(c: CommitRecord, priority: int) -> tuple:
@@ -164,7 +186,7 @@ class CommitStore:
 
     def set_line_stats(self, updates: Iterable[tuple[int, int, int, int]]) -> None:
         """Line statistics for many rows: ``(seq, additions, deletions, files)``."""
-        self._db.executemany(
+        self._many(
             "update commits set additions = ?, deletions = ?, files_changed = ?, stats_fetched = 1 where seq = ?",
             [(a, d, f, seq) for seq, a, d, f in updates],
         )
@@ -239,6 +261,29 @@ class CommitStore:
             files_changed=files_changed, stats_fetched=bool(stats_fetched), parent_count=parent_count,
         )
 
+    def count_shas(self, where: str = "1", params: tuple = ()) -> int:
+        return self._db.execute(
+            f"select count(distinct sha) from commits where dropped = 0 and ({where})", params
+        ).fetchone()[0]
+
+    def batches_by_sha(
+        self, where: str = "1", params: tuple = (), size: int = 500
+    ) -> Iterator[list[tuple[int, CommitRecord]]]:
+        """Kept rows ``(seq, record)`` in batches of up to ``size`` SHAs, every
+        row of a SHA in the same batch. Each batch is read in full before it
+        is handed out, so the caller may update the rows meanwhile."""
+        last = ""
+        while True:
+            shas = [sha for (sha,) in self._db.execute(
+                f"select distinct sha from commits where dropped = 0 and sha > ? and ({where}) order by sha limit ?",
+                (last, *params, size),
+            )]
+            if not shas:
+                return
+            marks = ", ".join("?" * len(shas))
+            yield list(self.rows(f"sha in ({marks}) and ({where})", (*shas, *params), "sha, seq"))
+            last = shas[-1]
+
     def has(self, full_name: str, sha: str) -> bool:
         return self._db.execute(
             "select 1 from commits where full_name = ? and sha = ? and dropped = 0 limit 1", (full_name, sha)
@@ -246,6 +291,20 @@ class CommitStore:
 
     def repositories(self) -> set[str]:
         return {name for (name,) in self._db.execute("select distinct full_name from commits where dropped = 0")}
+
+    def count(self, where: str = "1", params: tuple = ()) -> int:
+        """Kept rows matching an SQL condition (counted without reading them)."""
+        return self._db.execute(
+            f"select count(*) from commits where dropped = 0 and ({where})", params
+        ).fetchone()[0]
+
+    def group_counts(self, *columns: str, where: str = "1") -> list[tuple]:
+        """``(value, ..., rows)`` for each distinct combination of ``columns``
+        among the kept rows (``where``: an extra condition)."""
+        names = ", ".join(columns)
+        return self._db.execute(
+            f"select {names}, count(*) from commits where dropped = 0 and ({where}) group by {names}"
+        ).fetchall()
 
     # -- the report's steps (see filters.prepare_report_data) ---------------
 
@@ -283,7 +342,7 @@ class CommitStore:
     def _load_repos(self, repos: Iterable[RepoRecord]) -> None:
         self._db.execute("drop table if exists temp.repo_info")
         self._db.execute("create temp table repo_info (full_name text primary key, is_fork integer, default_branch text)")
-        self._db.executemany(
+        self._many(
             "insert or replace into temp.repo_info values (?, ?, ?)",
             [(r.full_name, int(r.is_fork), r.default_branch) for r in repos],
         )
@@ -337,7 +396,7 @@ class CommitStore:
             return 0
         self._db.execute("drop table if exists temp.folded")
         self._db.execute("create temp table folded (full_name text, sha text)")
-        self._db.executemany("insert into temp.folded values (?, ?)", folded)
+        self._many("insert into temp.folded values (?, ?)", folded)
         return self._drop(SQUASHED, (
             "exists (select 1 from temp.folded f where f.full_name = commits.full_name and f.sha = commits.sha)"
         ))
@@ -352,10 +411,22 @@ def chronological(commits: Iterable[CommitRecord], skip: int = 0) -> Iterator[Co
     """Oldest first (undated last), ties in the original order; without the
     first ``skip``."""
     if isinstance(commits, CommitStore):
-        order = "authored_us is null, authored_us, seq"
-        if skip:
-            order += f" limit -1 offset {int(skip)}"
-        return commits.records(order=order)
+        # Undated last: their key is past every date.
+        key = "coalesce(authored_us, 9223372036854775807)"
+        order = f"{key}, seq"
+        kept = len(commits) - skip
+        if skip <= 0:
+            return commits.records(order=order)
+        if kept <= 0:
+            return iter(())
+        # Only the rows from the first one shown are sorted (not every
+        # commit, messages and all): that one is found sorting keys alone,
+        # keeping the latest ``kept`` of them.
+        first = commits._db.execute(
+            f"select {key}, seq from commits where dropped = 0 order by {key} desc, seq desc limit 1 offset ?",
+            (kept - 1,),
+        ).fetchone()
+        return commits.records(f"({key}, seq) >= (?, ?)", tuple(first), order)
     ordered = sorted(commits, key=lambda c: (c.authored_date is None, _us(c.authored_date) or 0))
     return iter(ordered[skip:])
 

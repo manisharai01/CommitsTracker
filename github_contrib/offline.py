@@ -211,10 +211,13 @@ def _load_collection_file(output_dir: Path) -> tuple[dict[str, Any], list[str]]:
     )
 
 
-def load_collected_from_csv(output_dir: Path) -> CollectedData:
-    """Load a previous run's CSVs back into a :class:`CollectedData`."""
-    # Commits go straight from the file into a store on disk: never all in memory.
-    commits = CommitStore()
+def load_collected_from_csv(output_dir: Path, store_dir: Path | None = None) -> CollectedData:
+    """Load a previous run's CSVs back into a :class:`CollectedData`.
+
+    The commits go straight from the file into a store on disk (in
+    ``store_dir``, else the system's temp folder): never all in memory. The
+    caller closes it (``report.close_commits``)."""
+    commits = CommitStore(store_dir)
     added = commits.add(_commit(row) for row in _iter_rows(output_dir / "commits.csv"))
     log.info("loaded %d row(s) from commits.csv", added)
     mappers: list[tuple[str, Any]] = [

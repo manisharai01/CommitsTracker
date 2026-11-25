@@ -7,12 +7,18 @@ FROM python:3.12-slim-trixie
 
 # PDF_NO_SANDBOX: Chromium can't use its sandbox inside a container (see
 # pdfexport.py). MPLCONFIGDIR: a writable cache for matplotlib's font list.
+# One maths thread (a container sees the host's CPUs, and each thread gets
+# its own buffers) and two malloc arenas keep a report run's memory small
+# and steady on a 512 MB instance.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PDF_NO_SANDBOX=1 \
-    MPLCONFIGDIR=/tmp/matplotlib
+    MPLCONFIGDIR=/tmp/matplotlib \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MALLOC_ARENA_MAX=2
 
 # Chromium's headless shell renders the PDF with far less memory than the
 # full browser (about 40% less); the fonts cover Latin text, symbols and

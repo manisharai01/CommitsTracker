@@ -238,6 +238,9 @@ CommitsTracker/
 │   ├── organizations.py        # org contribution aggregation
 │   ├── statistics.py           # pandas statistics
 │   ├── exporters.py            # CSV / Excel / text-report writers
+│   ├── xlsx.py                 # streaming Excel (.xlsx) writer: rows go straight to the file
+│   ├── commitstore.py          # the commits on disk (SQLite): memory stays flat for any number
+│   ├── fanout.py               # one read of the commits feeds every statistic
 │   ├── charts.py               # matplotlib charts + dashboard
 │   ├── insights.py             # deterministic work narrative + activity insights
 │   ├── analytics.py            # delivery, work mix, quarters, timeline, rhythm, reviews, stack
@@ -264,6 +267,7 @@ CommitsTracker/
 │   ├── test_reviews.py         # code reviews (fake GraphQL)
 │   ├── test_pdfexport.py       # PDF in parts, memory guard, incomplete parts
 │   ├── test_report_layout.py   # commit calendar, summary PDF page, streamed output
+│   ├── test_xlsx.py            # Excel writer: values, text safety, sheet splitting
 │   ├── test_collection_limits.py # rate limits, deadline, partial GraphQL failures
 │   ├── test_webapp_ops.py      # logs on disk, token-check limits, memory, deadline
 │   ├── test_auth.py            # sign-in, sessions, report history

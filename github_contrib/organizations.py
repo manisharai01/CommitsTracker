@@ -7,6 +7,9 @@ appear (with zero counts)."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
+from .commitstore import CommitStore
 from .logging_config import get_logger
 from .models import CommitRecord, OrgRecord, PullRequestRecord, RepoRecord
 
@@ -15,7 +18,7 @@ log = get_logger("organizations")
 
 def aggregate_organizations(
     repos: list[RepoRecord],
-    commits: list[CommitRecord],
+    commits: Iterable[CommitRecord],
     pull_requests: list[PullRequestRecord],
     member_orgs: list[OrgRecord],
 ) -> list[OrgRecord]:
@@ -43,12 +46,20 @@ def aggregate_organizations(
         repo_names.setdefault(login, set())
         return org
 
-    for commit in commits:
-        if not commit.organization:
-            continue
-        org = _record(commit.organization)
-        org.commit_count += 1
-        repo_names[commit.organization].add(commit.full_name)
+    if isinstance(commits, CommitStore):  # counted by the store, not read
+        for login, full_name, n in commits.group_counts(
+            "organization", "full_name", where="organization is not null and organization != ''"
+        ):
+            org = _record(login)
+            org.commit_count += n
+            repo_names[login].add(full_name)
+    else:
+        for commit in commits:
+            if not commit.organization:
+                continue
+            org = _record(commit.organization)
+            org.commit_count += 1
+            repo_names[commit.organization].add(commit.full_name)
 
     for pr in pull_requests:
         if not pr.organization:

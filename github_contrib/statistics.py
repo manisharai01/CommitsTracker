@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import heapq
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import pandas as pd
 
 from .analytics import WEEKDAYS, WORK_TYPES, Analytics
+from .fanout import fan_out
 from .logging_config import get_logger
 from .models import CollectedData, CommitRecord
 
@@ -152,22 +154,9 @@ def _object_frame(columns: dict[str, list]) -> pd.DataFrame:
     })
 
 
-def compute_statistics(data: CollectedData) -> Statistics:
-    """Compute every statistic table from collected data.
-
-    The commits are read in streaming passes that keep counts per
-    repository, year, month, weekday, email and the like: memory grows with
-    those, not with the number of commits.
-    """
-    prs_df = _records_to_df(data.pull_requests, _PR_COLS)
-    # A size that wasn't recorded stays blank (and recorded ones stay "12", not "12.0").
-    for column in ("additions", "deletions", "changed_files"):
-        prs_df[column] = pd.array(
-            [None if pd.isna(v) else int(v) for v in prs_df[column].tolist()], dtype="Int64"
-        )
-    repos_df = _records_to_df(data.repos, _REPO_COLS)
-    orgs_df = _records_to_df(data.organizations, _ORG_COLS)
-
+def _count_commits(commits: Iterable[CommitRecord]) -> tuple:
+    """Commits per repository, email, year, month and weekday, the first and
+    latest commit, and the count."""
     repo_counts: Counter[tuple[str, str]] = Counter()
     email_counts: Counter[str] = Counter()
     year_counts: Counter[int] = Counter()
@@ -176,7 +165,7 @@ def compute_statistics(data: CollectedData) -> Statistics:
     zone = None  # years, months and weekdays in the zone of the data (the first dated commit's)
     first_dt = last_dt = None
     n_commits = 0
-    for commit in data.commits:
+    for commit in commits:
         n_commits += 1
         repo_counts[(commit.full_name, commit.organization or "(personal)")] += 1
         email_counts[commit.author_email or "(unknown)"] += 1
@@ -193,6 +182,35 @@ def compute_statistics(data: CollectedData) -> Statistics:
         year_counts[local.year] += 1
         month_counts[f"{local.year:04d}-{local.month:02d}"] += 1
         weekday_counts[_WEEKDAY_NAMES[local.weekday()]] += 1
+    return repo_counts, email_counts, year_counts, month_counts, weekday_counts, first_dt, last_dt, n_commits
+
+
+def compute_statistics(data: CollectedData) -> Statistics:
+    """Compute every statistic table from collected data.
+
+    The commits are read in streaming passes that keep counts per
+    repository, year, month, weekday, email and the like: memory grows with
+    those, not with the number of commits.
+    """
+    prs_df = _records_to_df(data.pull_requests, _PR_COLS)
+    # A size that wasn't recorded stays blank (and recorded ones stay "12", not "12.0").
+    for column in ("additions", "deletions", "changed_files"):
+        prs_df[column] = pd.array(
+            [None if pd.isna(v) else int(v) for v in prs_df[column].tolist()], dtype="Int64"
+        )
+    repos_df = _records_to_df(data.repos, _REPO_COLS)
+    orgs_df = _records_to_df(data.organizations, _ORG_COLS)
+
+    # One read of the commits for every table (see fanout.py).
+    counts, by_org, per_user, lines_by_repo, top_commits, summary_tally = fan_out(data.commits, [
+        _count_commits,
+        lambda commits: _commits_prs_by_org(data, commits),
+        lambda commits: _per_user(data, commits),
+        _lines_by_repo,
+        _top_commits_by_impact,
+        _SummaryTally.of,
+    ])
+    repo_counts, email_counts, year_counts, month_counts, weekday_counts, first_dt, last_dt, n_commits = counts
 
     # -- commits per repository -------------------------------------------
     if n_commits:
@@ -240,24 +258,14 @@ def compute_statistics(data: CollectedData) -> Statistics:
     else:
         by_email = pd.DataFrame(columns=["author_email", "commits"])
 
-    # -- commits / PRs by organization ------------------------------------
-    by_org = _commits_prs_by_org(data)
-
     # -- top repositories --------------------------------------------------
     top_repos = per_repo.head(TOP_N_REPOS).reset_index(drop=True)
 
     # -- PR summary --------------------------------------------------------
     pr_summary = _pr_summary(prs_df)
 
-    # -- per-user breakdown ------------------------------------------------
-    per_user = _per_user(data)
-
-    # -- line-level impact tables ------------------------------------------
-    lines_by_repo = _lines_by_repo(data)
-    top_commits = _top_commits_by_impact(data)
-
     # -- headline summary --------------------------------------------------
-    summary_dict = _summary_dict(data, first_dt, last_dt)
+    summary_dict = _summary_dict(data, first_dt, last_dt, summary_tally)
     summary_df = pd.DataFrame(
         [{"metric": k, "value": v} for k, v in summary_dict.items()]
     )
@@ -348,14 +356,14 @@ def attach_analytics(stats: Statistics, analytics: Analytics) -> None:
     )
 
 
-def _commits_prs_by_org(data: CollectedData) -> pd.DataFrame:
+def _commits_prs_by_org(data: CollectedData, commits: Iterable[CommitRecord]) -> pd.DataFrame:
     counts: dict[str, dict[str, int]] = {}
 
     def bucket(org: str) -> dict[str, int]:
         key = org or "(personal)"
         return counts.setdefault(key, {"commits": 0, "prs": 0, "merged_prs": 0})
 
-    for commit in data.commits:
+    for commit in commits:
         bucket(commit.organization)["commits"] += 1
     for pr in data.pull_requests:
         b = bucket(pr.organization)
@@ -389,7 +397,7 @@ def _pr_summary(prs_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _per_user(data: CollectedData) -> pd.DataFrame:
+def _per_user(data: CollectedData, commits: Iterable[CommitRecord]) -> pd.DataFrame:
     users: dict[str, dict[str, object]] = {}
 
     def row(login: str) -> dict[str, object]:
@@ -406,7 +414,7 @@ def _per_user(data: CollectedData) -> pd.DataFrame:
             },
         )
 
-    for commit in data.commits:
+    for commit in commits:
         r = row(commit.author_login or "(unknown)")
         r["commits"] = int(r["commits"]) + 1  # type: ignore[arg-type]
         r["repositories"].add(commit.full_name)  # type: ignore[union-attr]
@@ -448,36 +456,55 @@ def _per_user(data: CollectedData) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("commits", ascending=False, ignore_index=True)
 
 
-def _summary_dict(data: CollectedData, first_dt, last_dt) -> dict[str, object]:
-    """The headline numbers (one streaming pass over the commits)."""
-    contributed_repos = {p.full_name for p in data.pull_requests}
-    contributed_orgs = {p.organization for p in data.pull_requests if p.organization}
+class _SummaryTally:
+    """What the headline numbers need from the commits (one read)."""
+
+    def __init__(self) -> None:
+        self.commits = self.additions = self.deletions = self.files_changed = self.measured = 0
+        self.repos: set[str] = set()
+        self.orgs: set[str] = set()
+        self.emails: set[str] = set()
+        self.authors: set[str] = set()
+
+    @classmethod
+    def of(cls, commits: Iterable[CommitRecord]) -> "_SummaryTally":
+        t = cls()
+        for c in commits:
+            t.commits += 1
+            t.repos.add(c.full_name)
+            if c.organization:
+                t.orgs.add(c.organization)
+            if c.author_email:
+                t.emails.add(c.author_email)
+            if c.author_login:
+                t.authors.add(c.author_login)
+            t.additions += c.additions
+            t.deletions += c.deletions
+            t.files_changed += c.files_changed
+            if c.stats_fetched and not c.is_merge:
+                t.measured += 1
+        return t
+
+
+def _summary_dict(data: CollectedData, first_dt, last_dt, tally: _SummaryTally | None = None) -> dict[str, object]:
+    """The headline numbers."""
+    if tally is None:
+        tally = _SummaryTally.of(data.commits)
+    contributed_repos = {p.full_name for p in data.pull_requests} | tally.repos
+    contributed_orgs = {p.organization for p in data.pull_requests if p.organization} | tally.orgs
     member_or_contrib_orgs = {o.login for o in data.organizations if o.login}
 
     merged = sum(1 for p in data.pull_requests if p.merged)
     open_prs = sum(1 for p in data.pull_requests if p.state == "open")
 
-    n_commits = total_additions = total_deletions = total_files_changed = measured = 0
-    emails: set[str] = set()
-    for c in data.commits:
-        n_commits += 1
-        contributed_repos.add(c.full_name)
-        if c.organization:
-            contributed_orgs.add(c.organization)
-        if c.author_email:
-            emails.add(c.author_email)
-        total_additions += c.additions
-        total_deletions += c.deletions
-        total_files_changed += c.files_changed
-        if c.stats_fetched and not c.is_merge:
-            measured += 1
+    n_commits, emails, measured = tally.commits, tally.emails, tally.measured
+    total_additions, total_deletions, total_files_changed = tally.additions, tally.deletions, tally.files_changed
     has_line_stats = total_additions > 0 or total_deletions > 0
 
     # The accounts the report covers - also those without work in the period -
     # else (older collections) whoever authored the work.
     targets = [str(login) for login in data.meta.get("target_logins") or [] if str(login).strip()]
-    authors = sorted({c.author_login for c in data.commits if c.author_login}
-                     | {p.author_login for p in data.pull_requests if p.author_login})
+    authors = sorted(tally.authors | {p.author_login for p in data.pull_requests if p.author_login})
     d: dict[str, object] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tracked_users": ", ".join(dict.fromkeys(targets) if targets else authors),
@@ -504,13 +531,14 @@ def _summary_dict(data: CollectedData, first_dt, last_dt) -> dict[str, object]:
     return d
 
 
-def _lines_by_repo(data: CollectedData) -> pd.DataFrame:
-    """Additions, deletions, net lines and files changed grouped by repository."""
+def _lines_by_repo(commits: Iterable[CommitRecord]) -> pd.DataFrame:
+    """Additions, deletions, net lines and files changed grouped by repository
+    (no rows when no commit has line counts)."""
     cols = ["full_name", "organization", "commits", "additions", "deletions", "net_lines", "files_changed"]
-    if not data.commits or not any(c.additions or c.deletions for c in data.commits):
-        return pd.DataFrame(columns=cols)
     buckets: dict[str, dict[str, object]] = {}
-    for c in data.commits:
+    any_lines = False
+    for c in commits:
+        any_lines = any_lines or bool(c.additions or c.deletions)
         key = c.full_name
         b = buckets.setdefault(key, {
             "full_name": key,
@@ -521,6 +549,8 @@ def _lines_by_repo(data: CollectedData) -> pd.DataFrame:
         b["additions"] = int(b["additions"]) + c.additions  # type: ignore[arg-type]
         b["deletions"] = int(b["deletions"]) + c.deletions  # type: ignore[arg-type]
         b["files_changed"] = int(b["files_changed"]) + c.files_changed  # type: ignore[arg-type]
+    if not any_lines:
+        return pd.DataFrame(columns=cols)
     rows = []
     for b in buckets.values():
         rows.append({**b, "net_lines": int(b["additions"]) - int(b["deletions"])})  # type: ignore[arg-type]
@@ -528,7 +558,7 @@ def _lines_by_repo(data: CollectedData) -> pd.DataFrame:
     return df.sort_values("additions", ascending=False, ignore_index=True)
 
 
-def _top_commits_by_impact(data: CollectedData, top: int = 20) -> pd.DataFrame:
+def _top_commits_by_impact(commits: Iterable[CommitRecord], top: int = 20) -> pd.DataFrame:
     """Top commits ranked by total lines changed (additions + deletions)."""
     cols = ["sha", "repository", "author_login", "authored_date",
             "additions", "deletions", "total_changes", "files_changed", "message_first_line", "url"]
@@ -536,7 +566,7 @@ def _top_commits_by_impact(data: CollectedData, top: int = 20) -> pd.DataFrame:
     # commit seen first): a min-heap on (size, -order) drops the smallest,
     # and of equal ones the latest.
     best: list[tuple[int, int, CommitRecord]] = []
-    for order, c in enumerate(data.commits):
+    for order, c in enumerate(commits):
         if not (c.additions or c.deletions):
             continue
         heapq.heappush(best, (c.additions + c.deletions, -order, c))

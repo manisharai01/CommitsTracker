@@ -261,6 +261,57 @@ def test_regen_for_a_period_rewrites_the_summary_csv():
         assert (out / "commits.csv").read_bytes() == before, "the collected data is left untouched"
 
 
+def test_store_orders_commits_as_a_list_would():
+    import random
+
+    from github_contrib.commitstore import CommitStore, chronological, repo_commits
+
+    rng = random.Random(5)
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    commits = [
+        _commit(f"{i:04x}", None if rng.random() < 0.1 else start + timedelta(hours=rng.randint(0, 50)), f"o/r{i % 3}")
+        for i in range(400)
+    ]
+    with CommitStore.from_records(commits) as store:
+        for skip in (0, 1, 5, 50, 199, 360, 399, 400, 450):
+            got = [c.sha for c in chronological(store, skip)]
+            assert got == [c.sha for c in chronological(commits, skip)], skip
+        for name in ("o/r0", "o/r1"):
+            for limit in (None, 1, 7):
+                got = [c.sha for c in repo_commits(store, name, limit)]
+                assert got == [c.sha for c in repo_commits(commits, name, limit)], (name, limit)
+
+
+def test_one_read_feeds_every_reader_the_same_commits():
+    from github_contrib.fanout import CHUNK, fan_out
+
+    items = list(range(CHUNK * 3 + 17))
+
+    def early(values):
+        for value in values:
+            if value == 5:
+                return "stopped"
+        return "never"
+
+    def broken(values):
+        for value in values:
+            if value == CHUNK + 1:
+                raise ValueError("reader failed")
+
+    assert fan_out(items, [sum, list, early, len_of]) == [sum(items), items, "stopped", len(items)]
+    try:
+        fan_out(items, [sum, broken, list])
+    except ValueError as exc:
+        assert "reader failed" in str(exc)
+    else:
+        raise AssertionError("a reader's error reaches the caller")
+    assert fan_out([], [list, sum]) == [[], 0]
+
+
+def len_of(values) -> int:
+    return sum(1 for _ in values)
+
+
 def _all_tests():
     return [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 

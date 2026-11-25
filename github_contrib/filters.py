@@ -267,6 +267,13 @@ def dedupe_contributions(
     return replace(data, commits=commits, organizations=organizations), result
 
 
+def _count(commits, where: str, keep) -> int:
+    """Commits matching an SQL condition (a store) or ``keep`` (a list)."""
+    if isinstance(commits, CommitStore):
+        return commits.count(where)
+    return sum(1 for c in commits if keep(c))
+
+
 def _log_dedupe(result: DedupeResult) -> None:
     if result.total:
         log.info(
@@ -359,10 +366,10 @@ def prepare_report_data(
         excluded=excluded,
         outside_period=outside,
         duplicates=duplicates,
-        merge_commits=sum(1 for c in data.commits if c.is_merge),
-        commits_without_line_stats=sum(
-            1 for c in data.commits if stats_requested and not c.is_merge and not c.stats_fetched
-        ),
+        merge_commits=_count(data.commits, "parent_count > 1", lambda c: c.is_merge),
+        commits_without_line_stats=_count(
+            data.commits, "parent_count <= 1 and stats_fetched = 0", lambda c: not c.is_merge and not c.stats_fetched
+        ) if stats_requested else 0,
         collection=collection,
         notes=list(data.notes),
     )

@@ -110,6 +110,8 @@ async def collect_commits_for_repo(
     author_emails: list[str] | None = None,
     coverage: Coverage | None = None,
     branches: list[str] | None = None,
+    store: Any = None,
+    priority: int = 0,
 ) -> list[CommitRecord]:
     """Collect commits authored by ``target_logins`` (and ``author_emails``) in ``repo``.
 
@@ -122,6 +124,11 @@ async def collect_commits_for_repo(
     from several branches is reported once, against the first branch scanned).
     ``branches`` names the branches to read (those GraphQL couldn't) instead
     of listing them all.
+
+    With a ``store`` (a :class:`~github_contrib.commitstore.CommitStore`) the
+    commits are written there as pages arrive - each branch scan under its
+    own priority from ``priority`` on, so the store keeps the same commit
+    for each SHA as the list would - and an empty list is returned.
     """
     coverage = coverage if coverage is not None else Coverage()
     if not branches:
@@ -167,6 +174,12 @@ async def collect_commits_for_repo(
             )
         return found
 
+    if store is not None:
+        await _scan_into_store(
+            client, repo, branches, author_keys, coverage, store, priority
+        )
+        return []
+
     seen: set[str] = set()
     results: list[CommitRecord] = []
 
@@ -190,6 +203,65 @@ async def collect_commits_for_repo(
     if results:
         log.debug("%s: %d commit(s) by tracked users", repo.full_name, len(results))
     return results
+
+
+async def _scan_into_store(
+    client: GitHubClient,
+    repo: RepoRecord,
+    branches: list[str],
+    author_keys: list[tuple[str, str]],
+    coverage: Coverage,
+    store: Any,
+    priority: int,
+) -> None:
+    """collect_commits_for_repo, writing to ``store`` 500 commits at a time."""
+
+    async def scan(author_key: str, fallback_login: str, branch: str, rank: int, skip_known: bool) -> None:
+        params = {"author": author_key, "sha": branch}
+        batch: list[CommitRecord] = []
+
+        def empty(status: int) -> None:
+            if status in _UNREADABLE:
+                coverage.warn(
+                    f"{repo.full_name}: GitHub answered {status} ({_UNREADABLE[status]}) for the commits "
+                    f"on '{branch}'; any contributions there are missing."
+                )
+
+        try:
+            async for payload in client.paginate(
+                f"/repos/{repo.full_name}/commits", params=params, on_empty=empty
+            ):
+                if not isinstance(payload, dict):
+                    continue
+                sha = str(payload.get("sha", ""))
+                # Other branches: the default branch's commits are already stored.
+                if sha and not (skip_known and store.has(repo.full_name, sha)):
+                    batch.append(_commit_from_payload(payload, repo, branch, fallback_login))
+                    if len(batch) >= 500:
+                        store.add(batch, rank)
+                        batch = []
+        except GitHubError as exc:
+            coverage.warn(
+                f"{repo.full_name}: commits by {author_key} on branch '{branch}' could not "
+                f"be fully read ({exc})."
+            )
+        finally:
+            if batch:
+                store.add(batch, rank)
+
+    first, others = branches[0], branches[1:]
+    rank = priority
+    jobs = []
+    for key, fallback in author_keys:
+        jobs.append(scan(key, fallback, first, rank, False))
+        rank += 1
+    await asyncio.gather(*jobs)
+    jobs = []
+    for key, fallback in author_keys:
+        for branch in others:
+            jobs.append(scan(key, fallback, branch, rank, True))
+            rank += 1
+    await asyncio.gather(*jobs)
 
 
 def _authored_by(payload: dict[str, Any], logins: set[str], emails: set[str]) -> bool:
@@ -265,6 +337,7 @@ async def enrich_commits_with_stats(
     coverage: Coverage | None = None,
     *,
     gather: Callable[[list[Awaitable[None]]], Awaitable[Any]] | None = None,
+    failed: list[str] | None = None,
 ) -> None:
     """Fill in additions / deletions / files changed (one request per commit).
 
@@ -272,7 +345,8 @@ async def enrich_commits_with_stats(
     work from the merged branch (often other people's), so counting it would
     inflate the line totals. The same SHA found in several repositories (a
     fork and its upstream) is fetched once. Failures are counted and reported
-    instead of silently leaving zeros.
+    instead of silently leaving zeros. ``failed`` collects the commits that
+    couldn't be measured instead (the caller notes them once, for every call).
     """
     coverage = coverage if coverage is not None else Coverage()
     fallback: GitHubClient | None = next(iter(repo_client.values()), None)
@@ -284,7 +358,8 @@ async def enrich_commits_with_stats(
         if commit.sha and not commit.is_merge:
             by_sha.setdefault(commit.sha, []).append(commit)
 
-    failed: list[str] = []
+    gathered = failed
+    failed = []
 
     async def _one(sha: str, group: list[CommitRecord]) -> None:
         first = group[0]
@@ -303,9 +378,16 @@ async def enrich_commits_with_stats(
 
     coros = [_one(sha, group) for sha, group in by_sha.items()]
     await (gather(coros) if gather is not None else asyncio.gather(*coros))
-    if failed:
-        sample = ", ".join(sorted(failed)[:5])
-        coverage.warn(
-            f"Line statistics could not be read for {len(failed)} commit(s) "
-            f"(e.g. {sample}); their added/deleted lines are not counted."
-        )
+    if gathered is not None:
+        gathered.extend(failed)
+    elif failed:
+        coverage.warn(stats_failure_note(failed))
+
+
+def stats_failure_note(failed: list[str]) -> str:
+    """The completeness note for commits whose lines couldn't be measured."""
+    sample = ", ".join(sorted(failed)[:5])
+    return (
+        f"Line statistics could not be read for {len(failed)} commit(s) "
+        f"(e.g. {sample}); their added/deleted lines are not counted."
+    )

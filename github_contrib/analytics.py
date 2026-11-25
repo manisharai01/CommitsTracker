@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+from .fanout import fan_out
 from .models import CollectedData, CommitRecord, PullRequestRecord, ReviewRecord
 
 # ---------------------------------------------------------------------------
@@ -927,17 +928,33 @@ class Stack:
         return sorted(chosen, key=lambda t: t.name not in CORE_FRAMEWORKS)  # stable: keeps the commit order
 
 
-def _stack(data: CollectedData) -> Stack | None:
+class _RepoCounts:
+    """Per repository: commits (in first-commit order) and the latest commit
+    day; per owner: commits; and the commit authors."""
+
+    def __init__(self, commits: Iterable[CommitRecord]) -> None:
+        self.commits_in: Counter[str] = Counter()
+        self.last_in: dict[str, date] = {}
+        self.owners: Counter[str] = Counter()
+        self.authors: set[str] = set()
+        for commit in commits:
+            self.commits_in[commit.full_name] += 1
+            self.owners[commit.owner.lower()] += 1
+            if commit.author_login:
+                self.authors.add(commit.author_login.lower())
+            if commit.authored_date:
+                day = commit.authored_date.date()
+                self.last_in[commit.full_name] = max(day, self.last_in.get(commit.full_name, day))
+
+
+def _stack(data: CollectedData, counts: _RepoCounts | None = None) -> Stack | None:
     """Languages and technologies across the repositories with commits, each
     weighted by the commits there (None when no repository was read)."""
     from .stack import CATEGORY_OF
 
-    commits_in: Counter[str] = Counter(c.full_name for c in data.commits)
-    last_in: dict[str, date] = {}
-    for commit in data.commits:
-        if commit.authored_date:
-            day = commit.authored_date.date()
-            last_in[commit.full_name] = max(day, last_in.get(commit.full_name, day))
+    if counts is None:
+        counts = _RepoCounts(data.commits)
+    commits_in, last_in = counts.commits_in, counts.last_in
     repos = {r.full_name: r for r in data.repos}
     read = [repos[name] for name in commits_in if name in repos and repos[name].stack_read]
     if not read:
@@ -1138,25 +1155,32 @@ def compute_analytics(
     end = period_end or now  # what the data covers up to
     period = (start.date() if start else None, period_end.date() if period_end else None)
 
-    tracked = {str(login).lower() for login in data.meta.get("target_logins") or []}
-    tracked |= {c.author_login.lower() for c in commits if c.author_login}
-    team = sum(1 for c in commits if c.owner.lower() not in tracked)
+    # One read of the commits for every analytic (see fanout.py).
+    work_mix, rhythm, quarters, footprint, timeline, calendar, counts = fan_out(commits, [
+        _work_mix,
+        lambda cs: _rhythm(cs, *period),
+        lambda cs: _quarters(cs, prs, start.date() if start else None, end.date() if end else None, data.reviews),
+        _footprint,
+        lambda cs: _timeline(cs, period[1]),
+        lambda cs: _commit_calendar(cs, *period),
+        _RepoCounts,
+    ])
+    tracked = {str(login).lower() for login in data.meta.get("target_logins") or []} | counts.authors
+    team = sum(n for owner, n in counts.owners.items() if owner not in tracked)
 
     analytics = Analytics(
-        work_mix=_work_mix(commits),
+        work_mix=work_mix,
         delivery=_delivery(prs),
-        rhythm=_rhythm(commits, *period),
-        quarters=_quarters(
-            commits, prs, start.date() if start else None, end.date() if end else None, data.reviews
-        ),
-        footprint=_footprint(commits),
-        repositories=len({c.full_name for c in commits}),
+        rhythm=rhythm,
+        quarters=quarters,
+        footprint=footprint,
+        repositories=len(counts.commits_in),
         team_share=_pct(team, len(commits)),
         highlights=[],
-        stack=_stack(data),
+        stack=_stack(data, counts),
         reviews=_reviews(data),
-        timeline=_timeline(commits, period[1]),
-        commit_calendar=_commit_calendar(commits, *period),
+        timeline=timeline,
+        commit_calendar=calendar,
         merged_after=sum(
             1 for p in prs
             if p.merged and p.merged_at and end is not None and p.merged_at.date() > end.date()

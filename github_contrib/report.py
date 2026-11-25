@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import zlib
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
@@ -33,9 +34,9 @@ import aiohttp
 
 from . import graphql
 from .analytics import compute_analytics
-from .client import GitHubClient, GitHubError
+from .client import DeadlineError, GitHubClient, GitHubError
 from .commits import collect_commits_for_repo, collect_pr_commits, enrich_commits_with_stats
-from .config import AppConfig
+from .config import AppConfig, run_deadline
 from .discovery import (
     SEARCH_END,
     SEARCH_START,
@@ -48,7 +49,7 @@ from .discovery import (
     merge_repositories,
     search_pull_requests,
 )
-from .exporters import export_csvs, export_excel, export_summary_report
+from .exporters import SUMMARY_CSV, export_csvs, export_excel, export_summary_report
 from .filters import ReportScope, prepare_report_data
 from .htmlreport import export_reports
 from .insights import compute_insights
@@ -88,12 +89,27 @@ def _tqdm():
         return None
 
 
+#: The one note a run cut short by its time limit gets (whatever it was reading).
+TIME_LIMIT_NOTE = (
+    "Collection stopped at the run's time limit, so some repositories, pull requests or line "
+    "statistics were not read and this report is missing their contributions. A shorter time "
+    "range, or turning off line-level stats, makes a run faster."
+)
+
+
+def _note_failure(exc: BaseException, label: str, coverage: Coverage) -> None:
+    if isinstance(exc, DeadlineError):
+        coverage.warn(TIME_LIMIT_NOTE)
+    else:
+        coverage.warn(f"Collection failed for {label}: {exc}")
+
+
 async def _guard(coro: Awaitable[list], label: str, coverage: Coverage) -> list:
     """Run ``coro``; an unexpected failure becomes a completeness note, never a crash."""
     try:
         return await coro
     except Exception as exc:  # noqa: BLE001 - one repo must never abort the run
-        coverage.warn(f"Collection failed for {label}: {exc}")
+        _note_failure(exc, label, coverage)
         return []
 
 
@@ -217,7 +233,10 @@ async def _check_unlinked_commits(
                 f"/repos/{repo.full_name}/commits", params={"per_page": UNLINKED_SAMPLE}
             )
         except Exception as exc:  # noqa: BLE001 - a check that fails is a note, never the end of the run
-            coverage.warn(f"{repo.full_name}: could not check it for commits that weren't counted ({exc}).")
+            if isinstance(exc, DeadlineError):
+                coverage.warn(TIME_LIMIT_NOTE)
+            else:
+                coverage.warn(f"{repo.full_name}: could not check it for commits that weren't counted ({exc}).")
             return
         items = items if isinstance(items, list) else []  # empty repository: nothing to count
         sample = f" of its latest {len(items)}" if len(items) >= UNLINKED_SAMPLE else ""
@@ -407,6 +426,14 @@ async def collect(config: AppConfig) -> CollectedData:
     semaphore = asyncio.Semaphore(config.concurrency)
     started = datetime.now(timezone.utc)
     start, end = _search_window(config)
+    deadline = run_deadline()
+
+    def out_of_time() -> bool:
+        """Past the run's deadline: the remaining phases are skipped (one note)."""
+        if deadline is not None and time.time() >= deadline:
+            coverage.warn(TIME_LIMIT_NOTE)
+            return True
+        return False
 
     async with AsyncExitStack() as stack:
         clients: dict[str, GitHubClient] = {}
@@ -425,6 +452,7 @@ async def collect(config: AppConfig) -> CollectedData:
                 per_page=config.per_page,
                 request_timeout=config.request_timeout,
                 coverage=coverage,
+                deadline=deadline,
             )
         # Accounts sharing a token (e.g. several logins using one sign-in
         # token) see the same repositories: list and search with it once.
@@ -470,40 +498,64 @@ async def collect(config: AppConfig) -> CollectedData:
                             await discover_org_repos(client, org.login, account.login, coverage),
                         )
             except Exception as exc:  # noqa: BLE001 - keep what was found
-                coverage.warn(
-                    f"[{account.login}] repository discovery did not complete ({exc}); "
-                    "repositories it would have listed may be missing."
-                )
+                if isinstance(exc, DeadlineError):
+                    coverage.warn(TIME_LIMIT_NOTE)
+                else:
+                    coverage.warn(
+                        f"[{account.login}] repository discovery did not complete ({exc}); "
+                        "repositories it would have listed may be missing."
+                    )
 
-        await _add_manual_includes(readers, config, repos, member_orgs, coverage)
+        try:
+            await _add_manual_includes(readers, config, repos, member_orgs, coverage)
+        except Exception as exc:  # noqa: BLE001 - the requested extras are a part, not the run
+            _note_failure(exc, "the requested extra repositories and organizations", coverage)
 
         # --- search: upstream projects with commits or pull requests ---------
+        # Each token has its own search budget (30 a minute): they search at once.
         use_graphql = config.use_graphql
         pr_hits: dict[tuple[str, int], tuple[str, dict]] = {}
-        if config.use_search_discovery:
-            for login, client in readers.items():
-                names = await discover_repos_via_search(
-                    client, config.target_logins, config.author_emails, start, end, coverage
-                )
-                if config.collect_prs and not use_graphql:
+
+        async def search_with(login: str, client: GitHubClient, *, commits: bool, prs: bool) -> set[str]:
+            names: set[str] = set()
+            try:
+                if commits:
+                    names |= await discover_repos_via_search(
+                        client, config.target_logins, config.author_emails, start, end, coverage
+                    )
+                if prs:
                     names |= await _search_prs(client, login, config, end, coverage, pr_hits)
-                await _add_found_repos(client, login, names, repos, coverage)
+            except Exception as exc:  # noqa: BLE001 - search only adds repositories
+                _note_failure(exc, f"the repository search of {login}", coverage)
+            return names
+
+        async def search_all_readers(*, commits: bool, prs: bool) -> None:
+            found = await asyncio.gather(
+                *(search_with(login, client, commits=commits, prs=prs) for login, client in readers.items())
+            )
+            for (login, client), names in zip(readers.items(), found):
+                try:
+                    await _add_found_repos(client, login, names, repos, coverage)
+                except Exception as exc:  # noqa: BLE001
+                    _note_failure(exc, "repositories found by search", coverage)
+
+        if config.use_search_discovery and not out_of_time():
+            await search_all_readers(commits=True, prs=config.collect_prs and not use_graphql)
 
         # --- pull requests through GraphQL: each user's own list ------------
         # It covers private repositories and upstream projects alike, so it
         # replaces both listing every repository's pull requests and the
         # pull-request search (used again below if GraphQL fails).
         graph_prs: graphql.PullRequestData | None = None
-        if config.collect_prs and use_graphql:
+        if config.collect_prs and use_graphql and not out_of_time():
             graph_prs = await graphql.collect_pull_requests(
-                readers, config.target_logins, inflight=config.concurrency
+                readers, config.target_logins, inflight=config.concurrency,
+                author_emails=config.author_emails, coverage=coverage,
             )
             if graph_prs is None:
                 log.info("Pull requests could not be listed through GraphQL; using the REST API.")
-                if config.use_search_discovery:
-                    for login, client in readers.items():
-                        names = await _search_prs(client, login, config, end, coverage, pr_hits)
-                        await _add_found_repos(client, login, names, repos, coverage)
+                if config.use_search_discovery and not out_of_time():
+                    await search_all_readers(commits=False, prs=True)
             else:
                 for full, found in graph_prs.repos.items():
                     known = repos.get(full)
@@ -527,8 +579,8 @@ async def collect(config: AppConfig) -> CollectedData:
 
         # --- commits ------------------------------------------------------
         commits: list[CommitRecord] = []
-        if config.collect_commits and scan_repos:
-            rest_repos = scan_repos
+        if config.collect_commits and scan_repos and not out_of_time():
+            rest_work: list[tuple[RepoRecord, list[str] | None]] = [(repo, None) for repo in scan_repos]
             if use_graphql:
                 found = await graphql.collect_commits(
                     scan_repos,
@@ -537,15 +589,17 @@ async def collect(config: AppConfig) -> CollectedData:
                     config.author_emails,
                     scan_all_branches=config.scan_all_branches,
                     inflight=config.concurrency,
+                    since=config.since,
+                    coverage=coverage,
                 )
                 if found is None:
                     log.info("Commits could not be read through GraphQL; using the REST API.")
                 else:
-                    commits, rest_repos = found
-                    if rest_repos:
+                    commits, rest_work = found
+                    if rest_work:
                         log.info(
-                            "%d repo(s) could not be read through GraphQL; using the REST API for them.",
-                            len(rest_repos),
+                            "%d repo(s) could not be (fully) read through GraphQL; using the REST API for them.",
+                            len(rest_work),
                         )
             coros = [
                 _guard(
@@ -556,11 +610,12 @@ async def collect(config: AppConfig) -> CollectedData:
                         scan_all_branches=config.scan_all_branches,
                         author_emails=config.author_emails or None,
                         coverage=coverage,
+                        branches=branches,
                     ),
                     repo.full_name,
                     coverage,
                 )
-                for repo in rest_repos
+                for repo, branches in rest_work
             ]
             for batch in await _gather_with_progress(coros, "Commits"):
                 commits.extend(batch)
@@ -571,7 +626,7 @@ async def collect(config: AppConfig) -> CollectedData:
         prs: list[PullRequestRecord] = []
         if config.collect_prs and scan_repos and graph_prs is not None:
             prs = [pr for pr in graph_prs.prs if pr.full_name in scan_by_name]
-        elif config.collect_prs and scan_repos:
+        elif config.collect_prs and scan_repos and not out_of_time():
             listed = [r for r in scan_repos if r.affiliated]
             listed_names = {r.full_name for r in listed}
             coros: list[Awaitable[list]] = [
@@ -601,7 +656,7 @@ async def collect(config: AppConfig) -> CollectedData:
         log.info("collected %d pull request(s)", len(prs))
 
         # --- commits that live only in pull requests ----------------------
-        if config.collect_commits and config.scan_all_branches and prs:
+        if config.collect_commits and config.scan_all_branches and prs and not out_of_time():
             present = {(c.full_name, c.sha) for c in commits}
             # A pull request last updated before the period cannot hold
             # commits authored inside it.
@@ -641,27 +696,27 @@ async def collect(config: AppConfig) -> CollectedData:
 
         # --- the accounts' own repos: commits no account is linked to ------
         unlinked: list[dict[str, Any]] = []
-        if config.collect_commits and scan_repos:
+        if config.collect_commits and scan_repos and not out_of_time():
             unlinked = await _check_unlinked_commits(scan_repos, commits, config, client_for, coverage)
 
         # --- technologies of the repositories with commits (never fatal) ----
         worked_in = {c.full_name for c in commits}
         stack_repos = [r for r in scan_repos if r.full_name in worked_in]
-        if stack_repos:
+        if stack_repos and not out_of_time():
             unread = await collect_stacks(stack_repos, client_for, inflight=config.concurrency)
             if unread:
                 log.info("technologies of %d repositor(ies) could not be read", unread)
 
         # --- code reviews given on other people's pull requests ------------
         reviews: list[ReviewRecord] = []
-        if config.collect_prs:
+        if config.collect_prs and not out_of_time():
             reviews = await collect_reviews(
                 clients, config.target_logins, since=config.since, until=config.until,
                 coverage=coverage, inflight=config.concurrency,
             )
 
         # --- line-level stats (one request per commit in the period) ------
-        if config.fetch_commit_stats and commits:
+        if config.fetch_commit_stats and commits and not out_of_time():
             in_period = [c for c in commits if _in_period(c.authored_date, config)]
             repo_client: dict[str, GitHubClient] = {
                 repo.full_name: client_for(repo) for repo in repo_list
@@ -762,6 +817,22 @@ def _period_notes(data: CollectedData, config: AppConfig) -> list[str]:
     if collected_until and (config.until is None or config.until > collected_until):
         notes.append(
             f"The data was collected up to {data.meta['until'][:10]} only; later work "
+            "is not in this report. Collect again to cover the full period."
+        )
+    collected_at = parse_github_datetime(str(data.meta.get("collected_at") or ""))
+    zone = config.tz or timezone.utc
+    collected_day = collected_at.astimezone(zone).date() if collected_at else None
+    if (
+        collected_day
+        and not collected_until
+        and config.until is not None
+        and config.until.astimezone(zone).date() > collected_day
+        and collected_day < datetime.now(zone).date()  # rebuilt on a later day (--regen)
+    ):
+        # A report rebuilt later (--regen) for a period that runs past the day
+        # its data was collected: anything after that day is not in it.
+        notes.append(
+            f"The data was collected on {collected_at.date().isoformat()}; work after that day "
             "is not in this report. Collect again to cover the full period."
         )
     return notes
@@ -880,8 +951,18 @@ def generate_outputs(
 
     if export_source_csvs:
         export_csvs(config.output_dir, stats)
-    export_excel(config.output_dir, stats)
-    export_summary_report(config.output_dir, stats)
+    else:
+        # The summary isn't collected data: it must match this report (a
+        # --regen for a period would otherwise leave the old numbers in it).
+        export_csvs(config.output_dir, stats, only=(SUMMARY_CSV,))
+    # The workbook and the text summary are outputs among others: a failure in
+    # one of them must never cost the user the report itself.
+    for write, what in ((export_excel, "Excel workbook"), (export_summary_report, "text summary")):
+        try:
+            write(config.output_dir, stats)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("The %s could not be written (%s); the other outputs are complete.", what, exc)
+            log.info("Details:", exc_info=True)
 
     if config.make_charts:
         try:
@@ -902,8 +983,13 @@ def generate_outputs(
             include_charts=config.make_charts,
             scope=scope,
         )
-    except Exception as exc:  # noqa: BLE001 - reports are non-fatal
-        log.warning("Report generation failed (continuing): %s", exc)
+    except Exception:
+        # The report is the run's result: never leave an earlier run's report
+        # in its place (it would be served, printed and shared as this one).
+        for name in ("report.html", "report.md", "summary.html", "report.pdf"):
+            (config.output_dir / name).unlink(missing_ok=True)
+        log.error("The HTML report could not be written; no report was produced.")
+        raise
 
     # A LinkedIn-ready draft built from the same numbers.
     post = build_linkedin_post(stats.summary_dict)

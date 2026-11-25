@@ -417,7 +417,7 @@ code { font: 12px/16px var(--mono); padding: 1px 4px; border-radius: 4px; backgr
 .panel-item span { color: var(--muted); font-size: 13px; line-height: 16px; }
 .panel-link { display: block; padding: 16px; transition: background-color 0.2s; }
 .panel-link:hover { background: var(--hover); text-decoration: none; }
-.sidebar-footer { margin: 0; padding: 0 16px; color: var(--muted); font-size: 13px; line-height: 16px; }
+.sidebar-footer { margin: 0; padding: 0 16px; color: var(--muted); font-size: 13px; line-height: 16px; overflow-wrap: anywhere; }
 
 /* ---------- toast ---------- */
 

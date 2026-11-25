@@ -115,6 +115,21 @@ class AppConfig:
 #: run only ever sees the token its user typed in).
 NO_DOTENV_ENV = "GITHUB_CONTRIB_NO_DOTENV"
 
+#: When a run must stop collecting (Unix seconds): the hosted web UI sets it
+#: from its time limit. Past it, nothing more is requested from GitHub (no
+#: waiting for a rate limit either) and the report is written from what was
+#: read, with a completeness note saying what is missing.
+DEADLINE_ENV = "REPORT_DEADLINE"
+
+
+def run_deadline() -> float | None:
+    """The run's collection deadline (:data:`DEADLINE_ENV`), or None."""
+    try:
+        value = float(os.environ.get(DEADLINE_ENV) or 0)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 def _maybe_load_dotenv() -> None:
     """Populate ``os.environ`` from a local ``.env`` file if python-dotenv is

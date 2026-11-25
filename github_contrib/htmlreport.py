@@ -14,7 +14,9 @@ from __future__ import annotations
 import base64
 import html
 import math
-from datetime import date, datetime
+import os
+from collections.abc import Iterable, Iterator
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +26,8 @@ from .analytics import (
     WEEKDAYS,
     WORK_TYPES,
     Analytics,
+    CalendarGrid,
+    CommitCalendar,
     Rhythm,
     TechUse,
     Timeline,
@@ -33,8 +37,9 @@ from .analytics import (
 from .filters import ReportScope
 from .insights import ExecSummary, Insights, RepoWork, build_exec_summary
 from .logging_config import get_logger
-from .reportscript import REPORT_CSP, SCRIPT, SCRIPT_HASH  # noqa: F401 - SCRIPT_HASH re-exported
-from .statistics import Statistics
+from .reportscript import REPORT_CSP, SCRIPT, SCRIPT_HASH, SUMMARY_FILE  # noqa: F401 - SCRIPT_HASH re-exported
+from .commitstore import chronological, repo_commits
+from .statistics import CommitTable, Statistics
 
 log = get_logger("htmlreport")
 
@@ -62,23 +67,26 @@ def _metric_pairs(
 ) -> list[tuple[str, object]]:
     ins = insights.to_summary_dict()
     commits_label = "Commits in period" if scope is not None and scope.has_period else "Lifetime commits"
+    # A run without pull requests says so, rather than showing 0 of them.
+    prs_read = scope is None or scope.collection.get("collect_prs", True) is not False
     pairs: list[tuple[str, object]] = [
         (commits_label, summary.get("total_lifetime_commits", 0)),
-        ("Pull requests", summary.get("total_pull_requests", 0)),
-        ("Merged PRs", summary.get("merged_pull_requests", 0)),
+        ("Pull requests", summary.get("total_pull_requests", 0) if prs_read else "not collected"),
+        ("Merged PRs", summary.get("merged_pull_requests", 0) if prs_read else "not collected"),
         ("Repos contributed", summary.get("repositories_contributed_to", 0)),
         ("Organizations", summary.get("organizations_contributed_to", 0)),
         ("Active days", ins.get("active_days", 0)),
         ("Longest streak (days)", ins.get("longest_daily_streak", 0)),
         ("Avg commits / active week", ins.get("avg_commits_per_active_week", 0)),
     ]
-    if summary.get("total_lines_added"):
+    # Present whenever lines were counted - also when a period only deleted code.
+    if "total_lines_added" in summary:
         added = int(summary["total_lines_added"])  # type: ignore[arg-type]
         deleted = int(summary.get("total_lines_deleted", 0))  # type: ignore[arg-type]
         pairs += [
             ("Lines added", f"+{added:,}"),
             ("Lines deleted", f"−{deleted:,}"),
-            ("Net lines", f"{int(summary.get('net_lines', 0)):+,}"),  # type: ignore[arg-type]
+            ("Net lines", f"{int(summary.get('net_lines', 0)):+,}".replace("-", "−")),  # type: ignore[arg-type]
             ("Files touched", f"{int(summary.get('total_files_changed', 0)):,}"),  # type: ignore[arg-type]
         ]
     if summary.get("merge_commits"):
@@ -158,7 +166,8 @@ def method_items(scope: ReportScope | None) -> list[str]:
     return items
 
 
-def _render_completeness(scope: ReportScope | None) -> str:
+def _render_completeness(scope: ReportScope | None, limit: int | None = None) -> str:
+    """The data-completeness notes (the first ``limit`` of them, when given)."""
     if scope is None:
         return ""
     if not scope.notes:
@@ -166,7 +175,11 @@ def _render_completeness(scope: ReportScope | None) -> str:
             "<section id='completeness'><h2>Data completeness</h2>"
             "<p class='note'>No gaps detected: every repository, branch and request was read successfully.</p></section>"
         )
-    items = "".join(f"<li>{_esc(note)}</li>" for note in scope.notes)
+    notes = scope.notes[:limit] if limit else scope.notes
+    items = "".join(f"<li>{_esc(note)}</li>" for note in notes)
+    more = len(scope.notes) - len(notes)
+    if more:
+        items += f"<li>{_plural(more, 'more note')} in the full report.</li>"
     return (
         "<section id='completeness'><h2>Data completeness</h2>"
         "<div class='gaps'><p><strong>Some data could not be read, so this report may be "
@@ -213,10 +226,7 @@ def render_markdown(
     out.append(f"**Users:** {summary.get('tracked_users', '')}  ")
     out.append(f"**Period:** {period_text(scope)}  ")
     out.append(f"**Generated:** {_fmt_date(summary.get('generated_at'))}  ")
-    out.append(
-        f"**Activity:** {_fmt_date(summary.get('first_contribution_date'))} "
-        f"→ {_fmt_date(summary.get('latest_contribution_date'))}\n"
-    )
+    out.append(f"**Activity:** {activity_text(summary)}\n")
 
     out.append("## At a glance\n")
     for label, value in _metric_pairs(summary, insights, scope):
@@ -393,10 +403,11 @@ details.commitlist .ldel { color:#b3261e; }
 button.toggle { background:var(--card); color:var(--accent); border:1px solid var(--line); border-radius:8px; padding:6px 14px; font-size:13px; cursor:pointer; }
 button.toggle:hover { background:#eef2f9; }
 /* Repository dashboard */
-.dash td.dname { font-weight:600; white-space:nowrap; }
+.dash td.dname { font-weight:600; overflow-wrap:anywhere; min-width:9em; }
 .dash td.dnum { text-align:right; font-weight:700; color:var(--accent); white-space:nowrap; }
 .dash td.dshare { text-align:right; color:var(--muted); white-space:nowrap; }
-.dash td.dbarcell { width:34%; min-width:140px; }
+.dash td.dbarcell { width:22%; min-width:80px; }
+.dash tr.more td { color:var(--muted); font-style:italic; }
 .dash .dbar { height:14px; border-radius:4px; background:linear-gradient(90deg,var(--accent),var(--accent2));
               min-width:3px; print-color-adjust:exact; -webkit-print-color-adjust:exact; }
 .dash td.dmeta { color:var(--muted); font-size:12.5px; white-space:nowrap; }
@@ -412,8 +423,14 @@ button.toggle:hover { background:#eef2f9; }
 .atable h4, .shipped h4 { margin:0 0 6px; font-size:13.5px; color:var(--muted); font-weight:600; }
 table.bars { font-size:13px; }
 table.bars td { padding:5px 10px; }
-table.bars td.alabel, table.bars td.anum, table.bars td.ashare { white-space:nowrap; width:1%; }
+/* Long repository names wrap instead of widening the table past the page. */
+table.bars td.alabel { overflow-wrap:anywhere; }
+table.bars td.abarcell { width:38%; min-width:48px; }
+table.bars td.anum, table.bars td.ashare { white-space:nowrap; width:1%; }
 table.bars td.anum, table.bars td.ashare, .abig td.anum { text-align:right; white-space:nowrap; }
+.abig td.dname { overflow-wrap:anywhere; white-space:normal; }
+/* Grid items may shrink below their content's width (tables then wrap). */
+.cards > *, .agrid > *, .shipped > *, .charts > * { min-width:0; }
 table.bars td.ashare { color:var(--muted); }
 .abar { height:12px; border-radius:4px; background:linear-gradient(90deg,var(--accent),var(--accent2));
         print-color-adjust:exact; -webkit-print-color-adjust:exact; }
@@ -431,6 +448,17 @@ table.heat th { background:none; color:var(--muted); font-weight:500; font-size:
 table.heat th.day { width:36px; }
 table.heat td { height:18px; padding:0; border:none; border-radius:3px; background:#eef2f8;
                 print-color-adjust:exact; -webkit-print-color-adjust:exact; }
+/* Commit calendar (GitHub style): SVG grids that scale as a whole */
+.calendar .cal { margin:8px 0 12px; break-inside:avoid; }
+.cal-head { font-size:12.5px; color:var(--muted); margin:0 0 4px; }
+.cal-head b { color:var(--ink); font-weight:600; margin-right:8px; }
+svg.calsvg { display:block; width:100%; height:auto; }
+svg.calsvg text { font-size:9px; fill:var(--muted); }
+.q0 { fill:#ebeff5; } .q1 { fill:#c3d1ea; } .q2 { fill:#8aa4d3; } .q3 { fill:#5574b3; } .q4 { fill:#28487f; }
+.cal-legend { display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:11.5px; color:var(--muted); }
+.cal-legend svg { width:62px; height:10px; flex:none; }
+.cal-legend .cal-shades { margin-left:8px; }
+.heatwrap { overflow-x:auto; }
 .tl { margin-top:6px; }
 .tlrow { display:grid; grid-template-columns:minmax(140px,28%) 1fr; gap:12px; align-items:center;
          padding:5px 0; border-bottom:1px solid var(--line); }
@@ -459,14 +487,16 @@ table.heat td { height:18px; padding:0; border:none; border-radius:3px; backgrou
      text, and long values wrap. */
   .table-scroll { overflow:visible; }
   table { font-size:11.5px; }
-  th, td { padding:6px 8px; overflow-wrap:break-word; }
+  th, td { padding:6px 8px; overflow-wrap:anywhere; }
   .dash { font-size:11.5px; }
   .dash th, .dash td { padding:6px 8px; }
   .dash td.dbarcell { width:16%; min-width:0; }
   .dash td.dname, .dash td.dmeta { white-space:normal; overflow-wrap:break-word; }
   .dash td.dmeta { font-size:11px; }
   .card, .charts figure, .exec .proj, tr { break-inside:avoid; }
-  .atable, .shipped .sq, #analytics .cards, .tlrow, .tlwrap { break-inside:avoid; }
+  .atable, .shipped .sq, #analytics .cards, .tlrow, .tlwrap, .calendar .cal { break-inside:avoid; }
+  .calendar { break-inside:auto; }
+  .heatwrap { overflow:visible; }
   .tllabel { font-size:9.5px; }
   #analytics h3, #stack h2, #stack > .note { break-after:avoid; }
   section { break-inside:auto; }
@@ -524,7 +554,8 @@ def _html_table(df: pd.DataFrame, columns: list[str] | None = None, limit: int |
         return '<p class="note">No data.</p>'
     cols = columns or list(df.columns)
     rows = df[cols].head(limit) if limit else df[cols]
-    head = "".join(f"<th>{_esc(c)}</th>" for c in cols)
+    # "merged_pr_count" -> "merged pr count": a heading that can wrap.
+    head = "".join(f"<th>{_esc(str(c).replace('_', ' '))}</th>" for c in cols)
     body = "".join(
         "<tr>" + "".join(f"<td>{_esc(v)}</td>" for v in row) + "</tr>"
         for row in rows.itertuples(index=False, name=None)
@@ -532,21 +563,60 @@ def _html_table(df: pd.DataFrame, columns: list[str] | None = None, limit: int |
     return f'<div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def _commits_by_repo(commits_df: pd.DataFrame) -> dict[str, list[dict]]:
-    """Group the commits table by repository, newest first."""
+#: The commit columns the HTML lists show (only these are read: the full
+#: table also holds every commit's whole message).
+_LIST_COLUMNS = (
+    "full_name", "authored_date", "sha", "url", "branch", "message_first_line", "additions", "deletions",
+)
+
+
+#: The report lists at most this many commits per repository, and this many
+#: across all repositories, the newest first; and at most this many in its
+#: chronological appendix (the latest). Every commit is in the workbook and
+#: commits.csv: a page with a million rows would not open in a browser.
+REPO_LIST_LIMIT = 1_000
+REPO_LISTS_BUDGET = 30_000
+TIMELINE_LIMIT = 25_000
+
+
+def _commit_rows(commits_df: pd.DataFrame) -> Iterator[dict]:
+    """The commits of a DataFrame as small dicts of :data:`_LIST_COLUMNS`
+    (missing = "")."""
     if commits_df is None or commits_df.empty:
-        return {}
-    grouped: dict[str, list[dict]] = {}
-    for row in commits_df.fillna("").to_dict("records"):
-        grouped.setdefault(str(row.get("full_name", "")), []).append(row)
-    for rows in grouped.values():
-        rows.sort(key=lambda r: str(r.get("authored_date") or ""), reverse=True)
-    return grouped
+        return
+    columns = [c for c in _LIST_COLUMNS if c in commits_df.columns]
+    for values in commits_df[columns].itertuples(index=False, name=None):
+        yield {
+            column: ("" if value is None or (isinstance(value, float) and math.isnan(value)) or value is pd.NA
+                     else value)
+            for column, value in zip(columns, values)
+        }
 
 
-def _render_commit_list(rows: list[dict]) -> str:
-    """A collapsible table with every commit of one repository."""
+def _list_row(commit) -> dict:
+    """One commit as the dict the lists show."""
+    return {
+        "full_name": commit.full_name,
+        "authored_date": commit.authored_date.isoformat() if commit.authored_date else "",
+        "sha": commit.sha,
+        "url": commit.url,
+        "branch": commit.branch,
+        "message_first_line": commit.message_first_line,
+        "additions": commit.additions,
+        "deletions": commit.deletions,
+    }
+
+
+def _render_commit_list(rows: list[dict], total: int | None = None) -> str:
+    """A collapsible table with a repository's commits (the newest ``len(rows)``
+    of its ``total``, when the report can't list them all)."""
+    total = len(rows) if total is None else total
     if not rows:
+        if total:
+            return (
+                f"<p class='note'>Its {_plural(total, 'commit')} are listed in the Excel workbook and "
+                "commits.csv (this page lists a limited number).</p>"
+            )
         return ""
     body: list[str] = []
     for r in rows:
@@ -572,24 +642,30 @@ def _render_commit_list(rows: list[dict]) -> str:
             "</tr>"
         )
     n = len(rows)
+    summary = f"Show all {n} commit(s)" if n >= total else f"Show the latest {n:,} of {total:,} commits"
+    more = (
+        f"<p class='note'>All {total:,} are in the Excel workbook and commits.csv.</p>" if n < total else ""
+    )
     return (
-        f"<details class='commitlist'><summary>Show all {n} commit(s)</summary>"
+        f"<details class='commitlist'><summary>{summary}</summary>"
         "<div class='table-scroll'><table>"
         "<thead><tr><th>Date</th><th>Commit</th><th>Branch</th><th>Message</th><th>Lines</th></tr></thead>"
-        f"<tbody>{''.join(body)}</tbody></table></div></details>"
+        f"<tbody>{''.join(body)}</tbody></table></div>{more}</details>"
     )
 
 
-def _render_repo_dashboard(insights: Insights) -> str:
-    """'Numbers first' dashboard: every repository's commit count and share."""
+def _render_repo_dashboard(insights: Insights, limit: int | None = None) -> str:
+    """'Numbers first' dashboard: every repository's commit count and share
+    (the ``limit`` largest, and the rest added up in one row, when given)."""
     works = sorted(insights.repo_work, key=lambda w: (-w.commits, w.full_name))
     if not works:
         return ""
     total = sum(w.commits for w in works) or 1
     max_commits = max(w.commits for w in works) or 1
+    shown = works[:limit] if limit else works
 
     rows: list[str] = []
-    for w in works:
+    for w in shown:
         width = max(2.0, w.commits / max_commits * 100)
         share = w.commits / total * 100
         pr = f"{w.pull_requests} ({w.merged_pull_requests} merged)" if w.pull_requests else "—"
@@ -611,10 +687,24 @@ def _render_repo_dashboard(insights: Insights) -> str:
             f"<td class='dmeta'>{span}</td>"
             "</tr>"
         )
+    rest = works[len(shown):]
+    if rest:
+        commits = sum(w.commits for w in rest)
+        rows.append(
+            "<tr class='more'>"
+            f"<td class='dname'>{_plural(len(rest), 'more repository', 'more repositories')}</td>"
+            f"<td class='dnum'>{commits:,}</td><td class='dbarcell'></td>"
+            f"<td class='dshare'>{commits / total * 100:.1f}%</td>"
+            "<td class='dmeta' colspan='3'>each listed in the full report</td></tr>"
+        )
+    lead = (
+        f"The {len(shown)} repositories with the most commits, of {len(works):,}."
+        if rest else "Every repository's share of the delivered work, largest first."
+    )
     return (
-        "<section id='repo-dashboard'><h2>Repository dashboard</h2>"
-        f"<p class='note'>{total:,} commits across {len(works)} repositories — every "
-        "repository's share of the delivered work, largest first.</p>"
+        f"<section id='repo-dashboard'><h2>{'Top repositories' if rest else 'Repository dashboard'}</h2>"
+        f"<p class='note'>{total:,} commits across {_plural(len(works), 'repository', 'repositories')}. "
+        f"{lead}</p>"
         "<div class='table-scroll'><table class='dash'>"
         "<thead><tr><th>Repository</th><th>Commits</th><th></th><th>Share</th>"
         "<th>PRs</th><th>Language</th><th>Active period</th></tr></thead>"
@@ -636,17 +726,48 @@ def _month_label(iso_date: str) -> str:
         return ""
 
 
-def _render_commit_timeline(commits_df: pd.DataFrame) -> str:
+def _render_commit_timeline(commits) -> str:
     """Appendix: every commit across all repos in ascending time order,
     broken up by month headers so the story reads chronologically."""
-    if commits_df is None or commits_df.empty:
-        return ""
-    rows = commits_df.fillna("").to_dict("records")
-    rows.sort(key=lambda r: str(r.get("authored_date") or "9999"))  # oldest first
+    return "".join(_commit_timeline_chunks(commits))
 
+
+def _commit_timeline_chunks(commits, batch: int = 500) -> Iterator[str]:
+    """:func:`_render_commit_timeline` in pieces of ``batch`` rows. ``commits``
+    is the report's :class:`CommitTable` (streamed from its store, the latest
+    TIMELINE_LIMIT of them) or a DataFrame of commit rows."""
+    if isinstance(commits, CommitTable):
+        n = len(commits)
+        skip = max(n - TIMELINE_LIMIT, 0)
+        rows: Iterable[dict] = (_list_row(c) for c in chronological(commits.source, skip=skip))
+    elif commits is None or commits.empty:
+        return
+    else:
+        listed = list(_commit_rows(commits))
+        listed.sort(key=lambda r: str(r.get("authored_date") or "9999"))  # oldest first
+        n, skip, rows = len(listed), 0, listed
+    if not n:
+        return
+    shown = n - skip
+    lead = (
+        f"All {n} commits across every repository in chronological order (oldest first), so the work can "
+        "be followed as it happened."
+        if not skip else
+        f"The latest {shown:,} of {n:,} commits, in chronological order (oldest first). Every one of them is "
+        "in the Excel workbook and commits.csv."
+    )
+    # data-print-parts: the script can print this appendix in parts (pdfexport).
+    yield (
+        "<section id='commit-timeline' data-print-parts><h2>Appendix — complete commit timeline</h2>"
+        f"<p class='note'>{lead}</p>"
+        f"<details class='commitlist timeline'><summary>Show the full timeline ({shown} commits)</summary>"
+        "<div class='table-scroll'><table>"
+        "<thead><tr><th>#</th><th>Date</th><th>Repository</th><th>Branch</th>"
+        "<th>Message</th><th>Commit</th><th>Lines</th></tr></thead><tbody>"
+    )
     body: list[str] = []
     current_month = None
-    for i, r in enumerate(rows, start=1):
+    for i, r in enumerate(rows, start=skip + 1):
         month = _month_label(str(r.get("authored_date") or ""))
         if month and month != current_month:
             current_month = month
@@ -674,18 +795,10 @@ def _render_commit_timeline(commits_df: pd.DataFrame) -> str:
             f"<td class='clines'>{lines}</td>"
             "</tr>"
         )
-    n = len(rows)
-    # data-print-parts: the script can print this appendix in parts (pdfexport).
-    return (
-        "<section id='commit-timeline' data-print-parts><h2>Appendix — complete commit timeline</h2>"
-        f"<p class='note'>All {n} commits across every repository in chronological "
-        "order (oldest first), so the work can be followed as it happened.</p>"
-        f"<details class='commitlist timeline'><summary>Show the full timeline ({n} commits)</summary>"
-        "<div class='table-scroll'><table>"
-        "<thead><tr><th>#</th><th>Date</th><th>Repository</th><th>Branch</th>"
-        "<th>Message</th><th>Commit</th><th>Lines</th></tr></thead>"
-        f"<tbody>{''.join(body)}</tbody></table></div></details></section>"
-    )
+        if len(body) >= batch:
+            yield "".join(body)
+            body.clear()
+    yield "".join(body) + "</tbody></table></div></details></section>"
 
 
 def _analytics_cards(pairs: list[tuple[str, str]]) -> str:
@@ -725,6 +838,112 @@ def _heatmap(rhythm: Rhythm) -> str:
         )
         rows.append(f"<tr><th class='day'>{WEEKDAYS[day]}</th>{cells}</tr>")
     return f"<table class='heat'><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
+
+
+#: Commit calendar geometry, in SVG units: a 10-unit day square every 12 units,
+#: below the month labels and right of the weekday labels.
+_CAL_CELL = 10
+_CAL_PITCH = 12
+_CAL_LEFT = 26
+_CAL_TOP = 14
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n:,} {one if n == 1 else (many or one + 's')}"
+
+
+def _day_text(day: date) -> str:
+    """'3 Mar 2025' (no locale: the same on every server)."""
+    return f"{day.day} {_MONTH_ABBR[day.month - 1]} {day.year}"
+
+
+def _calendar_svg(grid: CalendarGrid, cal: CommitCalendar) -> str:
+    """One calendar grid as an SVG: drawn in fixed units and scaled as a
+    whole, so labels and squares stay aligned at any width and in print."""
+    weeks = grid.weeks
+    width = _CAL_LEFT + weeks * _CAL_PITCH - (_CAL_PITCH - _CAL_CELL)
+    height = _CAL_TOP + 7 * _CAL_PITCH - (_CAL_PITCH - _CAL_CELL)
+    parts: list[str] = []
+    # A month is labelled above its first column that starts in it (or the
+    # first column, for the month the grid opens with). A label with less
+    # than two columns before the next one (or the edge) is left out, as on
+    # GitHub: it would run into its neighbour.
+    columns: list[tuple[int, date]] = []
+    for col, day in grid.month_starts():
+        if day != grid.first and day.weekday() != 0:
+            col += 1
+        if col < weeks:
+            columns.append((col, day))
+    for i, (col, day) in enumerate(columns):
+        following = columns[i + 1][0] if i + 1 < len(columns) else weeks
+        if following - col >= 2:
+            parts.append(f"<text x='{_CAL_LEFT + col * _CAL_PITCH}' y='9'>{_MONTH_ABBR[day.month - 1]}</text>")
+    for row, name in ((0, "Mon"), (2, "Wed"), (4, "Fri")):
+        parts.append(f"<text x='0' y='{_CAL_TOP + row * _CAL_PITCH + _CAL_CELL - 1}'>{name}</text>")
+    day = grid.first
+    while day <= grid.last:
+        n = grid.days.get(day, 0)
+        x = _CAL_LEFT + grid.column(day) * _CAL_PITCH
+        y = _CAL_TOP + day.weekday() * _CAL_PITCH
+        rect = f"<rect x='{x}' y='{y}' width='{_CAL_CELL}' height='{_CAL_CELL}' rx='2' class='q{cal.level(n)}'"
+        if n:
+            rect += f"><title>{WEEKDAYS[day.weekday()]} {_day_text(day)} · {_plural(n, 'commit')}</title></rect>"
+        else:
+            rect += "/>"
+        parts.append(rect)
+        day += timedelta(days=1)
+    label = f"Commits per day, {_day_text(grid.first)} to {_day_text(grid.last)}"
+    # Squares are at most 1.5x their drawn size: a short period isn't blown up.
+    return (
+        f"<svg class='calsvg' viewBox='0 0 {width} {height}' style='max-width:{width * 1.5:.0f}px' "
+        f"role='img' aria-label='{_esc(label)}'>{''.join(parts)}</svg>"
+    )
+
+
+def _calendar_legend(cal: CommitCalendar) -> str:
+    """Less → More swatches, and what each shade means in commits a day."""
+    swatches = "".join(
+        f"<rect x='{i * 13}' y='0' width='{_CAL_CELL}' height='{_CAL_CELL}' rx='2' class='q{i}'/>" for i in range(5)
+    )
+    t1, t2, t3 = cal.thresholds
+
+    def span(lo: int, hi: int) -> str:
+        return f"{lo}" if lo == hi else f"{lo}–{hi}"
+
+    shades = f"{span(1, t1)}, {span(t1 + 1, t2)}, {span(t2 + 1, t3)} and {t3 + 1}+ commits a day"
+    return (
+        "<div class='cal-legend'><span>Less</span>"
+        f"<svg viewBox='0 0 62 10' aria-hidden='true'>{swatches}</svg><span>More</span>"
+        f"<span class='cal-shades'>Shades: {shades}.</span></div>"
+    )
+
+
+def _render_calendar(cal: CommitCalendar, zone: str, *, summary: bool = False) -> str:
+    """The commit calendar block: the whole period (one grid per year when it
+    is longer than a year), or for the summary its latest 12 months."""
+    grids = [cal.recent] if summary else cal.grids
+    blocks = []
+    for grid in grids:
+        whole_year = grid.first == date(grid.first.year, 1, 1) and grid.last == date(grid.first.year, 12, 31)
+        if cal.per_year and not summary:
+            title = str(grid.first.year)
+            span = "" if whole_year else f"{_day_text(grid.first)} – {_day_text(grid.last)} · "
+        else:
+            title = "Last 12 months" if cal.per_year else "Report period"
+            span = f"{_day_text(grid.first)} – {_day_text(grid.last)} · "
+        blocks.append(
+            f"<div class='cal'><div class='cal-head'><b>{_esc(title)}</b>"
+            f"{_esc(span)}{_plural(grid.total, 'commit')} on {_plural(grid.active_days, 'day')}</div>"
+            f"{_calendar_svg(grid, cal)}</div>"
+        )
+    hidden = ""
+    if cal.hidden_years and not summary:
+        hidden = f"<p class='anote'>{_plural(cal.hidden_years, 'earlier year')} with commits left off.</p>"
+    return (
+        f"<div class='atable calendar'><h4>Commit calendar ({_esc(zone)})</h4>"
+        f"{''.join(blocks)}{_calendar_legend(cal)}{hidden}</div>"
+    )
 
 
 def _month_after(day: date) -> date:
@@ -862,6 +1081,13 @@ def _markdown_stack(a: Analytics | None) -> list[str]:
     return out
 
 
+#: The summary (PDF) lists the latest quarters, the repositories with the
+#: most commits and the first data-completeness notes, not all of them.
+SUMMARY_QUARTERS = 8
+SUMMARY_REPOS = 10
+SUMMARY_NOTES = 6
+
+
 def _render_analytics(a: Analytics | None, scope: ReportScope | None = None) -> str:
     """The 'Insights & analytics' section (see analytics.py for every definition)."""
     if a is None or not (a.work_mix.total or a.work_mix.merges or a.delivery or a.reviews):
@@ -963,7 +1189,7 @@ def _render_analytics(a: Analytics | None, scope: ReportScope | None = None) -> 
             "<h3>Quarter by quarter</h3><div class='table-scroll'><table class='dash aq'>"
             f"<thead>{head}</thead><tbody>{''.join(rows)}</tbody></table></div>"
             "<p class='anote'>A partial quarter is one the report (or the work) covers only in part, so it "
-            "isn't compared with the quarter before.</p>"
+            f"isn't compared with the quarter before.{_merged_after_note(a)}</p>"
         )
         shipped = [q for q in a.quarters if q.shipped]
         if shipped:
@@ -1015,11 +1241,11 @@ def _render_analytics(a: Analytics | None, scope: ReportScope | None = None) -> 
                 if r.span_is_period else
                 f"<p class='anote'>Weeks are counted from the first commit to the latest: {span}.</p>"
             )
+        calendar = _render_calendar(a.commit_calendar, zone) if a.commit_calendar is not None else ""
         parts.append(
-            "<h3>Working rhythm</h3>" + _analytics_cards(cards) + weeks
-            + f"<div class='atable'><h4>Commits by day and hour ({_esc(zone)})</h4>{_heatmap(r)}</div>"
+            "<h3>Working rhythm</h3>" + _analytics_cards(cards) + weeks + calendar
+            + f"<div class='atable heatwrap'><h4>Commits by day and hour ({_esc(zone)})</h4>{_heatmap(r)}</div>"
         )
-
     f = a.footprint
     if f is not None:
         cards = [
@@ -1147,8 +1373,9 @@ def _markdown_analytics(a: Analytics | None, scope: ReportScope | None = None) -
     return out
 
 
-def _render_exec_summary(exec_summary: ExecSummary) -> str:
-    """The promotion-ready 'Executive summary' section."""
+def _render_exec_summary(exec_summary: ExecSummary, *, compact: bool = False) -> str:
+    """The promotion-ready 'Executive summary' section (``compact``: the
+    summary's shorter lists)."""
     parts: list[str] = [
         "<section id='exec-summary'><h2>Executive summary — contribution highlights</h2>",
         "<div class='exec'>",
@@ -1156,11 +1383,13 @@ def _render_exec_summary(exec_summary: ExecSummary) -> str:
     for paragraph in exec_summary.overview:
         parts.append(f"<p class='lead'>{_esc(paragraph)}</p>")
 
-    if exec_summary.key_projects:
+    projects = exec_summary.key_projects[:4] if compact else exec_summary.key_projects
+    features = exec_summary.features[:6] if compact else exec_summary.features
+    if projects:
         parts.append("<h3>Key projects &amp; impact</h3>")
-        for w in exec_summary.key_projects:
+        for w in projects:
             lang = f" · {_esc(w.language)}" if w.language else ""
-            top_work = "; ".join(w.highlights[:3])
+            top_work = "; ".join(w.highlights[:2 if compact else 3])
             work_html = f"<div class='pwork'>Key work: {_esc(top_work)}</div>" if top_work else ""
             parts.append(
                 "<div class='proj'>"
@@ -1169,9 +1398,9 @@ def _render_exec_summary(exec_summary: ExecSummary) -> str:
                 f"{work_html}</div>"
             )
 
-    if exec_summary.features:
+    if features:
         parts.append("<h3>Features &amp; improvements delivered</h3><ul class='features'>")
-        for repo, feature in exec_summary.features:
+        for repo, feature in features:
             parts.append(f"<li>{_esc(feature)} <span class='frepo'>— {_esc(repo)}</span></li>")
         parts.append("</ul>")
 
@@ -1181,9 +1410,10 @@ def _render_exec_summary(exec_summary: ExecSummary) -> str:
             parts.append(f"<li><strong>{_esc(label)}:</strong> {_esc(value)}</li>")
         parts.append("</ul>")
 
+    where = "the full report and its workbook" if compact else "the tables below"
     parts.append(
         "<p class='note'>Auto-generated from the collected commit and pull-request "
-        "history — every figure above is verifiable in the tables below.</p>"
+        f"history — every figure above is verifiable in {where}.</p>"
     )
     parts.append("</div></section>")
     return "".join(parts)
@@ -1200,61 +1430,90 @@ def _embed_chart(charts_dir: Path, filename: str) -> str | None:
     return f"data:image/png;base64,{data}"
 
 
-def render_html(
+def _page(title: str, body: Iterable[str], *, extra_css: str = "", body_class: str = "") -> Iterator[str]:
+    """A whole report page around ``body``: the policy that only lets the
+    report's own script run, the stylesheet, and that script (always the
+    page's last element: see reportscript.with_current_script)."""
+    cls = f" class='{body_class}'" if body_class else ""
+    yield (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<meta http-equiv='Content-Security-Policy' content=\"{REPORT_CSP}\">"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{_esc(title)}</title>"
+        f"<style>{_CSS}{extra_css}</style></head><body{cls}>"
+    )
+    for part in body:
+        yield part + "\n"
+    yield f"<script>{_SCRIPT}</script></body></html>"
+
+
+def activity_text(summary: dict[str, object]) -> str:
+    """'2026-01-03 → 2026-11-20', or a plain word when there was no activity."""
+    first = _fmt_date(summary.get("first_contribution_date"))
+    last = _fmt_date(summary.get("latest_contribution_date"))
+    return f"{first} → {last}" if first and last else "none in this period"
+
+
+def _hero(title: str, summary: dict[str, object], scope: ReportScope | None) -> str:
+    users = str(summary.get("tracked_users") or "") or "—"
+    return (
+        f"<header class='hero'><div class='wrap'><h1>{_esc(title)}</h1>"
+        f"<div class='meta'>Users: <strong>{_esc(users)}</strong> · "
+        f"Period: <strong>{_esc(period_text(scope))}</strong> · "
+        f"Activity {_esc(activity_text(summary))} · "
+        f"Generated {_esc(_fmt_date(summary.get('generated_at')))}</div></div></header>"
+    )
+
+
+def _glance(summary: dict[str, object], insights: Insights, scope: ReportScope | None) -> str:
+    cards = "".join(
+        f"<div class='card'><div class='v'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>"
+        for label, value in _metric_pairs(summary, insights, scope)
+    )
+    return f"<section id='glance'><h2>At a glance</h2><div class='cards'>{cards}</div></section>"
+
+
+def _report_body(
     stats: Statistics,
     insights: Insights,
     summary: dict[str, object],
     charts_dir: Path,
-    include_charts: bool = True,
-    scope: ReportScope | None = None,
-) -> str:
+    include_charts: bool,
+    scope: ReportScope | None,
+) -> Iterator[str]:
+    """The full report, section by section (written to disk as it comes, so
+    a report with tens of thousands of commits never sits in memory whole)."""
     ins = insights.to_summary_dict()
     exec_summary = build_exec_summary(insights, summary)
-    commits_by_repo = _commits_by_repo(stats.commits)
-    parts: list[str] = []
 
-    parts.append("<header class='hero'><div class='wrap'>")
-    parts.append("<h1>GitHub Contribution Report</h1>")
-    parts.append(
-        f"<div class='meta'>Users: <strong>{_esc(summary.get('tracked_users'))}</strong> · "
-        f"Period: <strong>{_esc(period_text(scope))}</strong> · "
-        f"Activity {_esc(_fmt_date(summary.get('first_contribution_date')))} → "
-        f"{_esc(_fmt_date(summary.get('latest_contribution_date')))} · "
-        f"Generated {_esc(_fmt_date(summary.get('generated_at')))}</div>"
-    )
-    parts.append("</div></header>")
-
-    parts.append("<div class='wrap'>")
-
-    # Metric cards
-    parts.append("<section><h2>At a glance</h2><div class='cards'>")
-    for label, value in _metric_pairs(summary, insights, scope):
-        parts.append(f"<div class='card'><div class='v'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>")
-    parts.append("</div></section>")
+    yield _hero("GitHub Contribution Report", summary, scope)
+    yield "<div class='wrap'>"
+    yield _glance(summary, insights, scope)
 
     # Gaps are shown up front: a reader must know before trusting the numbers.
     if scope is not None and scope.notes:
-        parts.append(_render_completeness(scope))
+        yield _render_completeness(scope)
 
     # Repository dashboard — the per-repo numbers, before any narrative.
-    parts.append(_render_repo_dashboard(insights))
+    yield _render_repo_dashboard(insights)
 
     # Executive summary (promotion-ready narrative)
-    parts.append(_render_exec_summary(exec_summary))
+    yield _render_exec_summary(exec_summary)
 
     # Technologies, then insights & analytics (delivery, work mix, quarters, rhythm, footprint)
-    parts.append(_render_stack(stats.analytics))
-    parts.append(_render_analytics(stats.analytics, scope))
+    yield _render_stack(stats.analytics)
+    yield _render_analytics(stats.analytics, scope)
 
     # Activity insights
-    parts.append("<section><h2>Activity insights</h2><div class='cards'>")
-    for label, value in [
-        ("Busiest day", ins.get("busiest_day") or "n/a"),
-        ("Busiest month", ins.get("busiest_month") or "n/a"),
-        ("Primary languages", ins.get("primary_languages") or "n/a"),
-    ]:
-        parts.append(f"<div class='card'><div class='v' style='font-size:18px'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>")
-    parts.append("</div></section>")
+    cards = "".join(
+        f"<div class='card'><div class='v' style='font-size:18px'>{_esc(value)}</div><div class='l'>{_esc(label)}</div></div>"
+        for label, value in [
+            ("Busiest day", ins.get("busiest_day") or "n/a"),
+            ("Busiest month", ins.get("busiest_month") or "n/a"),
+            ("Primary languages", ins.get("primary_languages") or "n/a"),
+        ]
+    )
+    yield f"<section><h2>Activity insights</h2><div class='cards'>{cards}</div></section>"
 
     # Charts
     if include_charts:
@@ -1267,63 +1526,256 @@ def render_html(
                     f"<figcaption>{_esc(caption)}</figcaption></figure>"
                 )
         if figures:
-            parts.append("<section><h2>Charts</h2><div class='charts'>")
-            parts.extend(figures)
-            parts.append("</div></section>")
+            yield "<section><h2>Charts</h2><div class='charts'>" + "".join(figures) + "</div></section>"
 
     # Contributors
-    parts.append("<section><h2>Contributors</h2>")
-    parts.append(_html_table(stats.per_user))
-    parts.append("</section>")
+    yield "<section><h2>Contributors</h2>" + _html_table(stats.per_user) + "</section>"
 
     # Organizations
     if not stats.organizations.empty:
-        parts.append("<section><h2>Organizations</h2>")
-        parts.append(_html_table(
-            stats.organizations,
-            ["login", "repos_contributed", "commit_count", "pr_count", "merged_pr_count"],
-        ))
-        parts.append("</section>")
+        yield (
+            "<section><h2>Organizations</h2>"
+            + _html_table(
+                stats.organizations,
+                ["login", "repos_contributed", "commit_count", "pr_count", "merged_pr_count"],
+            )
+            + "</section>"
+        )
 
     # Work breakdown
-    parts.append("<section><h2>Work breakdown by repository</h2>")
-    parts.append(
+    yield (
+        "<section><h2>Work breakdown by repository</h2>"
         "<p class='note'>Descriptions are derived from pull-request titles, branch "
         "names and recurring commit keywords — so the work is explained even when "
         "individual commit messages are terse. Click a repository's commit count "
         "to see every commit.</p>"
     )
-    if commits_by_repo:
-        parts.append(
+    if len(stats.commits):
+        yield (
             "<p class='noprint'><button type='button' class='toggle' id='toggle-commits' "
             "data-state='closed'>Expand all commit lists</button></p>"
         )
+    # Each repository's commits, newest first, read from the store as each
+    # card is written (within REPO_LIST_LIMIT and REPO_LISTS_BUDGET).
+    source = stats.commits.source if isinstance(stats.commits, CommitTable) else []
+    budget = REPO_LISTS_BUDGET
     for work in insights.repo_work:
-        parts.append(_render_repo_card(work, commits_by_repo.get(work.full_name, [])))
-    parts.append("</section>")
+        limit = min(REPO_LIST_LIMIT, budget)
+        rows = [_list_row(c) for c in repo_commits(source, work.full_name, limit)] if limit and work.commits else []
+        budget -= len(rows)
+        yield _render_repo_card(work, rows, total=work.commits)
+    yield "</section>"
 
     if scope is not None and not scope.notes:
-        parts.append(_render_completeness(scope))
-    parts.append(_render_method(scope))
+        yield _render_completeness(scope)
+    yield _render_method(scope)
 
     # Appendix: the raw commit data, last, in chronological order.
-    parts.append(_render_commit_timeline(stats.commits))
+    yield from _commit_timeline_chunks(stats.commits)
 
-    parts.append("<footer>Generated by github-contrib · deterministic summary (no AI)</footer>")
-    parts.append("</div>")
+    yield (
+        "<footer>Generated by github-contrib · deterministic summary (no AI). "
+        "The PDF is a summary of this report.</footer>"
+    )
+    yield "</div>"
 
-    body = "\n".join(parts)
+
+def render_html(
+    stats: Statistics,
+    insights: Insights,
+    summary: dict[str, object],
+    charts_dir: Path,
+    include_charts: bool = True,
+    scope: ReportScope | None = None,
+) -> str:
+    """The full report as one string (see :func:`export_reports`, which
+    writes it piece by piece instead)."""
+    body = _report_body(stats, insights, summary, charts_dir, include_charts, scope)
+    return "".join(_page("GitHub Contribution Report", body))
+
+
+#: Extra styles of the summary (the PDF): an A4 page, a denser layout, and no
+#: section split across pages where it can be avoided.
+_SUMMARY_CSS = """
+@page { size:A4; margin:12mm 11mm 13mm; }
+body.summary header.hero { padding:28px 0 22px; margin-bottom:18px; }
+body.summary h2 { margin:28px 0 12px; }
+.hl-list { margin:0; padding-left:20px; }
+.hl-list li { margin:5px 0; }
+dl.techlist { display:grid; grid-template-columns:max-content minmax(0, 1fr); gap:4px 14px; margin:6px 0 0; font-size:13.5px; }
+dl.techlist dt { color:var(--muted); font-weight:600; }
+dl.techlist dd { margin:0; overflow-wrap:anywhere; }
+.sumfoot { color:var(--muted); font-size:12.5px; margin-top:28px; text-align:center; }
+@media print {
+  body.summary { font-size:12.5px; line-height:1.45; }
+  body.summary header.hero { padding:18px 0 14px; margin-bottom:10px; }
+  body.summary header.hero h1 { font-size:22px; }
+  body.summary h2 { font-size:16px; margin:18px 0 8px; }
+  body.summary h3 { font-size:13.5px; }
+  body.summary .cards { grid-template-columns:repeat(4, minmax(0, 1fr)); gap:8px; }
+  body.summary .card { padding:9px 11px; border-radius:9px; box-shadow:none; }
+  body.summary .card .v { font-size:19px; }
+  body.summary #analytics .card .v { font-size:17px; }
+  body.summary .card .l { font-size:10.5px; }
+  body.summary .exec { padding:12px 14px; }
+  body.summary .exec p.lead { font-size:13px; margin:5px 0; }
+  body.summary .agrid, body.summary .shipped { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+  body.summary section, body.summary .hl, body.summary #repo-dashboard { break-inside:auto; }
+  body.summary .exec .proj, body.summary .hl li { break-inside:avoid; }
+}
+"""
+
+
+def _summary_delivery(a: Analytics) -> str:
+    """Delivery and code reviews as one row of cards."""
+    cards: list[tuple[str, str]] = []
+    d = a.delivery
+    if d is not None:
+        cards.append((f"{d.merged:,}", f"pull requests merged, of {d.opened:,} opened"))
+        if d.merge_rate is not None:
+            cards.append((f"{d.merge_rate:.0%}", "of closed pull requests merged"))
+        if d.median_hours is not None:
+            cards.append((human_duration(d.median_hours), "median time to merge"))
+        if d.median_size is not None:
+            cards.append((f"{d.median_size:,.0f}", "median lines per merged pull request"))
+    rv = a.reviews
+    if rv is not None:
+        cards.append((f"{rv.total:,}", "code reviews given"))
+        cards.append((f"{rv.pull_requests:,}", f"pull requests reviewed, by {_plural(rv.authors, 'teammate')}"))
+    if not cards:
+        return ""
+    note = (
+        "<p class='anote'>Time to merge runs from opening a pull request to merging it. Reviews are those "
+        "given on other people's pull requests.</p>"
+    )
+    return "<h3>Pull requests &amp; reviews</h3>" + _analytics_cards(cards) + note
+
+
+def _summary_quarters(a: Analytics) -> str:
+    """The latest quarters, one line each."""
+    quarters = a.quarters[-SUMMARY_QUARTERS:]
+    if not quarters:
+        return ""
+    peak = max(q.commits for q in quarters) or 1
+    rows = []
+    for q in quarters:
+        width = max(q.commits / peak * 100, 1.5) if q.commits else 0
+        partial = " <span class='atag'>partial</span>" if q.partial else ""
+        change = f"{q.change:+.0%}" if q.change is not None else "—"
+        rows.append(
+            f"<tr><td class='dname'>{q.label}{partial}</td><td class='dnum'>{q.commits:,}</td>"
+            f"<td class='dbarcell'><div class='dbar' style='width:{width:.1f}%'></div></td>"
+            f"<td class='dshare'>{change}</td><td class='dnum'>{q.prs_merged:,}</td>"
+            f"<td class='dnum'>{q.active_days:,}</td></tr>"
+        )
+    earlier = len(a.quarters) - len(quarters)
+    cut = f" {_plural(earlier, 'earlier quarter')} in the full report." if earlier else ""
     return (
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
-        f"<meta http-equiv='Content-Security-Policy' content=\"{REPORT_CSP}\">"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>GitHub Contribution Report</title>"
-        f"<style>{_CSS}</style></head><body>{body}"
-        f"<script>{_SCRIPT}</script></body></html>"
+        "<h3>Quarter by quarter</h3><div class='table-scroll'><table class='dash aq'>"
+        "<thead><tr><th>Quarter</th><th>Commits</th><th></th><th>vs previous</th><th>PRs merged</th>"
+        f"<th>Active days</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        "<p class='anote'>A partial quarter is covered only in part, so it isn't compared with the one "
+        f"before.{_merged_after_note(a)}{cut}</p>"
     )
 
 
-def _render_repo_card(work: RepoWork, commit_rows: list[dict] | None = None) -> str:
+def _merged_after_note(a: Analytics) -> str:
+    """Why the quarters' merged pull requests can add up to less than the total."""
+    n = a.merged_after
+    if not n:
+        return ""
+    return (
+        f" {_plural(n, 'pull request')} opened in the period and merged after it "
+        f"{'counts' if n == 1 else 'count'} in the merged total but in no quarter."
+    )
+
+
+def _summary_rhythm(a: Analytics, zone: str) -> str:
+    r = a.rhythm
+    if r is None:
+        return ""
+    cards = [
+        (f"{r.active_weeks} of {r.weeks_in_span}", f"weeks with commits ({r.consistency:.0%})"),
+        (f"{r.best_30_commits:,}", f"commits in the best 30 days (from {_day_text(r.best_30_start)})"),
+        (f"{r.peak_start:02d}:00–{(r.peak_start + 3) % 24:02d}:00", f"busiest hours ({r.peak_share:.0%} of commits)"),
+        (f"{r.weekend_share:.0%}", "of commits on weekends"),
+    ]
+    calendar = _render_calendar(a.commit_calendar, zone, summary=True) if a.commit_calendar is not None else ""
+    return "<h3>Working rhythm</h3>" + _analytics_cards(cards) + calendar
+
+
+def _summary_stack(a: Analytics) -> str:
+    """The technologies as one line per kind, most-used first."""
+    s = a.stack
+    if s is None or not (s.languages or s.technologies):
+        return ""
+    lines = []
+    if s.languages:
+        lines.append(("Languages", s.languages))
+    lines += s.by_category()
+    items = "".join(
+        f"<dt>{_esc(kind)}</dt><dd>{' · '.join(_esc(u.name) for u in uses[:6])}"
+        + (f" <span class='frepo'>+{len(uses) - 6} more</span>" if len(uses) > 6 else "") + "</dd>"
+        for kind, uses in lines
+    )
+    return (
+        "<h3>Technologies</h3>"
+        f"<dl class='techlist'>{items}</dl>"
+        "<p class='anote'>From the repositories with commits in this report (language statistics, dependency and "
+        "build files), most commits first.</p>"
+    )
+
+
+def _summary_body(
+    stats: Statistics, insights: Insights, summary: dict[str, object], scope: ReportScope | None
+) -> Iterator[str]:
+    """The concise summary — what the PDF holds. The report's headline
+    numbers, highlights and narrative with only the top entries of each list
+    (each cut is said), so it stays a few pages however much work the report
+    covers. Every number is the full report's own."""
+    a = stats.analytics
+    zone = scope.timezone if scope is not None else "UTC"
+    yield _hero("GitHub Contribution Summary", summary, scope)
+    yield "<div class='wrap'>"
+    yield _glance(summary, insights, scope)
+    if scope is not None and scope.notes:
+        yield _render_completeness(scope, limit=SUMMARY_NOTES)
+    if a is not None and a.highlights:
+        items = "".join(f"<li>{_esc(line)}</li>" for line in a.highlights)
+        yield f"<section id='highlights'><h2>Highlights</h2><ul class='hl-list'>{items}</ul></section>"
+    yield _render_exec_summary(build_exec_summary(insights, summary), compact=True)
+    yield _render_repo_dashboard(insights, limit=SUMMARY_REPOS)
+    if a is not None:
+        body = "".join(
+            part for part in (
+                _summary_delivery(a), _summary_quarters(a), _summary_rhythm(a, zone), _summary_stack(a),
+            ) if part
+        )
+        if body:
+            yield f"<section id='analytics'><h2>Delivery &amp; activity</h2>{body}</section>"
+    if scope is not None and not scope.notes:
+        yield _render_completeness(scope)
+    yield _render_method(scope)
+    yield (
+        "<p class='sumfoot'>A summary of the full report. Every commit, pull request and repository is "
+        "listed in the HTML report and the Excel workbook. Generated by github-contrib · deterministic "
+        "(no AI).</p>"
+    )
+    yield "</div>"
+
+
+def render_summary_html(
+    stats: Statistics,
+    insights: Insights,
+    summary: dict[str, object],
+    scope: ReportScope | None = None,
+) -> str:
+    """The concise summary page the PDF is printed from (see :func:`_summary_body`)."""
+    body = _summary_body(stats, insights, summary, scope)
+    return "".join(_page("GitHub Contribution Summary", body, extra_css=_SUMMARY_CSS, body_class="summary"))
+
+
+def _render_repo_card(work: RepoWork, commit_rows: list[dict] | None = None, total: int | None = None) -> str:
     badge = "private" if work.is_private else "public"
     lang = f" · {_esc(work.language)}" if work.language else ""
     chips = "".join(f"<span class='chip'>{_esc(t)}</span>" for t in work.themes)
@@ -1349,7 +1801,7 @@ def _render_repo_card(work: RepoWork, commit_rows: list[dict] | None = None) -> 
                 f"<div class='bigcommit'>Largest commit: <em>{_esc(work.most_impactful_commit)}</em></div>"
             )
 
-    commits_html = _render_commit_list(commit_rows or [])
+    commits_html = _render_commit_list(commit_rows or [], total)
     stack_html = (
         "<div class='stackline'>Stack: "
         + "".join(f"<span class='chip'>{_esc(t)}</span>" for t in work.technologies)
@@ -1365,6 +1817,19 @@ def _render_repo_card(work: RepoWork, commit_rows: list[dict] | None = None) -> 
     )
 
 
+def _write_chunks(path: Path, chunks: Iterable[str]) -> None:
+    """Write ``chunks`` to ``path`` as they come, via a temporary file renamed
+    into place: a reader never sees a half-written report."""
+    partial = path.with_name(path.name + ".partial")
+    try:
+        with partial.open("w", encoding="utf-8", newline="\n") as fh:
+            for chunk in chunks:
+                fh.write(chunk)
+        os.replace(partial, path)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
 def export_reports(
     output_dir: Path,
     stats: Statistics,
@@ -1374,15 +1839,20 @@ def export_reports(
     include_charts: bool = True,
     scope: ReportScope | None = None,
 ) -> list[Path]:
-    """Write report.md and report.html. Returns the paths written."""
+    """Write report.md, report.html and summary.html (the PDF's source).
+    Returns the paths written."""
     output_dir.mkdir(parents=True, exist_ok=True)
     md_path = output_dir / "report.md"
     html_path = output_dir / "report.html"
-    md_path.write_text(render_markdown(stats, insights, summary, scope), encoding="utf-8", newline="\n")
-    html_path.write_text(
-        render_html(stats, insights, summary, charts_dir, include_charts, scope),
-        encoding="utf-8",
-        newline="\n",
-    )
-    log.info("wrote %s and %s", md_path.name, html_path.name)
-    return [md_path, html_path]
+    summary_path = output_dir / SUMMARY_FILE
+    _write_chunks(md_path, [render_markdown(stats, insights, summary, scope)])
+    _write_chunks(summary_path, _page(
+        "GitHub Contribution Summary", _summary_body(stats, insights, summary, scope),
+        extra_css=_SUMMARY_CSS, body_class="summary",
+    ))
+    _write_chunks(html_path, _page(
+        "GitHub Contribution Report", _report_body(stats, insights, summary, charts_dir, include_charts, scope),
+    ))
+    # The web app reads this line as "the report is written" (its phase list).
+    log.info("wrote %s and %s (summary: %s)", md_path.name, html_path.name, summary_path.name)
+    return [md_path, html_path, summary_path]

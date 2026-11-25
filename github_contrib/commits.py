@@ -29,6 +29,11 @@ log = get_logger("commits")
 
 #: The pull-request commits endpoint lists at most this many commits.
 PR_COMMITS_LIMIT = 250
+#: Answers that mean commits exist but can't be read (vs 409: an empty repository).
+_UNREADABLE = {
+    404: "not found: deleted, renamed, or no longer open to the token",
+    451: "unavailable for legal reasons",
+}
 
 
 def _commit_from_payload(
@@ -104,6 +109,7 @@ async def collect_commits_for_repo(
     scan_all_branches: bool = False,
     author_emails: list[str] | None = None,
     coverage: Coverage | None = None,
+    branches: list[str] | None = None,
 ) -> list[CommitRecord]:
     """Collect commits authored by ``target_logins`` (and ``author_emails``) in ``repo``.
 
@@ -114,9 +120,12 @@ async def collect_commits_for_repo(
 
     Commits are de-duplicated by SHA within the repository (a commit reachable
     from several branches is reported once, against the first branch scanned).
+    ``branches`` names the branches to read (those GraphQL couldn't) instead
+    of listing them all.
     """
     coverage = coverage if coverage is not None else Coverage()
-    branches = await _branches_to_scan(client, repo, scan_all_branches, coverage)
+    if not branches:
+        branches = await _branches_to_scan(client, repo, scan_all_branches, coverage)
 
     # (author_key passed to ?author=, fallback_login used when the payload has
     #  no author login — i.e. the email is not linked to any GitHub account)
@@ -124,13 +133,33 @@ async def collect_commits_for_repo(
     author_keys: list[tuple[str, str]] = [(login, login) for login in target_logins]
     author_keys += [(email, primary_login) for email in author_emails or []]
 
-    async def scan(author_key: str, branch: str) -> list[dict[str, Any]]:
+    async def scan(author_key: str, fallback_login: str, branch: str, known: set[str]) -> list[CommitRecord]:
+        """One author's commits on one branch, as records, without the ones
+        ``known`` already holds: each branch lists its whole history, so
+        keeping raw pages would hold the same commits once per branch."""
         params = {"author": author_key, "sha": branch}
-        found: list[dict[str, Any]] = []
+        found: list[CommitRecord] = []
+        mine: set[str] = set()
+
+        def empty(status: int) -> None:
+            # 409 is an empty repository; 404 / 451 mean the commits exist but
+            # can't be read, which must never look like "no contributions".
+            if status in _UNREADABLE:
+                coverage.warn(
+                    f"{repo.full_name}: GitHub answered {status} ({_UNREADABLE[status]}) for the commits "
+                    f"on '{branch}'; any contributions there are missing."
+                )
+
         try:
-            async for payload in client.paginate(f"/repos/{repo.full_name}/commits", params=params):
-                if isinstance(payload, dict):
-                    found.append(payload)
+            async for payload in client.paginate(
+                f"/repos/{repo.full_name}/commits", params=params, on_empty=empty
+            ):
+                if not isinstance(payload, dict):
+                    continue
+                sha = str(payload.get("sha", ""))
+                if sha and sha not in known and sha not in mine:
+                    mine.add(sha)
+                    found.append(_commit_from_payload(payload, repo, branch, fallback_login))
         except GitHubError as exc:
             coverage.warn(
                 f"{repo.full_name}: commits by {author_key} on branch '{branch}' could not "
@@ -138,17 +167,25 @@ async def collect_commits_for_repo(
             )
         return found
 
-    jobs = [(key, fallback, branch) for key, fallback in author_keys for branch in branches]
-    pages = await asyncio.gather(*(scan(key, branch) for key, _fallback, branch in jobs))
-
     seen: set[str] = set()
     results: list[CommitRecord] = []
-    for (_key, fallback_login, branch), payloads in zip(jobs, pages):
-        for payload in payloads:
-            sha = str(payload.get("sha", ""))
-            if sha and sha not in seen:
-                seen.add(sha)
-                results.append(_commit_from_payload(payload, repo, branch, fallback_login))
+
+    def merge(batches: list[list[CommitRecord]]) -> None:
+        for batch in batches:
+            for record in batch:
+                if record.sha not in seen:
+                    seen.add(record.sha)
+                    results.append(record)
+
+    # The first branch (the default one) first: most commits are on it, and
+    # what it holds is then skipped as the other branches are read.
+    first, others = branches[0], branches[1:]
+    merge(await asyncio.gather(*(scan(key, fallback, first, set()) for key, fallback in author_keys)))
+    if others:
+        known = set(seen)
+        merge(await asyncio.gather(*(
+            scan(key, fallback, branch, known) for key, fallback in author_keys for branch in others
+        )))
 
     if results:
         log.debug("%s: %d commit(s) by tracked users", repo.full_name, len(results))

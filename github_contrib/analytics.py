@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -127,7 +128,7 @@ class WorkMix:
         return self.counts.get(kind, 0) / self.total if self.total else 0.0
 
 
-def _work_mix(commits: list[CommitRecord]) -> WorkMix:
+def _work_mix(commits: Iterable[CommitRecord]) -> WorkMix:
     mix = WorkMix()
     for commit in commits:
         kind = None if commit.is_merge else classify_commit(commit.message_first_line)
@@ -272,6 +273,8 @@ def _delivery(prs: list[PullRequestRecord]) -> Delivery | None:
 # ---------------------------------------------------------------------------
 
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July",
+               "August", "September", "October", "November", "December"]
 
 
 @dataclass(slots=True)
@@ -295,25 +298,166 @@ class Rhythm:
         return self.active_weeks / self.weeks_in_span if self.weeks_in_span else 0.0
 
 
-def _rhythm(
+#: A span up to this many days gets one calendar (53 weeks); a longer one gets
+#: one calendar per calendar year with commits.
+CALENDAR_MAX_DAYS = 371
+#: Yearly calendars shown at most (the most recent years with commits).
+CALENDAR_MAX_YEARS = 10
+
+
+@dataclass(slots=True)
+class CalendarGrid:
+    """One GitHub-style calendar: a column per week and a row per weekday.
+
+    Weeks start on Monday, like every other weekly figure in the report (the
+    heatmap's rows, "weeks with commits"). Only the days ``first`` to
+    ``last`` are drawn: a day outside the report period is left blank rather
+    than shown as a day without commits."""
+
+    first: date  # first day drawn
+    last: date  # last day drawn
+    days: dict[date, int]  # commits per day (days with commits only)
+
+    @property
+    def start(self) -> date:
+        """The Monday that opens the first column."""
+        return self.first - timedelta(days=self.first.weekday())
+
+    @property
+    def weeks(self) -> int:
+        return (self.last - self.start).days // 7 + 1
+
+    @property
+    def total(self) -> int:
+        return sum(self.days.values())
+
+    @property
+    def active_days(self) -> int:
+        return len(self.days)
+
+    def column(self, day: date) -> int:
+        return (day - self.start).days // 7
+
+    def month_starts(self) -> list[tuple[int, date]]:
+        """``(column, first drawn day)`` of every month in the grid, in order."""
+        out: list[tuple[int, date]] = []
+        day = self.first
+        while day <= self.last:
+            out.append((self.column(day), day))
+            day = date(day.year + 1, 1, 1) if day.month == 12 else date(day.year, day.month + 1, 1)
+        return out
+
+
+@dataclass(slots=True)
+class CommitCalendar:
+    """Commits per day across the report period, GitHub style.
+
+    ``grids`` covers the whole span: one grid when it lasts at most
+    :data:`CALENDAR_MAX_DAYS`, else one per calendar year with commits (the
+    latest :data:`CALENDAR_MAX_YEARS`). ``recent`` is the latest 12 months of
+    it, for the summary. Colours come from the spread of busy days: a day's
+    level is 1-4 by the quartiles of the days with commits (0 = none)."""
+
+    grids: list[CalendarGrid]  # newest first
+    recent: CalendarGrid
+    thresholds: tuple[int, int, int]  # most commits a day of level 1, 2, 3 has
+    hidden_years: int = 0  # years with commits left off (beyond CALENDAR_MAX_YEARS)
+
+    @property
+    def per_year(self) -> bool:
+        return len(self.grids) > 1 or (bool(self.grids) and self.grids[0] is not self.recent)
+
+    def level(self, commits: int) -> int:
+        if commits <= 0:
+            return 0
+        for level, bound in enumerate(self.thresholds, start=1):
+            if commits <= bound:
+                return level
+        return 4
+
+
+def _calendar_thresholds(counts: list[int]) -> tuple[int, int, int]:
+    """Upper bounds of levels 1-3 from the commits of the busy days: their
+    quartiles, or 1, 2, 3 when no day has more than four commits."""
+    if not counts:
+        return (1, 2, 3)
+    ordered = sorted(counts)
+    if ordered[-1] <= 4:
+        return (1, 2, 3)
+    q1, q2, q3 = (max(1, round(percentile(ordered, q) or 1)) for q in (25, 50, 75))
+    q2 = max(q2, q1 + 1)
+    q3 = max(q3, q2 + 1)
+    return (q1, q2, q3)
+
+
+def _commit_calendar(
     commits: list[CommitRecord], period_start: date | None = None, period_end: date | None = None
+) -> CommitCalendar | None:
+    """The commit calendar of the report period (``period_start`` /
+    ``period_end``, the end at most today), else from the first commit to the
+    latest. Commit days are in the report's time zone."""
+    counts: Counter[date] = Counter(c.authored_date.date() for c in commits if c.authored_date)
+    if not counts:
+        return None
+    # The period, widened to every commit the report counts (one dated after
+    # the data was collected, by a fast clock, still shows).
+    first = min(period_start or min(counts), min(counts))
+    last = max(period_end or max(counts), max(counts))
+    if last < first:
+        return None
+    # Commits outside the drawn span (a period's data is already filtered to it).
+    counts = Counter({day: n for day, n in counts.items() if first <= day <= last})
+    if not counts:
+        return None
+
+    def grid(lo: date, hi: date) -> CalendarGrid:
+        return CalendarGrid(lo, hi, {day: n for day, n in counts.items() if lo <= day <= hi})
+
+    hidden = 0
+    if (last - first).days + 1 <= CALENDAR_MAX_DAYS:
+        recent = grid(first, last)
+        grids = [recent]
+    else:
+        recent = grid(last - timedelta(days=364), last)
+        years = sorted({day.year for day in counts}, reverse=True)
+        hidden = max(len(years) - CALENDAR_MAX_YEARS, 0)
+        grids = [
+            grid(max(first, date(year, 1, 1)), min(last, date(year, 12, 31)))
+            for year in years[:CALENDAR_MAX_YEARS]
+        ]
+    return CommitCalendar(
+        grids=grids,
+        recent=recent,
+        thresholds=_calendar_thresholds(list(counts.values())),
+        hidden_years=hidden,
+    )
+
+
+def _rhythm(
+    commits: Iterable[CommitRecord], period_start: date | None = None, period_end: date | None = None
 ) -> Rhythm | None:
     """``period_start`` / ``period_end``: the report period (its end at most
     today); weeks are counted across it, else from the first to the latest
-    commit."""
-    moments = sorted(c.authored_date for c in commits if c.authored_date)
-    if not moments:
-        return None
+    commit. One pass: counts per weekday and hour, and per day."""
     heat = [[0] * 24 for _ in range(7)]
-    for moment in moments:
+    per_day: Counter[date] = Counter()
+    total = 0
+    for commit in commits:
+        moment = commit.authored_date
+        if moment is None:
+            continue
         heat[moment.weekday()][moment.hour] += 1
+        per_day[moment.date()] += 1
+        total += 1
+    if not total:
+        return None
     by_hour = [sum(day[hour] for day in heat) for hour in range(24)]
     # The busiest three consecutive hours (wrapping past midnight).
     peak_start = max(range(24), key=lambda h: (by_hour[h] + by_hour[(h + 1) % 24] + by_hour[(h + 2) % 24], -h))
     peak = by_hour[peak_start] + by_hour[(peak_start + 1) % 24] + by_hour[(peak_start + 2) % 24]
     weekend = sum(sum(heat[d]) for d in (5, 6))
 
-    days = [m.date() for m in moments]
+    days = sorted(per_day)  # each day with commits, once
     span_start = min(days[0], period_start) if period_start else days[0]
     span_end = max(days[-1], period_end) if period_end else days[-1]
     first_monday = span_start - timedelta(days=span_start.weekday())
@@ -321,20 +465,23 @@ def _rhythm(
     weeks_in_span = (last_monday - first_monday).days // 7 + 1
     active_weeks = len({d - timedelta(days=d.weekday()) for d in days})
 
-    # The 30-day window (from a commit's day) holding the most commits.
+    # The 30-day window (from a day with commits) holding the most commits;
+    # the first such window wins a tie.
     best = (days[0], days[0], 0)
-    end = 0
+    end = window = 0
     for start in range(len(days)):
         while end < len(days) and days[end] <= days[start] + timedelta(days=29):
+            window += per_day[days[end]]
             end += 1
-        if end - start > best[2]:
-            best = (days[start], days[end - 1], end - start)
+        if window > best[2]:
+            best = (days[start], days[end - 1], window)
+        window -= per_day[days[start]]
     return Rhythm(
         heatmap=heat,
-        total=len(moments),
+        total=total,
         peak_start=peak_start,
-        peak_share=peak / len(moments),
-        weekend_share=weekend / len(moments),
+        peak_share=peak / total,
+        weekend_share=weekend / total,
         active_weeks=active_weeks,
         weeks_in_span=weeks_in_span,
         best_30_start=best[0],
@@ -395,11 +542,49 @@ def clean_title(title: str) -> str:
     return (text[:1].upper() + text[1:]) if text else " ".join((title or "").split())
 
 
-def _shipped(quarter_prs: list[PullRequestRecord], quarter_commits: list[CommitRecord], top: int = 5) -> list[tuple[str, str, str]]:
+#: Kinds of work a quarter without pull requests lists commits of, in order.
+_SHIPPED_KINDS = ("New features", "Improvements", "Bug fixes")
+#: Distinct candidates kept per kind (5 are shown; up to 5 more can repeat
+#: a text already taken from an earlier kind).
+_SHIPPED_POOL = 12
+
+
+class _ShippedPool:
+    """The most recent commits of one quarter and kind, one per distinct
+    text (what :func:`_shipped` needs of them), kept as commits stream past."""
+
+    __slots__ = ("entries",)
+
+    def __init__(self) -> None:
+        self.entries: dict[str, tuple[float, int, str, str]] = {}  # text key -> (-time, order, text, repo)
+
+    def offer(self, commit: CommitRecord, order: int) -> None:
+        text = clean_title(commit.message_first_line)
+        if len(text.split()) < 2:
+            return
+        key = text.lower()
+        entry = (-_when(commit.authored_date), order, text, commit.full_name)
+        current = self.entries.get(key)
+        if current is None or entry < current:  # more recent, or as recent and seen first
+            self.entries[key] = entry
+            if len(self.entries) > 4 * _SHIPPED_POOL:
+                kept = sorted(self.entries.items(), key=lambda kv: kv[1])[:_SHIPPED_POOL]
+                self.entries = dict(kept)
+
+    def ranked(self) -> list[tuple[float, int, str, str]]:
+        return sorted(self.entries.values())
+
+
+def _shipped(
+    quarter_prs: list[PullRequestRecord],
+    quarter_commits: Iterable[CommitRecord] | dict[str, _ShippedPool],
+    top: int = 5,
+) -> list[tuple[str, str, str]]:
     """What a quarter delivered: its merged pull requests, largest first (by
     lines changed, or by its own commits when the size isn't recorded), else
-    the commit messages that describe features, improvements or fixes. A
-    one-word title ("Commit", "Testdb") says nothing and is skipped."""
+    the commit messages that describe features, improvements or fixes (most
+    recent first within each kind). A one-word title ("Commit", "Testdb")
+    says nothing and is skipped."""
     items: list[tuple[str, str, str]] = []
     seen: set[str] = set()
 
@@ -416,25 +601,41 @@ def _shipped(quarter_prs: list[PullRequestRecord], quarter_commits: list[CommitR
     for pr in ranked:
         add(clean_title(pr.title), pr.full_name, f"PR #{pr.number}")
     if not items:
-        order = {kind: i for i, kind in enumerate(("New features", "Improvements", "Bug fixes"))}
-        candidates = [
-            (order[kind], -_when(c.authored_date), c)  # most recent first within a kind
-            for c in quarter_commits
-            if not c.is_merge and (kind := classify_commit(c.message_first_line)) in order
-        ]
-        for _rank, _recent, commit in sorted(candidates, key=lambda t: (t[0], t[1])):
-            add(clean_title(commit.message_first_line), commit.full_name, "")
+        pools = quarter_commits if isinstance(quarter_commits, dict) else _shipped_pools(quarter_commits)
+        for kind in _SHIPPED_KINDS:
+            for _time, _order, text, repo in pools[kind].ranked() if kind in pools else []:
+                add(text, repo, "")
     return items
 
 
+def _shipped_pools(commits: Iterable[CommitRecord]) -> dict[str, _ShippedPool]:
+    pools = {kind: _ShippedPool() for kind in _SHIPPED_KINDS}
+    for order, commit in enumerate(commits):
+        if not commit.is_merge:
+            kind = classify_commit(commit.message_first_line)
+            if kind in pools:
+                pools[kind].offer(commit, order)
+    return pools
+
+
+class _QuarterTally:
+    __slots__ = ("commits", "repositories", "days", "additions", "deletions", "pools")
+
+    def __init__(self) -> None:
+        self.commits = 0
+        self.repositories: set[str] = set()
+        self.days: set[date] = set()
+        self.additions = self.deletions = 0
+        self.pools = {kind: _ShippedPool() for kind in _SHIPPED_KINDS}
+
+
 def _quarters(
-    commits: list[CommitRecord],
+    commits: Iterable[CommitRecord],
     prs: list[PullRequestRecord],
     covered_from: date | None,
     covered_to: date | None,
     reviews: list[ReviewRecord] | tuple = (),
 ) -> list[Quarter]:
-    dated = [c for c in commits if c.authored_date]
     reviewed = [r.submitted_at.date() for r in reviews if r.submitted_at]
     # A pull request opened in the period can be merged after it: that merge
     # isn't part of any quarter the report covers.
@@ -442,7 +643,29 @@ def _quarters(
         p for p in prs
         if p.merged and p.merged_at and not (covered_to and p.merged_at.date() > covered_to)
     ]
-    keys = {_quarter_key(c.authored_date.date()) for c in dated}
+    # One pass over the commits: a tally per quarter.
+    tallies: dict[tuple[int, int], _QuarterTally] = {}
+    first_commit_day: date | None = None
+    for order, commit in enumerate(commits):
+        if not commit.authored_date:
+            continue
+        day = commit.authored_date.date()
+        if first_commit_day is None or day < first_commit_day:
+            first_commit_day = day
+        tally = tallies.get(_quarter_key(day))
+        if tally is None:
+            tally = tallies[_quarter_key(day)] = _QuarterTally()
+        tally.commits += 1
+        tally.repositories.add(commit.full_name)
+        tally.days.add(day)
+        if commit.stats_fetched and not commit.is_merge:
+            tally.additions += commit.additions
+            tally.deletions += commit.deletions
+        if not commit.is_merge:
+            kind = classify_commit(commit.message_first_line)
+            if kind in tally.pools:
+                tally.pools[kind].offer(commit, order)
+    keys = set(tallies)
     keys |= {_quarter_key(p.created_at.date()) for p in prs if p.created_at}
     keys |= {_quarter_key(p.merged_at.date()) for p in merges}
     keys |= {_quarter_key(day) for day in reviewed}
@@ -450,7 +673,7 @@ def _quarters(
         return []
     # All time: the first quarter is when the work began, usually part-way in.
     first_day = min(
-        [c.authored_date.date() for c in dated] + [p.created_at.date() for p in prs if p.created_at]
+        ([first_commit_day] if first_commit_day else []) + [p.created_at.date() for p in prs if p.created_at]
         + [p.merged_at.date() for p in merges] + reviewed
     )
     reviews_in = Counter(_quarter_key(day) for day in reviewed)
@@ -464,9 +687,6 @@ def _quarters(
         year, number = (year + 1, 1) if number == 4 else (year, number + 1)
     by_key = {(q.year, q.number): q for q in quarters}
 
-    commits_in: dict[tuple[int, int], list[CommitRecord]] = {}
-    for commit in dated:
-        commits_in.setdefault(_quarter_key(commit.authored_date.date()), []).append(commit)
     merged_in: dict[tuple[int, int], list[PullRequestRecord]] = {}
     for pr in prs:
         if pr.created_at:
@@ -474,24 +694,24 @@ def _quarters(
     for pr in merges:
         merged_in.setdefault(_quarter_key(pr.merged_at.date()), []).append(pr)
 
+    empty = _QuarterTally()
     previous: Quarter | None = None
     for quarter in quarters:
         key = (quarter.year, quarter.number)
-        own = commits_in.get(key, [])
-        quarter.commits = len(own)
+        tally = tallies.get(key, empty)
+        quarter.commits = tally.commits
         quarter.prs_merged = len(merged_in.get(key, []))
         quarter.reviews = reviews_in.get(key, 0)
-        quarter.repositories = len({c.full_name for c in own})
-        quarter.active_days = len({c.authored_date.date() for c in own})
-        measured = [c for c in own if c.stats_fetched and not c.is_merge]
-        quarter.additions = sum(c.additions for c in measured)
-        quarter.deletions = sum(c.deletions for c in measured)
+        quarter.repositories = len(tally.repositories)
+        quarter.active_days = len(tally.days)
+        quarter.additions = tally.additions
+        quarter.deletions = tally.deletions
         quarter.partial = bool(
             (covered_from and covered_from > quarter.start) or (covered_to and covered_to < quarter.end)
         )
         if previous is not None and not previous.partial and not quarter.partial and previous.commits:
             quarter.change = quarter.commits / previous.commits - 1
-        quarter.shipped = _shipped(merged_in.get(key, []), own)
+        quarter.shipped = _shipped(merged_in.get(key, []), tally.pools)
         previous = quarter
     return quarters
 
@@ -518,19 +738,51 @@ class Footprint:
         return self.deletions / self.additions * 100 if self.additions else None
 
 
-def _footprint(commits: list[CommitRecord]) -> Footprint | None:
-    measured = [c for c in commits if c.stats_fetched and not c.is_merge]
+def _footprint(commits: Iterable[CommitRecord]) -> Footprint | None:
+    """Commit sizes, from a count per size (not a list of every commit)."""
+    sizes: Counter[int] = Counter()
+    measured = additions = deletions = small = 0
+    for c in commits:
+        if not c.stats_fetched or c.is_merge:
+            continue
+        size = c.additions + c.deletions
+        sizes[size] += 1
+        measured += 1
+        additions += c.additions
+        deletions += c.deletions
+        if size < SMALL_COMMIT_LINES:
+            small += 1
     if not measured:
         return None
-    sizes = sorted(float(c.additions + c.deletions) for c in measured)
+    ordered = sorted(sizes.items())
     return Footprint(
-        measured=len(measured),
-        median_lines=percentile(sizes, 50) or 0.0,
-        p90_lines=percentile(sizes, 90) or 0.0,
-        small_share=sum(1 for s in sizes if s < SMALL_COMMIT_LINES) / len(sizes),
-        additions=sum(c.additions for c in measured),
-        deletions=sum(c.deletions for c in measured),
+        measured=measured,
+        median_lines=_percentile_of_counts(ordered, measured, 50) or 0.0,
+        p90_lines=_percentile_of_counts(ordered, measured, 90) or 0.0,
+        small_share=small / measured,
+        additions=additions,
+        deletions=deletions,
     )
+
+
+def _percentile_of_counts(ordered: list[tuple[int, int]], n: int, q: float) -> float | None:
+    """:func:`percentile` of ``n`` values given as sorted ``(value, count)``."""
+    if not n:
+        return None
+    position = (n - 1) * q / 100
+    low = int(position)
+    high = min(low + 1, n - 1)
+
+    def nth(index: int) -> float:
+        seen = 0
+        for value, count in ordered:
+            seen += count
+            if index < seen:
+                return float(value)
+        return float(ordered[-1][0])
+
+    low_value, high_value = nth(low), nth(high)
+    return low_value + (high_value - low_value) * (position - low)
 
 
 # ---------------------------------------------------------------------------
@@ -558,23 +810,31 @@ class Timeline:
     hidden: int  # repositories with fewer commits, left off the chart
 
 
-def _timeline(commits: list[CommitRecord], period_end: date | None = None) -> Timeline | None:
-    """When each of the busiest repositories was worked on (first to latest commit)."""
-    dated = [c for c in commits if c.authored_date]
-    if not dated:
+def _timeline(commits: Iterable[CommitRecord], period_end: date | None = None) -> Timeline | None:
+    """When each of the busiest repositories was worked on (first to latest
+    commit): per repository a count, its first and latest day and a count per
+    month, gathered in one pass."""
+    per_repo: dict[str, list] = {}  # name -> [commits, first day, last day, Counter(month)]
+    for commit in commits:
+        if not commit.authored_date:
+            continue
+        day = commit.authored_date.date()
+        entry = per_repo.get(commit.full_name)
+        if entry is None:
+            per_repo[commit.full_name] = [1, day, day, Counter({day.strftime("%Y-%m"): 1})]
+            continue
+        entry[0] += 1
+        entry[1] = min(entry[1], day)
+        entry[2] = max(entry[2], day)
+        entry[3][day.strftime("%Y-%m")] += 1
+    if not per_repo:
         return None
-    per_repo: dict[str, list[date]] = {}
-    for commit in dated:
-        per_repo.setdefault(commit.full_name, []).append(commit.authored_date.date())
-    busiest = sorted(per_repo.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:TIMELINE_REPOS]
-    rows = [
-        TimelineRow(name, min(days), max(days), len(days), dict(Counter(d.strftime("%Y-%m") for d in days)))
-        for name, days in busiest
-    ]
+    busiest = sorted(per_repo.items(), key=lambda kv: (-kv[1][0], kv[0]))[:TIMELINE_REPOS]
+    rows = [TimelineRow(name, first, last, n, dict(months)) for name, (n, first, last, months) in busiest]
     rows.sort(key=lambda row: (row.first, -row.commits, row.repository))
-    every = [d for days in per_repo.values() for d in days]
-    last = max(every)
-    return Timeline(min(every), max(last, period_end) if period_end else last, rows, len(per_repo) - len(rows))
+    first = min(entry[1] for entry in per_repo.values())
+    last = max(entry[2] for entry in per_repo.values())
+    return Timeline(first, max(last, period_end) if period_end else last, rows, len(per_repo) - len(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +991,10 @@ class Analytics:
     stack: Stack | None = None  # None when no repository's technologies were read
     reviews: Reviews | None = None  # None when no code reviews were found
     timeline: Timeline | None = None  # None without dated commits
+    commit_calendar: CommitCalendar | None = None  # commits per day across the period
+    # Pull requests opened in the period but merged after it: in the merged
+    # total, in no quarter (the report says so next to the quarters).
+    merged_after: int = 0
 
     def summary(self) -> dict[str, object]:
         """Headline figures for contribution_summary.csv and the Summary sheet."""
@@ -892,6 +1156,11 @@ def compute_analytics(
         stack=_stack(data),
         reviews=_reviews(data),
         timeline=_timeline(commits, period[1]),
+        commit_calendar=_commit_calendar(commits, *period),
+        merged_after=sum(
+            1 for p in prs
+            if p.merged and p.merged_at and end is not None and p.merged_at.date() > end.date()
+        ),
     )
     analytics.highlights = _highlights(analytics, len(commits))
     return analytics

@@ -25,6 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from github_contrib import graphql  # noqa: E402
+
+graphql.RETRY_PAUSE = 0  # retried pages don't wait in tests
 from github_contrib.client import GitHubClient, GitHubError, GraphQLQueryError  # noqa: E402
 from github_contrib.commits import collect_commits_for_repo, collect_pr_commits  # noqa: E402
 from github_contrib.models import Coverage, PullRequestRecord, RepoRecord  # noqa: E402
@@ -192,7 +194,7 @@ class FakeRest:
         self.model = model
         self.paths: list[str] = []
 
-    async def paginate(self, path, *, params=None, accept=None, max_items=None):
+    async def paginate(self, path, *, params=None, accept=None, max_items=None, on_empty=None):
         self.paths.append(path)
         full = "/".join(path.split("/")[2:4])
         repo = self.model.repos[full]
@@ -315,7 +317,7 @@ def test_timeouts_split_batches_and_shrink_pages():
 
 def test_unreadable_repositories_are_handed_to_rest():
     _gql, (commits, rest_repos), _rest = asyncio.run(_collect_both(_model(), forbidden={"acme/app"}))
-    assert [r.full_name for r in rest_repos] == ["acme/app"]
+    assert [(r.full_name, branches) for r, branches in rest_repos] == [("acme/app", None)]
     assert {c.full_name for c in commits} == {"up/stream"}
 
     async def unknown_user():

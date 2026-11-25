@@ -94,7 +94,7 @@ class FakeClient:
         data, _headers, _status = await self.request("GET", path, params=params)
         return data
 
-    async def paginate(self, path, *, params=None, accept=None, max_items=None):
+    async def paginate(self, path, *, params=None, accept=None, max_items=None, on_empty=None):
         value = self._route(path, params)
         for item in value or []:
             yield item

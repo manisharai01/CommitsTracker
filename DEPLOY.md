@@ -76,32 +76,40 @@ be `https://<service>.onrender.com`. It's used in step 1.
 | `DATABASE_URL` | recommended | Postgres URL for the report history. Without it, history is kept in memory and lost on restart. |
 | `PUBLIC_URL` | no | The site address, if you use a custom domain. Default: `RENDER_EXTERNAL_URL`. |
 | `RETENTION_HOURS` | no | Hours to keep report files after a run finishes. Default 24. |
-| `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. |
-| `PDF_TIMEOUT` | no | Seconds the PDF may take. Default 900 (15 minutes). |
-| `PDF_PART_ROWS` | no | Commit-appendix rows printed per part of the PDF. Default 200, which keeps the PDF step at about 350 MB however long the report is (measured with 1,800 commits and every section). `0` prints in one go (over 900 MB for 1,800 commits). |
+| `PARALLEL` | no | Reports run at the same time. `render.yaml` sets 1, which fits 512 MB. The server also lowers it to what its memory holds (about 600 MB per run), so a value too high for the container can't take it down. |
+| `PDF_TIMEOUT` | no | Seconds the PDF may take. Default 900 (15 minutes); the summary PDF takes seconds. |
+| `PDF_PART_ROWS` | no | Only for reports made before the summary PDF existed, which print their whole commit appendix: rows printed per part. Default 200. |
 | `PDF_MEMORY_LIMIT_MB` | no | The memory the PDF step must stay under. Default: the container's limit. It stops the browser 64 MB before that, so the server never runs out. |
 | `PORT`, `RENDER`, `RENDER_EXTERNAL_URL` | set by Render | Port, `0.0.0.0` binding and trusted proxy headers. |
 
 Other limits are `webui.py` flags (`python webui.py --help`), for example
-`--max-jobs-per-hour` and `--job-timeout`.
+`--max-jobs-per-hour` and `--job-timeout` (default 120 minutes). A run that
+nears its time limit stops collecting 10 minutes before it and writes the
+report from what it read, with a data-completeness note saying so, instead of
+being stopped with nothing to show.
 
 ## Plans
 
 - **Free** (`render.yaml` default) needs no card. It sleeps after 15 idle
   minutes, and the next visit waits about a minute while it wakes up. A
   report in progress keeps it awake (the page checks on it every second).
-  It has a tenth of a CPU, so the PDF of a long report takes a few minutes.
-  The report is marked done first, with the HTML and Excel files ready, and
-  shows "Preparing PDF…" until the PDF is in.
-- **Memory**: free and starter have 512 MB. Chromium needs a lot to print a
-  long report, so the PDF is printed in parts (`PDF_PART_ROWS`) by Chromium's
-  headless shell. If the server still gets close to its limit, the PDF step
-  stops and the report stays (running out of memory would restart the whole
-  service and lose the report's files). The report card then offers **Save as
-  PDF**, which prints the report in the reader's own browser: the PDF is made
-  on their device, however long the report is. Why the server made no PDF is
-  written to the server log (Render → **Logs**: `report <id>: no PDF (...)`),
-  never on the report card.
+  It has a tenth of a CPU. The report is marked done first, with the HTML and
+  Excel files ready, and shows "Preparing PDF…" until the PDF is in.
+- **The PDF is a concise summary** (`summary.html`, a few pages): the headline
+  numbers, highlights, executive summary, top repositories, delivery,
+  quarters, working rhythm and technologies. Every commit stays in the HTML
+  report and the Excel workbook. Its size doesn't grow with the number of
+  commits, so printing it takes seconds and about 100 MB (measured on Linux
+  for a 30,000-commit report).
+- **Memory**: free and starter have 512 MB. A report run peaks at about 210 MB
+  for 30,000 commits (the workbook and the HTML are written as they are made,
+  never held whole). If the server still gets close to its limit while
+  printing, the PDF step stops and the report stays (running out of memory
+  would restart the whole service and lose the report's files). The report
+  card then offers **Save as PDF**, which prints the same summary in the
+  reader's own browser. Why the server made no PDF is written to the server
+  log (Render → **Logs**: `report <id>: no PDF (...)`), never on the report
+  card.
 - **Starter** (paid, set `plan: starter`) stays awake and has more CPU, so
   reports and PDFs finish faster. Render asks for a card for it.
 - On every plan, report **files** are kept on the service's own disk, which is
@@ -124,7 +132,16 @@ Other limits are `webui.py` flags (`python webui.py --help`), for example
   report is never read with the wrong account's access.
 - **Classic tokens** (`repo` + `read:org`) see private and organization
   repositories. Organizations with SAML SSO need the token authorized for
-  them (github.com → Settings → Tokens → Configure SSO).
+  them (github.com → Settings → Tokens → Configure SSO). A pull request or
+  commit GitHub hides from a token is left out with a data-completeness note;
+  the rest of the report is unaffected.
+- **Token checks** (the warning shown before a run when a token belongs to
+  another account or lacks a scope) are limited to 60 tokens per user (or
+  address) per 10 minutes and 8 at a time, so the server can't be used to
+  test tokens in bulk. A refused check never blocks a run.
+- **Rate limits**: a secondary-rate-limit answer pauses every request of that
+  token (at least a minute, longer when it repeats), measured on GitHub's
+  clock, so a run neither hammers GitHub nor gives up early.
 - **The database** holds only GitHub user ids and, per report: id, time,
   period, status and, once it is done, six numbers (commits, pull requests,
   repositories, active days, lines added and deleted). Row level security is

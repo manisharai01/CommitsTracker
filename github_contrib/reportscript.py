@@ -12,6 +12,10 @@ import base64
 import hashlib
 import re
 
+#: The concise summary written next to report.html: what the PDF (and the web
+#: app's "Save as PDF") prints. The full report stays the HTML and workbook.
+SUMMARY_FILE = "summary.html"
+
 SCRIPT = """
 (function () {
   function setAll(open, selector) {

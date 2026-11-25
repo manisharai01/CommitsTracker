@@ -15,9 +15,9 @@ date range until each slice fits — no result is dropped silently.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
-from .client import GitHubClient, GitHubError
+from .client import DeadlineError, GitHubClient, GitHubError
 from .config import Account
 from .logging_config import get_logger
 from .models import Coverage, OrgRecord, RepoRecord, parse_github_datetime
@@ -66,11 +66,13 @@ async def discover_repositories(
     max_repos: int | None = None,
 ) -> list[RepoRecord]:
     """Discover all repositories accessible to ``account``."""
+    # Sorted by name, not by last push: a repository pushed to while the pages
+    # are read would move to page 1 (already read) and never be listed.
     params = {
         "visibility": "all",
         "affiliation": "owner,collaborator,organization_member",
-        "sort": "pushed",
-        "direction": "desc",
+        "sort": "full_name",
+        "direction": "asc",
     }
     repos: list[RepoRecord] = []
     async for payload in client.paginate("/user/repos", params=params, max_items=max_repos):
@@ -112,6 +114,8 @@ async def fetch_repo(
     """Fetch a single repository's metadata by ``owner/name``."""
     try:
         payload = await client.get_json(f"/repos/{full_name}")
+    except DeadlineError:
+        raise  # the caller notes the time limit once
     except GitHubError as exc:
         log.debug("could not fetch repo %s: %s", full_name, exc)
         return None
@@ -133,21 +137,28 @@ async def search_all(
     end: datetime,
     coverage: Coverage,
     what: str,
-) -> list[dict[str, Any]]:
-    """Every result of ``base_query`` with ``date_field`` in ``[start, end]``.
+    pick: Callable[[dict[str, Any]], Any] | None = None,
+) -> list[Any]:
+    """Every result of ``base_query`` with ``date_field`` in ``[start, end]``
+    (``pick(item)`` of each, when given: a search item carries whole user and
+    repository objects, about 13 KB each, so 30,000 kept whole took 390 MB).
 
     A query matching more than 1000 results is split into two halves of its
     date range, recursively, so every slice can be read completely. Gaps that
     cannot be avoided (more than 1000 results within a single second, or
     GitHub reporting a timed-out search) are recorded as completeness notes.
     """
-    results: list[dict[str, Any]] = []
+    results: list[Any] = []
     pending = [(start.replace(microsecond=0), end.replace(microsecond=0))]
     while pending:
         lo, hi = pending.pop()
         query = f"{base_query} {date_field}:{_search_stamp(lo)}..{_search_stamp(hi)}"
-        items, total, incomplete = await client.search(path, query, split_above=SEARCH_CAP)
-        if total > SEARCH_CAP and hi - lo > timedelta(seconds=1):
+        # A one-second slice can't be split further: read all it shows.
+        splittable = hi - lo > timedelta(seconds=1)
+        items, total, incomplete = await client.search(
+            path, query, split_above=SEARCH_CAP if splittable else None
+        )
+        if total > SEARCH_CAP and splittable:
             mid = (lo + (hi - lo) / 2).replace(microsecond=0)
             pending.append((mid + timedelta(seconds=1), hi))
             pending.append((lo, mid))
@@ -159,8 +170,24 @@ async def search_all(
                 f"GitHub search returned {len(items)} of {total} {what} between "
                 f"{_search_stamp(lo)} and {_search_stamp(hi)}; the rest could not be listed."
             )
-        results.extend(items)
+        results.extend(pick(item) for item in items) if pick is not None else results.extend(items)
     return results
+
+
+def _repo_of_commit(item: dict[str, Any]) -> str:
+    return str((item.get("repository") or {}).get("full_name") or "")
+
+
+#: What a pull-request search item is still needed for (see
+#: pull_requests._pr_from_search_item and issue_repo_full_name).
+_PR_ITEM_KEYS = ("number", "title", "state", "created_at", "updated_at", "closed_at", "html_url", "repository_url")
+
+
+def _slim_pr_item(item: dict[str, Any]) -> dict[str, Any]:
+    slim = {key: item.get(key) for key in _PR_ITEM_KEYS}
+    slim["user"] = {"login": (item.get("user") or {}).get("login")}
+    slim["pull_request"] = {"merged_at": (item.get("pull_request") or {}).get("merged_at")}
+    return slim
 
 
 async def discover_repos_via_search(
@@ -183,16 +210,18 @@ async def discover_repos_via_search(
     names: set[str] = set()
     for base_query, what in queries:
         try:
-            items = await search_all(
-                client, "/search/commits", base_query, "author-date", start, end, coverage, what
-            )
+            found = set(await search_all(
+                client, "/search/commits", base_query, "author-date", start, end, coverage, what,
+                pick=_repo_of_commit,
+            ))
+        except DeadlineError:
+            raise  # the caller notes the time limit once
         except GitHubError as exc:
             coverage.warn(
                 f"Searching {what} failed ({exc}); repositories found only through "
                 "search may be missing."
             )
             continue
-        found = {str((item.get("repository") or {}).get("full_name") or "") for item in items}
         found.discard("")
         if found:
             log.info("search found %d repo(s) with %s", len(found), what)
@@ -212,8 +241,10 @@ async def search_pull_requests(
     try:
         return await search_all(
             client, "/search/issues", f"type:pr author:{login}", "created",
-            start, end, coverage, f"pull requests by {login}",
+            start, end, coverage, f"pull requests by {login}", pick=_slim_pr_item,
         )
+    except DeadlineError:
+        raise  # the caller notes the time limit once
     except GitHubError as exc:
         coverage.warn(
             f"Searching pull requests by {login} failed ({exc}); pull requests in "
@@ -239,10 +270,12 @@ async def discover_org_repos(
     repos: list[RepoRecord] = []
     try:
         async for payload in client.paginate(
-            f"/orgs/{org_login}/repos", params={"type": "all", "sort": "pushed"}
+            f"/orgs/{org_login}/repos", params={"type": "all", "sort": "full_name", "direction": "asc"}
         ):
             if isinstance(payload, dict) and payload.get("full_name"):
                 repos.append(_repo_from_payload(payload, discovered_by))
+    except DeadlineError:
+        raise  # the caller notes the time limit once
     except GitHubError as exc:
         message = f"Could not list the repositories of organization {org_login} ({exc})."
         if coverage is not None:

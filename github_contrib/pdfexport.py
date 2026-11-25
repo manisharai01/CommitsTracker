@@ -1,12 +1,17 @@
 """PDF export of the HTML report via a headless Chromium browser.
 
 Microsoft Edge ships with Windows 10/11, and Edge, Chrome and Chromium's
-headless shell all support ``--headless --print-to-pdf``.  The report is opened
-with the ``#print`` fragment so its script expands the chronological commit
-appendix — the PDF therefore contains the complete commit history.
+headless shell all support ``--headless --print-to-pdf``.
+
+The PDF is the report's concise summary: ``summary.html``, written next to
+``report.html`` (see htmlreport.render_summary_html), a few pages however many
+commits the report has. Every commit stays in the HTML report and the
+workbook. A report from before the summary existed is printed whole instead,
+opened with the ``#print`` fragment so its script expands the chronological
+commit appendix.
 
 The browser holds a whole document in memory while it prints it: a few hundred
-MB for the report itself plus about 0.25 MB per appendix row, so one long
+MB for the page itself plus about 0.25 MB per appendix row, so one long
 report (1,700+ commits: over 1 GB) was enough to take a 512 MB server down.
 A long appendix is therefore printed in parts of ``PDF_PART_ROWS`` rows
 (``#print=FROM-TO``) that pypdf joins into one PDF: the memory needed no longer
@@ -37,6 +42,7 @@ import time
 from pathlib import Path
 
 from .logging_config import get_logger
+from .reportscript import SUMMARY_FILE
 
 log = get_logger("pdfexport")
 
@@ -343,6 +349,17 @@ def _join(parts: list[Path], target: Path) -> None:
         writer.write(fh)
 
 
+def pdf_source(html_path: Path) -> Path:
+    """The page a report's PDF is printed from: its concise summary
+    (``summary.html`` next to ``report.html``) when there is one, else the
+    page itself (a report from before the summary existed)."""
+    html_path = Path(html_path)
+    summary = html_path.with_name(SUMMARY_FILE)
+    if html_path.name != SUMMARY_FILE and summary.is_file():
+        return summary
+    return html_path
+
+
 def _export(html_path: Path, pdf_path: Path | None, timeout: float | None) -> tuple[Path | None, str]:
     """:func:`export_pdf`, also saying how it ended: "done", "failed",
     "timeout" or "memory"."""
@@ -351,6 +368,7 @@ def _export(html_path: Path, pdf_path: Path | None, timeout: float | None) -> tu
     if not html_path.exists():
         log.warning("cannot export PDF: %s does not exist", html_path)
         return None, "failed"
+    html_path = pdf_source(html_path)
 
     browser = find_browser()
     if browser is None:
@@ -417,7 +435,8 @@ def _export(html_path: Path, pdf_path: Path | None, timeout: float | None) -> tu
 
 
 def export_pdf(html_path: Path, pdf_path: Path | None = None, *, timeout: float | None = None) -> Path | None:
-    """Render ``html_path`` to ``pdf_path`` (default: same name, .pdf).
+    """Render the report ``html_path`` (its summary, see :func:`pdf_source`)
+    to ``pdf_path`` (default: the report's name, .pdf).
 
     Returns the written path, or ``None`` when no browser is available or the
     conversion fails (a warning is logged either way — PDF export must never

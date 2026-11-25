@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from .client import GitHubClient, GitHubError
+from .client import DeadlineError, GitHubClient, GitHubError, RateLimitedError
 from .commits import PR_COMMITS_LIMIT, _authored_by, _commit_from_payload
 from .commits import enrich_commits_with_stats as enrich_commits_with_stats_rest
 from .logging_config import get_logger
@@ -45,6 +47,17 @@ PAGE = 100
 PR_PAGE = 50
 #: A page that keeps timing out is halved down to this size before giving up.
 MIN_PAGE = 10
+#: A walk gives up after this many failed pages in a row. Each failure waits
+#: (RETRY_PAUSE seconds, doubling); from the second one in a row the page is
+#: also halved (down to MIN_PAGE). A success resets the count, so a long walk
+#: survives the occasional blip instead of failing on its fifth over hours.
+MAX_FAILURES_IN_A_ROW = 6
+RETRY_PAUSE = 1.0
+#: After this many good pages in a row a halved page doubles again (a page
+#: halved by two blips in a row needn't stay small for the rest of the walk).
+GROW_AFTER = 20
+#: GraphQL error types that retrying can't fix.
+_PERMANENT_ERRORS = frozenset({"NOT_FOUND", "FORBIDDEN", "UNAUTHORIZED", "UNPROCESSABLE"})
 #: Aliases per query, by kind of work. Walking a long history for one author
 #: is the slow part, so those batches are small.
 BATCH: dict[str, int] = {
@@ -99,16 +112,48 @@ class Walk:
     cursor: str | None = None
     # Stop after the first page when the connection holds more than this.
     limit: int | None = None
+    # Applied to each node as it arrives: what to keep of it (None = drop it),
+    # so a walk never holds what its caller would throw away.
+    convert: Callable[[dict], dict | None] | None = None
     nodes: list[dict] = field(default_factory=list)
     total: int | None = None
     root_data: dict | None = None  # the root object of the first page
     overflow: bool = False
     done: bool = False
     error: str = ""
+    # Errors of single nodes (e.g. one pull request hidden by SAML SSO): the
+    # rest of the page was read; the caller notes what is missing.
+    skipped: list[str] = field(default_factory=list)
+    failures: int = 0  # failed pages in a row
+    successes: int = 0  # good pages in a row since the page was last resized
+    full_page: int = 0  # the page size to grow back to
+
+    def __post_init__(self) -> None:
+        self.full_page = self.page_size
 
     @property
     def finished(self) -> bool:
         return self.done or bool(self.error)
+
+    def failed_page(self, reason: str) -> float | None:
+        """Count a failed page: the pause before trying it again (halving the
+        page from the second failure in a row), or None once the walk has
+        failed MAX_FAILURES_IN_A_ROW times in a row (``error`` is then set)."""
+        self.failures += 1
+        self.successes = 0
+        if self.failures > MAX_FAILURES_IN_A_ROW:
+            self.error = reason
+            return None
+        if self.failures >= 2 and self.page_size > MIN_PAGE:
+            self.page_size = max(MIN_PAGE, self.page_size // 2)
+        return min(RETRY_PAUSE * 2 ** (self.failures - 1), 30.0) * random.uniform(1.0, 1.25)
+
+    def good_page(self) -> None:
+        self.failures = 0
+        self.successes += 1
+        if self.successes >= GROW_AFTER and self.page_size < self.full_page:
+            self.page_size = min(self.full_page, self.page_size * 2)
+            self.successes = 0
 
 
 def _str(value: str) -> str:
@@ -148,8 +193,30 @@ def _take_batch(queue: deque[Walk], size: int) -> list[Walk]:
     return batch
 
 
+def _in_list(path: list) -> bool:
+    """Whether an error ``path`` points into one element of a list (a single
+    node), rather than at the object or connection a walk reads."""
+    return any(isinstance(part, int) for part in path[1:])
+
+
+async def _pause(walk: Walk, seconds: float | None) -> None:
+    """Wait before ``walk`` is tried again (not past the run's deadline)."""
+    if not seconds:
+        return
+    try:
+        await getattr(walk.client, "_sleep", asyncio.sleep)(seconds)
+    except DeadlineError as exc:
+        walk.error = str(exc)
+
+
 async def _run_batch(batch: list[Walk]) -> list[Walk]:
-    """Fetch the next page of every walk in ``batch`` with one query. Never raises."""
+    """Fetch the next page of every walk in ``batch`` with one query. Never raises.
+
+    A failed query is split and retried; a single walk that keeps failing is
+    retried after a pause, then with smaller pages, and only fails after
+    MAX_FAILURES_IN_A_ROW failures in a row. Rate limits and the deadline are
+    the client's business: splitting would only multiply refused requests.
+    """
     aliases = [f"w{i}" for i in range(len(batch))]
     query = "query {\n" + "\n".join(
         f"{alias}: {walk.root} {{ {walk.body(walk.page_size, _after(walk.cursor))} }}"
@@ -158,35 +225,46 @@ async def _run_batch(batch: list[Walk]) -> list[Walk]:
     try:
         data, errors = await batch[0].client.graphql(query)
     except GitHubError as exc:
-        if exc.status in (401, 403):  # no use splitting: every part fails alike
-            for walk in batch:
+        if isinstance(exc, (RateLimitedError, DeadlineError)) or exc.status in (401, 403):
+            for walk in batch:  # no use splitting: every part fails alike
                 walk.error = str(exc)
         elif len(batch) > 1:
             middle = len(batch) // 2
             await asyncio.gather(_run_batch(batch[:middle]), _run_batch(batch[middle:]))
-        elif batch[0].page_size > MIN_PAGE:
-            batch[0].page_size = max(MIN_PAGE, batch[0].page_size // 2)  # retried smaller
         else:
-            batch[0].error = str(exc)
+            await _pause(batch[0], batch[0].failed_page(str(exc)))
         return batch
     except Exception as exc:  # noqa: BLE001 - one bad query must not end the run
         for walk in batch:
             walk.error = f"{type(exc).__name__}: {exc}"
         return batch
 
-    by_alias: dict[str, str] = {}
-    loose: list[str] = []
+    by_alias: dict[str, dict] = {}
+    by_node: dict[str, list[dict]] = {}
+    loose: list[dict] = []
     for error in errors:
         where = error.get("path")
         if isinstance(where, list) and where and isinstance(where[0], str):
-            by_alias.setdefault(where[0], _error_text(error))
+            if _in_list(where):
+                by_node.setdefault(where[0], []).append(error)
+            else:
+                by_alias.setdefault(where[0], error)
         else:
-            loose.append(_error_text(error))
+            loose.append(error)
 
+    pauses: list[float] = []
     for alias, walk in zip(aliases, batch):
         obj = data.get(alias)
-        if alias in by_alias or not isinstance(obj, dict):
-            walk.error = by_alias.get(alias) or (loose[0] if loose else "no data returned")
+        error = by_alias.get(alias)
+        if error is not None or not isinstance(obj, dict):
+            if error is None and not loose:
+                walk.error = "no data returned"
+            elif error is not None and error.get("type") in _PERMANENT_ERRORS:
+                walk.error = _error_text(error)
+            else:  # "Something went wrong…", a timeout, an internal error: try again
+                pause = walk.failed_page(_error_text(error if error is not None else loose[0]))
+                if pause is not None:
+                    pauses.append(pause)
             continue
         try:
             conn = walk.path(obj)
@@ -195,6 +273,10 @@ async def _run_batch(batch: list[Walk]) -> list[Walk]:
             continue
         if walk.root_data is None:
             walk.root_data = obj
+        walk.good_page()
+        # One unreadable node (an SSO-protected pull request, a deleted
+        # author...) is noted and skipped; the rest of the page counts.
+        walk.skipped.extend(_error_text(e) for e in by_node.get(alias, []))
         if conn is None:
             walk.done = True
             continue
@@ -203,7 +285,11 @@ async def _run_batch(batch: list[Walk]) -> list[Walk]:
         if walk.limit is not None and walk.total is not None and walk.total > walk.limit:
             walk.overflow = walk.done = True
             continue
-        walk.nodes.extend(n for n in conn.get("nodes") or [] if isinstance(n, dict))
+        for node in conn.get("nodes") or []:
+            if isinstance(node, dict):
+                kept = walk.convert(node) if walk.convert is not None else node
+                if kept is not None:
+                    walk.nodes.append(kept)
         info = conn.get("pageInfo") or {}
         cursor = info.get("endCursor")
         if info.get("hasNextPage") and cursor:
@@ -212,7 +298,18 @@ async def _run_batch(batch: list[Walk]) -> list[Walk]:
             walk.cursor = str(cursor)
         else:
             walk.done = True
+    if pauses:
+        await _pause(batch[0], max(pauses))
     return batch
+
+
+def note_skipped(walks: list[Walk], coverage: Coverage | None, what: str) -> None:
+    """One completeness note for the nodes ``walks`` couldn't read."""
+    reasons = [reason for walk in walks for reason in walk.skipped]
+    if reasons and coverage is not None:
+        coverage.warn(
+            f"{len(reasons)} {what} could not be read and are missing ({reasons[0]})."
+        )
 
 
 async def run_walks(
@@ -370,13 +467,18 @@ def _heads_walk(client: GitHubClient, repo: RepoRecord, all_branches: bool) -> W
     return Walk(client, _repo_root(repo.full_name), body, path)
 
 
-def _history_walk(client: GitHubClient, full_name: str, head: str, author: str) -> Walk:
-    """Commits by ``author`` (a GraphQL CommitAuthor) reachable from ``head``."""
+def _history_walk(
+    client: GitHubClient, full_name: str, head: str, author: str, since: str = "",
+    convert: Callable[[dict], dict | None] | None = None,
+) -> Walk:
+    """Commits by ``author`` (a GraphQL CommitAuthor) reachable from ``head``
+    (committed from ``since`` on, an ISO time, when given)."""
+    since_arg = f", since: {_str(since)}" if since else ""
 
     def body(size: int, after: str) -> str:
         return (
             f"object(oid: {_str(head)}) {{ ... on Commit {{ "
-            f"history(first: {size}{after}, author: {author}) "
+            f"history(first: {size}{after}, author: {author}{since_arg}) "
             f"{{ {_PAGE_INFO} nodes {{ {COMMIT_FIELDS} }} }} }} }}"
         )
 
@@ -386,11 +488,28 @@ def _history_walk(client: GitHubClient, full_name: str, head: str, author: str) 
             raise _Missing(f"commit {head[:7]} could not be read")
         return target.get("history")
 
-    return Walk(client, _repo_root(full_name), body, path)
+    return Walk(client, _repo_root(full_name), body, path, convert=convert)
 
 
-def _compare_walk(client: GitHubClient, full_name: str, base: str, branch: str) -> Walk:
-    """Every commit on ``branch`` that is not on ``base`` (any author)."""
+def node_author_filter(logins: set[str], emails: set[str]) -> Callable[[dict], dict | None]:
+    """``Walk.convert`` keeping only commit nodes by ``logins`` / ``emails``
+    (lower case): a compared branch lists everyone's commits."""
+
+    def keep(node: dict) -> dict | None:
+        author = node.get("author") or {}
+        login = str((author.get("user") or {}).get("login") or "").lower()
+        email = str(author.get("email") or "").lower()
+        return node if login in logins or (email and email in emails) else None
+
+    return keep
+
+
+def _compare_walk(
+    client: GitHubClient, full_name: str, base: str, branch: str,
+    keep: Callable[[dict], dict | None] | None = None,
+) -> Walk:
+    """Every commit on ``branch`` that is not on ``base`` (by the tracked
+    authors only, with ``keep``)."""
 
     def body(size: int, after: str) -> str:
         return (
@@ -405,7 +524,7 @@ def _compare_walk(client: GitHubClient, full_name: str, base: str, branch: str) 
             raise _Missing(f"branch '{branch}' could not be compared with '{base}'")
         return compare.get("commits")
 
-    return Walk(client, _repo_root(full_name), body, path, limit=COMPARE_MAX_AHEAD)
+    return Walk(client, _repo_root(full_name), body, path, limit=COMPARE_MAX_AHEAD, convert=keep)
 
 
 @dataclass(eq=False)
@@ -432,58 +551,99 @@ class _RepoPlan:
     all_branches: bool
     heads: Walk = field(init=False)
     scans: list[_Scan] = field(default_factory=list)
+    # Why the repository couldn't be planned through GraphQL at all.
+    unplanned: str = ""
+    since: str = ""  # history walks start here (an ISO time; "" = all history)
 
     def __post_init__(self) -> None:
         self.heads = _heads_walk(self.client, self.repo, self.all_branches)
 
-    def plan(self, filters: list[tuple[str, str]], primary: str) -> None:
+    def plan(
+        self, filters: list[tuple[str, str]], primary: str,
+        keep: Callable[[dict], dict | None] | None = None, since: str = "",
+    ) -> None:
         """Default branch walks per author, then one comparison per other branch."""
+        self.since = since
         default_ref = (self.heads.root_data or {}).get("defaultBranchRef")
-        if not isinstance(default_ref, dict):
-            return  # an empty repository
-        default = str(default_ref.get("name") or "")
-        default_head = str((default_ref.get("target") or {}).get("oid") or "")
-        if not default or not default_head:
-            return
-        for login, author in filters:
-            walk = _history_walk(self.client, self.repo.full_name, default_head, author)
-            self.scans.append(_Scan(default, walk, login, by_author=True))
-
         heads: dict[str, str] = {}
         for node in self.heads.nodes:
             name, oid = node.get("name"), (node.get("target") or {}).get("oid")
             if name and oid:
                 heads[str(name)] = str(oid)
+        if not isinstance(default_ref, dict):
+            if heads:  # branches but no default one: let the REST collector read them
+                self.unplanned = "the repository has branches but no default branch"
+            return  # else an empty repository
+        default = str(default_ref.get("name") or "")
+        default_head = str((default_ref.get("target") or {}).get("oid") or "")
+        if not default or not default_head:
+            return
+        for login, author in filters:
+            walk = _history_walk(self.client, self.repo.full_name, default_head, author, since)
+            self.scans.append(_Scan(default, walk, login, by_author=True))
+
         seen = {default_head}
         for name in sorted(heads):
             if name == default or heads[name] in seen:
                 continue  # same head as a branch already scanned: same history
             seen.add(heads[name])
-            walk = _compare_walk(self.client, self.repo.full_name, default, name)
+            walk = _compare_walk(self.client, self.repo.full_name, default, name, keep)
             self.scans.append(_Scan(name, walk, primary, by_author=False, head=heads[name]))
 
     def replace_failed_compares(self, filters: list[tuple[str, str]]) -> list[Walk]:
         """Per-author history walks for branches whose comparison overflowed or
-        failed (e.g. a branch with no history in common, like gh-pages)."""
+        failed (e.g. a branch with no history in common, like gh-pages).
+
+        Those walks re-read history the plan may already hold (every branch
+        far ahead of a stale default branch shares most of it): a commit
+        already read is dropped as it arrives, so memory holds each commit once."""
+        known = {
+            str(node.get("oid") or "")
+            for scan in self.scans if not (scan.walk.overflow or scan.walk.error)
+            for node in scan.walk.nodes
+        }
+
+        def new_only(node: dict) -> dict | None:
+            oid = str(node.get("oid") or "")
+            if oid in known:
+                return None
+            known.add(oid)
+            return node
+
         added: list[Walk] = []
         for scan in self.scans:
             if scan.by_author or not (scan.walk.overflow or scan.walk.error):
                 continue
             scan.replaced_by = [
-                _Scan(scan.branch, _history_walk(self.client, self.repo.full_name, scan.head, author), login, True)
+                _Scan(
+                    scan.branch,
+                    _history_walk(self.client, self.repo.full_name, scan.head, author, self.since, new_only),
+                    login,
+                    True,
+                )
                 for login, author in filters
             ]
             added.extend(child.walk for child in scan.replaced_by)
         return added
 
     def failure(self) -> str:
-        if self.heads.error:
-            return self.heads.error
+        """Why the whole repository must be read with REST instead ("" = it
+        needn't): its branches couldn't be listed, or its default branch
+        couldn't be read."""
+        if self.heads.error or self.unplanned:
+            return self.heads.error or self.unplanned
         for scan in self.scans:
-            for leaf in scan.leaves():
-                if leaf.walk.error:
-                    return leaf.walk.error
+            if scan.by_author and scan.walk.error:
+                return scan.walk.error
         return ""
+
+    def failed_branches(self) -> list[str]:
+        """Other branches that couldn't be read through GraphQL (REST reads
+        just these; everything else this plan read stays)."""
+        return [
+            scan.branch for scan in self.scans
+            if not scan.by_author and any(leaf.walk.error for leaf in scan.leaves())
+        ]
 
     def commits(self, logins: set[str], emails: set[str]) -> list[CommitRecord]:
         """De-duplicated by SHA; the first source (default branch first) wins."""
@@ -491,6 +651,8 @@ class _RepoPlan:
         out: list[CommitRecord] = []
         for scan in self.scans:
             for leaf in scan.leaves():
+                if leaf.walk.error:
+                    continue  # read again with REST (failed_branches)
                 for node in leaf.walk.nodes:
                     payload = rest_commit(node)
                     if not leaf.by_author and not _authored_by(payload, logins, emails):
@@ -516,6 +678,12 @@ async def resolve_user_ids(client: GitHubClient, logins: list[str], *, inflight:
     return ids
 
 
+#: History walks of a period report start this long before the period: the
+#: walk filters by commit date, the report by author date (a commit is
+#: committed after it was authored, by days when it is rebased later).
+SINCE_MARGIN = timedelta(days=90)
+
+
 async def collect_commits(
     repos: list[RepoRecord],
     client_for: Callable[[RepoRecord], GitHubClient],
@@ -524,14 +692,20 @@ async def collect_commits(
     *,
     scan_all_branches: bool,
     inflight: int,
-) -> tuple[list[CommitRecord], list[RepoRecord]] | None:
+    since: datetime | None = None,
+    coverage: Coverage | None = None,
+) -> tuple[list[CommitRecord], list[tuple[RepoRecord, list[str] | None]]] | None:
     """Commits by the tracked logins / emails in ``repos``.
 
     Same result as :func:`commits.collect_commits_for_repo` on each repo:
     every branch for affiliated repositories (when ``scan_all_branches``),
     the default branch otherwise, de-duplicated by SHA with the default branch
-    first. Returns ``(commits, repos to collect with REST instead)``, or
-    ``None`` when GraphQL cannot be used at all.
+    first. ``since`` (the report period's start) spares reading older history.
+
+    Returns ``(commits, what to read with REST instead)`` — each a repository
+    with the branches to read (``None``: all of it) — or ``None`` when GraphQL
+    cannot be used at all. A branch that can't be read through GraphQL costs
+    only that branch, never what was read of the rest of its repository.
     """
     if not repos:
         return [], []
@@ -542,13 +716,19 @@ async def collect_commits(
     filters = [(login, f"{{id: {_str(uid)}}}") for login, uid in ids.items()]
     if author_emails:
         filters.append((primary, "{emails: [" + ", ".join(_str(e) for e in author_emails) + "]}"))
+    logins = {login.lower() for login in target_logins}
+    emails = {email.lower() for email in author_emails}
+    keep = node_author_filter(logins, emails)
+    since_text = (
+        (since - SINCE_MARGIN).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if since else ""
+    )
 
     plans = [_RepoPlan(repo, client_for(repo), scan_all_branches and repo.affiliated) for repo in repos]
     with _Progress("Branches", len(plans)) as bar:
         await run_walks([p.heads for p in plans], BATCH["heads"], inflight=inflight, progress=bar)
     live = [p for p in plans if not p.heads.error]
     for plan in live:
-        plan.plan(filters, primary)
+        plan.plan(filters, primary, keep, since_text)
 
     histories = [s.walk for p in live for s in p.scans if s.by_author]
     compares = [s.walk for p in live for s in p.scans if not s.by_author]
@@ -561,17 +741,22 @@ async def collect_commits(
         bar.add(len(extra))
         await run_walks(extra, BATCH["history"], inflight=inflight, progress=bar)
 
-    logins = {login.lower() for login in target_logins}
-    emails = {email.lower() for email in author_emails}
     commits: list[CommitRecord] = []
-    rest: list[RepoRecord] = []
+    rest: list[tuple[RepoRecord, list[str] | None]] = []
     for plan in plans:
         reason = plan.failure()
         if reason:
             log.debug("%s: GraphQL failed (%s); using REST", plan.repo.full_name, reason)
-            rest.append(plan.repo)
-        else:
-            commits.extend(plan.commits(logins, emails))
+            rest.append((plan.repo, None))
+            continue
+        commits.extend(plan.commits(logins, emails))
+        failed = plan.failed_branches()
+        if failed:
+            log.debug("%s: %d branch(es) to read with REST", plan.repo.full_name, len(failed))
+            rest.append((plan.repo, failed))
+    note_skipped(
+        [s.walk for p in live for scan in p.scans for s in scan.leaves()], coverage, "commit(s)"
+    )
     if extra:
         log.info("%d branch(es) far ahead of their default branch were read per author", len(extra))
     return commits, rest
@@ -621,7 +806,10 @@ class PullRequestData:
     """Everything :func:`collect_pull_requests` found."""
 
     prs: list[PullRequestRecord] = field(default_factory=list)
-    # (repo, number) -> every commit node of the pull request
+    # (repo, number) -> the SHA of every commit of the pull request, in order
+    commit_shas: dict[tuple[str, int], list[str]] = field(default_factory=dict)
+    # (repo, number) -> the commit nodes by the tracked users (only those are
+    # kept: a team's pull requests hold mostly other people's commits)
     commit_nodes: dict[tuple[str, int], list[dict]] = field(default_factory=dict)
     # (repo, number) -> how many commits GitHub says the pull request has
     commit_totals: dict[tuple[str, int], int] = field(default_factory=dict)
@@ -629,6 +817,16 @@ class PullRequestData:
     incomplete: set[tuple[str, int]] = field(default_factory=set)
     # Repositories the pull requests live in, keyed by full name
     repos: dict[str, RepoRecord] = field(default_factory=dict)
+
+    def add_commits(self, key: tuple[str, int], nodes: list[dict], keep: Callable[[dict], dict | None]) -> None:
+        shas = self.commit_shas.setdefault(key, [])
+        mine = self.commit_nodes.setdefault(key, [])
+        for node in nodes:
+            sha = str(node.get("oid") or "")
+            if sha:
+                shas.append(sha)
+                if keep(node) is not None:
+                    mine.append(node)
 
     def commits_of(
         self,
@@ -643,16 +841,14 @@ class PullRequestData:
         emails = {email.lower() for email in author_emails}
         primary = target_logins[0] if target_logins else ""
         branch = pr.head_branch or f"pull/{pr.number}"
-        shas: list[str] = []
+        key = (pr.full_name, pr.number)
+        shas = list(self.commit_shas.get(key, []))
         records: list[CommitRecord] = []
-        for node in self.commit_nodes.get((pr.full_name, pr.number), []):
+        for node in self.commit_nodes.get(key, []):
             payload = rest_commit(node)
-            if not payload["sha"]:
-                continue
-            shas.append(payload["sha"])
-            if _authored_by(payload, logins, emails):
+            if payload["sha"] and _authored_by(payload, logins, emails):
                 records.append(_commit_from_payload(payload, repo, branch, primary))
-        total = self.commit_totals.get((pr.full_name, pr.number), len(shas))
+        total = self.commit_totals.get(key, len(shas))
         if len(shas) < total or len(shas) == PR_COMMITS_LIMIT:
             coverage.warn(
                 f"{repo.full_name} PR #{pr.number}: GitHub lists only the first "
@@ -662,11 +858,33 @@ class PullRequestData:
         return shas, records
 
 
+def _slim_pr(keep: Callable[[dict], dict | None]) -> Callable[[dict], dict | None]:
+    """``Walk.convert`` for pull requests: each keeps its commits' SHAs but
+    only the tracked users' commit nodes (5,000 pull requests of a team carry
+    hundreds of thousands of commit nodes otherwise)."""
+
+    def convert(node: dict) -> dict | None:
+        conn = node.get("commits")
+        if isinstance(conn, dict):
+            commits = [c["commit"] for c in conn.get("nodes") or [] if isinstance((c or {}).get("commit"), dict)]
+            node = {
+                **node,
+                "commits": {key: value for key, value in conn.items() if key != "nodes"},
+                "_shas": [str(c.get("oid") or "") for c in commits],
+                "_mine": [c for c in commits if keep(c) is not None],
+            }
+        return node
+
+    return convert
+
+
 async def collect_pull_requests(
     clients: dict[str, GitHubClient],
     target_logins: list[str],
     *,
     inflight: int,
+    author_emails: list[str] | None = None,
+    coverage: Coverage | None = None,
 ) -> PullRequestData | None:
     """Every pull request opened by ``target_logins`` that any token can see.
 
@@ -674,16 +892,23 @@ async def collect_pull_requests(
     and the pull-request search: a user's own pull-request list covers private
     repositories the token can read as well as upstream projects. Returns
     ``None`` if a list could not be read completely (the caller then uses the
-    REST collectors).
+    REST collectors). A single pull request GitHub won't show (SAML SSO, a
+    deleted repository) is noted and left out instead.
     """
+    keep = node_author_filter(
+        {login.lower() for login in target_logins}, {email.lower() for email in author_emails or []}
+    )
     pairs = [(account, login) for account in clients for login in target_logins]
     walks = [_prs_walk(clients[account], login) for account, login in pairs]
+    for walk in walks:
+        walk.convert = _slim_pr(keep)
     with _Progress("Pull requests", len(walks)) as bar:
         await run_walks(walks, BATCH["prs"], inflight=inflight, progress=bar)
     for (account, login), walk in zip(pairs, walks):
         if walk.error:
             log.info("[%s] pull requests of %s could not be listed through GraphQL: %s", account, login, walk.error)
             return None
+    note_skipped(walks, coverage, "pull request(s)")
 
     result = PullRequestData()
     follow: list[tuple[tuple[str, int], Walk]] = []
@@ -700,18 +925,18 @@ async def collect_pull_requests(
                 known.discovered_via.add(account)
             pr = pr_record(node, known)
             key = (pr.full_name, pr.number)
-            if key in result.commit_nodes:
+            if key in result.commit_shas:
                 continue  # seen through another token
             result.prs.append(pr)
+            result.commit_shas[key] = [sha for sha in node.get("_shas") or [] if sha]
+            result.commit_nodes[key] = list(node.get("_mine") or [])
             conn = node.get("commits") or {}
-            result.commit_nodes[key] = [
-                c["commit"] for c in conn.get("nodes") or [] if isinstance((c or {}).get("commit"), dict)
-            ]
             if isinstance(conn.get("totalCount"), int):
                 result.commit_totals[key] = conn["totalCount"]
             info = conn.get("pageInfo") or {}
             if info.get("hasNextPage") and info.get("endCursor"):
                 follow.append((key, _pr_commits_walk(clients[account], pr.full_name, pr.number, str(info["endCursor"]))))
+        walk.nodes = []  # read: free it
 
     if follow:
         await run_walks([w for _key, w in follow], BATCH["pr_commits"], inflight=inflight)
@@ -719,7 +944,9 @@ async def collect_pull_requests(
             if walk.error:
                 result.incomplete.add(key)
             else:
-                result.commit_nodes[key].extend(n["commit"] for n in walk.nodes if isinstance(n.get("commit"), dict))
+                commits = [n["commit"] for n in walk.nodes if isinstance(n.get("commit"), dict)]
+                result.add_commits(key, commits, keep)
+                walk.nodes = []
     return result
 
 

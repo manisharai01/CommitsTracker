@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -82,26 +83,31 @@ def _clean_title(title: str) -> str:
     return text or title.strip()
 
 
-def extract_themes(messages: list[str], top: int = 8) -> tuple[list[str], dict[str, int]]:
+def _count_theme(message: str, words: Counter[str], types: Counter[str]) -> None:
+    """Add one commit message to the keyword and commit-type counts."""
+    first_line = (message.splitlines()[0] if message else "").strip()
+    if not first_line:
+        return
+    # Skip auto-generated merge commits - they only add noise (branch names,
+    # usernames, "pull request") and describe no real work.
+    low = first_line.lower()
+    if low.startswith(("merge pull request", "merge branch", "merge remote-tracking", "merged pull")):
+        return
+    match = _CONV_RE.match(first_line)
+    if match and match.group(1).lower() in _CONV_TYPES:
+        types[match.group(1).lower()] += 1
+        first_line = first_line[match.end():]  # drop the "feat:" prefix
+    for word in _WORD_RE.findall(first_line.lower()):
+        if word not in _STOPWORDS:
+            words[word] += 1
+
+
+def extract_themes(messages: Iterable[str], top: int = 8) -> tuple[list[str], dict[str, int]]:
     """Return (top keywords, conventional-commit-type counts)."""
     words: Counter[str] = Counter()
     types: Counter[str] = Counter()
     for message in messages:
-        first_line = (message.splitlines()[0] if message else "").strip()
-        if not first_line:
-            continue
-        # Skip auto-generated merge commits - they only add noise (branch names,
-        # usernames, "pull request") and describe no real work.
-        low = first_line.lower()
-        if low.startswith(("merge pull request", "merge branch", "merge remote-tracking", "merged pull")):
-            continue
-        match = _CONV_RE.match(first_line)
-        if match and match.group(1).lower() in _CONV_TYPES:
-            types[match.group(1).lower()] += 1
-            first_line = first_line[match.end():]  # drop the "feat:" prefix
-        for word in _WORD_RE.findall(first_line.lower()):
-            if word not in _STOPWORDS:
-                words[word] += 1
+        _count_theme(message, words, types)
     return [w for w, _ in words.most_common(top)], dict(types.most_common())
 
 
@@ -195,13 +201,15 @@ def _fmt_day(value: object) -> str:
 
 
 def _span_months(first: str, last: str) -> int:
-    """Whole months between two ISO date strings (0 when unknown)."""
+    """Months from one ISO date to another, by elapsed time and rounded
+    (2 Jan to 30 Dec is 12 months, 31 Jan to 1 Mar is 1); 0 when unknown."""
     try:
         f = datetime.fromisoformat(first.replace("Z", "+00:00"))
         l = datetime.fromisoformat(last.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return 0
-    return max(0, (l.year - f.year) * 12 + (l.month - f.month))
+    days = (l.date() - f.date()).days + 1  # both days count
+    return max(0, round(days / 30.4375))
 
 
 def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSummary:
@@ -220,16 +228,27 @@ def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSu
     months = _span_months(first, last)
 
     overview: list[str] = []
-    span = f"Between {first} and {last}"
-    if months >= 2:
-        span += f" ({months} months)"
-    sentence = (
-        f"{span}, {users} delivered {commits:,} commits across "
-        f"{repos} repositories spanning {len(owners)} team/organization account(s)"
-    )
-    if prs:
-        sentence += f", and opened {prs} pull request(s) of which {merged} were merged"
-    overview.append(sentence + ".")
+    if not commits and not prs:
+        overview.append(f"No commits or pull requests by {users} fall in this report's period.")
+    else:
+        if first and last:
+            span = f"On {first}" if first == last else f"Between {first} and {last}"
+        else:
+            span = "In this report's period"
+        if months >= 2:
+            span += f" ({months} months)"
+        where = (
+            f"{repos} repositor{'y' if repos == 1 else 'ies'} owned by {len(owners)} "
+            f"account{'' if len(owners) == 1 else 's'} or organization{'' if len(owners) == 1 else 's'}"
+        )
+        opened = f"{prs} pull request{'' if prs == 1 else 's'} of which {merged} {'was' if merged == 1 else 'were'} merged"
+        if commits:
+            sentence = f"{span}, {users} delivered {commits:,} commit{'' if commits == 1 else 's'} across {where}"
+            if prs:
+                sentence += f", and opened {opened}"
+        else:  # pull requests only
+            sentence = f"{span}, {users} opened {opened}, across {where}"
+        overview.append(sentence + ".")
 
     added = int(summary.get("total_lines_added") or 0)
     deleted = int(summary.get("total_lines_deleted") or 0)
@@ -285,8 +304,13 @@ def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSu
             ", ".join(f"{lang} ({c} commits)" for lang, _r, c in insights.languages[:6]
                       if lang != "Unknown") or ins.get("primary_languages", ""),
         ))
-    if owners:
-        strengths.append(("Teams / accounts contributed to", ", ".join(owners)))
+    # Other people's accounts and organizations: the tracked accounts' own
+    # repositories aren't a team they contributed to.
+    tracked = {name.strip().lower() for name in users.split(",")}
+    teams = [owner for owner in owners if owner.lower() not in tracked]
+    if teams:
+        shown = ", ".join(teams[:12]) + (f" and {len(teams) - 12} more" if len(teams) > 12 else "")
+        strengths.append(("Teams / accounts contributed to", shown))
     if ins.get("busiest_month"):
         strengths.append(("Peak delivery month", str(ins["busiest_month"])))
     private = sum(1 for w in works if w.is_private)
@@ -307,8 +331,22 @@ def build_exec_summary(insights: Insights, summary: dict[str, object]) -> ExecSu
     )
 
 
-def _compute_activity(commits: list[CommitRecord]) -> dict[str, object]:
-    days = sorted({c.authored_date.date() for c in commits if c.authored_date})
+def _compute_activity(commits: Iterable[CommitRecord]) -> dict[str, object]:
+    day_set: set[date] = set()
+    weekday: Counter[str] = Counter()
+    month: Counter[str] = Counter()
+    weeks: set[tuple[int, int]] = set()
+    n_commits = 0
+    for c in commits:
+        n_commits += 1
+        moment = c.authored_date
+        if moment is None:
+            continue
+        day_set.add(moment.date())
+        weekday[moment.strftime("%A")] += 1
+        month[moment.strftime("%Y-%m")] += 1
+        weeks.add(moment.isocalendar()[:2])
+    days = sorted(day_set)
     longest = current = 0
     prev: date | None = None
     for day in days:
@@ -319,16 +357,7 @@ def _compute_activity(commits: list[CommitRecord]) -> dict[str, object]:
         longest = max(longest, current)
         prev = day
 
-    weekday = Counter(
-        c.authored_date.strftime("%A") for c in commits if c.authored_date
-    )
-    month = Counter(
-        c.authored_date.strftime("%Y-%m") for c in commits if c.authored_date
-    )
-    weeks = {
-        c.authored_date.isocalendar()[:2] for c in commits if c.authored_date
-    }
-    avg_per_week = (len(commits) / len(weeks)) if weeks else 0.0
+    avg_per_week = (n_commits / len(weeks)) if weeks else 0.0
 
     busiest_day, busiest_day_n = (weekday.most_common(1)[0] if weekday else ("", 0))
     busiest_month, busiest_month_n = (month.most_common(1)[0] if month else ("", 0))
@@ -360,15 +389,58 @@ def _compute_languages(
     ]
 
 
+class _RepoTally:
+    """One repository's commits, summed up as they stream past (its branch
+    names, authors, keyword counts: never the commits themselves)."""
+
+    __slots__ = ("commits", "branches", "authors", "first", "last", "words", "types",
+                 "additions", "deletions", "files", "biggest")
+
+    def __init__(self) -> None:
+        self.commits = 0
+        self.branches: set[str] = set()
+        self.authors: set[str] = set()
+        self.first: datetime | None = None
+        self.last: datetime | None = None
+        self.words: Counter[str] = Counter()
+        self.types: Counter[str] = Counter()
+        self.additions = self.deletions = self.files = 0
+        self.biggest: CommitRecord | None = None  # the first of the largest
+
+    def add(self, c: CommitRecord) -> None:
+        self.commits += 1
+        if c.branch:
+            self.branches.add(c.branch)
+        if c.author_login:
+            self.authors.add(c.author_login)
+        moment = c.authored_date
+        if moment is not None:
+            if self.first is None or moment < self.first:
+                self.first = moment
+            if self.last is None or moment > self.last:
+                self.last = moment
+        _count_theme(c.message, self.words, self.types)
+        self.additions += c.additions
+        self.deletions += c.deletions
+        self.files += c.files_changed
+        if self.biggest is None or c.additions + c.deletions > self.biggest.additions + self.biggest.deletions:
+            self.biggest = c
+
+
 def _build_repo_work(
     repo: RepoRecord,
-    commits: list[CommitRecord],
+    commits: Iterable[CommitRecord] | _RepoTally,
     prs: list[PullRequestRecord],
 ) -> RepoWork:
+    if isinstance(commits, _RepoTally):
+        tally = commits
+    else:
+        tally = _RepoTally()
+        for commit in commits:
+            tally.add(commit)
     default_branch = repo.default_branch
-    branches = sorted({c.branch for c in commits if c.branch})
-    authors = sorted({c.author_login for c in commits if c.author_login})
-    dates = [c.authored_date for c in commits if c.authored_date]
+    branches = sorted(tally.branches)
+    authors = sorted(tally.authors)
 
     # Highlights: readable PR titles first (most descriptive), then branch topics.
     highlights: list[str] = []
@@ -389,15 +461,16 @@ def _build_repo_work(
             seen.add(key)
             highlights.append(phrase)
 
-    themes, conv_types = extract_themes([c.message for c in commits])
+    themes = [w for w, _ in tally.words.most_common(8)]
+    conv_types = dict(tally.types.most_common())
 
-    total_additions = sum(c.additions for c in commits)
-    total_deletions = sum(c.deletions for c in commits)
-    total_files_changed = sum(c.files_changed for c in commits)
+    total_additions = tally.additions
+    total_deletions = tally.deletions
+    total_files_changed = tally.files
 
     most_impactful = ""
-    if commits:
-        big = max(commits, key=lambda c: c.additions + c.deletions)
+    if tally.biggest is not None:
+        big = tally.biggest
         if big.additions or big.deletions:
             total_ch = big.additions + big.deletions
             msg = (big.message_first_line or big.sha[:8])[:60]
@@ -408,11 +481,11 @@ def _build_repo_work(
         organization=repo.organization,
         is_private=repo.is_private,
         language=repo.language or "",
-        commits=len(commits),
+        commits=tally.commits,
         pull_requests=len(prs),
         merged_pull_requests=sum(1 for p in prs if p.merged),
-        first_activity=min(dates) if dates else None,
-        last_activity=max(dates) if dates else None,
+        first_activity=tally.first,
+        last_activity=tally.last,
         branches=branches,
         authors=authors,
         highlights=highlights[:12],
@@ -430,22 +503,26 @@ def compute_insights(data: CollectedData) -> Insights:
     """Compute activity insights and per-repo work narratives."""
     activity = _compute_activity(data.commits)
 
-    commits_by_repo: dict[str, list[CommitRecord]] = {}
+    # One pass over the commits, a tally per repository.
+    commits_by_repo: dict[str, _RepoTally] = {}
     for commit in data.commits:
-        commits_by_repo.setdefault(commit.full_name, []).append(commit)
+        tally = commits_by_repo.get(commit.full_name)
+        if tally is None:
+            tally = commits_by_repo[commit.full_name] = _RepoTally()
+        tally.add(commit)
     prs_by_repo: dict[str, list[PullRequestRecord]] = {}
     for pr in data.pull_requests:
         prs_by_repo.setdefault(pr.full_name, []).append(pr)
 
     repos_by_name = {r.full_name: r for r in data.repos}
     commit_counts: Counter[str] = Counter(
-        {name: len(cs) for name, cs in commits_by_repo.items()}
+        {name: tally.commits for name, tally in commits_by_repo.items()}
     )
 
     repo_work: list[RepoWork] = []
     for full_name in sorted(
         set(commits_by_repo) | set(prs_by_repo),
-        key=lambda n: (-len(commits_by_repo.get(n, [])), n),
+        key=lambda n: (-(commits_by_repo[n].commits if n in commits_by_repo else 0), n),
     ):
         repo = repos_by_name.get(full_name) or RepoRecord(
             full_name=full_name,
@@ -456,7 +533,7 @@ def compute_insights(data: CollectedData) -> Insights:
         repo_work.append(
             _build_repo_work(
                 repo,
-                commits_by_repo.get(full_name, []),
+                commits_by_repo.get(full_name) or _RepoTally(),
                 prs_by_repo.get(full_name, []),
             )
         )

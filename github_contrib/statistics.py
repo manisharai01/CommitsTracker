@@ -6,6 +6,8 @@ for export happens later in :mod:`github_contrib.exporters`.
 
 from __future__ import annotations
 
+import heapq
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -13,18 +15,33 @@ import pandas as pd
 
 from .analytics import WEEKDAYS, WORK_TYPES, Analytics
 from .logging_config import get_logger
-from .models import CollectedData
+from .models import CollectedData, CommitRecord
 
 log = get_logger("statistics")
 
 TOP_N_REPOS = 25
+#: Years and months without commits are listed (as 0) across at most this
+#: many years: a commit dated decades off by a broken clock shouldn't add
+#: hundreds of empty rows.
+_MAX_FILLED_YEARS = 30
+
+
+def _month_range(first: str, last: str) -> list[str]:
+    """Every "YYYY-MM" from ``first`` to ``last``, inclusive."""
+    year, month = int(first[:4]), int(first[5:7])
+    end = (int(last[:4]), int(last[5:7]))
+    out: list[str] = []
+    while (year, month) <= end:
+        out.append(f"{year:04d}-{month:02d}")
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return out
 
 
 @dataclass(slots=True)
 class Statistics:
     """All derived tables plus the headline summary."""
 
-    commits: pd.DataFrame
+    commits: CommitTable  # every commit, read row by row
     pull_requests: pd.DataFrame
     repositories: pd.DataFrame
     organizations: pd.DataFrame
@@ -94,23 +111,54 @@ _ORG_COLS = [
 ]
 
 
-def _commit_datetimes(data: CollectedData) -> pd.Series:
-    """Series of timezone-aware authored datetimes (NaT for missing).
+class CommitTable:
+    """The report's commits as a table read row by row - never held whole.
 
-    Expressed in the time zone of the data (see filters.localize), so years,
-    months and weekdays follow the report's calendar rather than UTC.
+    It stands where a DataFrame of every commit used to be: that took about
+    1 KB per commit, and an account can have any number of commits. The
+    exporters and the HTML report stream its rows; ``source`` is the list or
+    :class:`~github_contrib.commitstore.CommitStore` they come from.
     """
-    if not data.commits:
-        return pd.Series([], dtype="datetime64[ns, UTC]")
-    values = [c.authored_date for c in data.commits]
-    series = pd.to_datetime(pd.Series(values), utc=True)
-    tz = next((v.tzinfo for v in values if v is not None), None)
-    return series.dt.tz_convert(tz) if tz is not None else series
+
+    columns: list[str] = _COMMIT_COLS
+
+    def __init__(self, source) -> None:
+        self.source = source
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    @property
+    def empty(self) -> bool:
+        return len(self.source) == 0
+
+    def rows(self):
+        """Each commit as a list of values in :attr:`columns` order."""
+        for commit in self.source:
+            row = commit.to_row()
+            yield [row[column] for column in _COMMIT_COLS]
+
+
+#: Weekday names in English, whatever the server's locale (as pandas gives them).
+_WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _object_frame(columns: dict[str, list]) -> pd.DataFrame:
+    """A DataFrame whose text columns are plain Python objects (as built from
+    a Series of objects), so tables made from counts match the old ones."""
+    return pd.DataFrame({
+        name: pd.Series(values, dtype="object") if values and isinstance(values[0], str) else values
+        for name, values in columns.items()
+    })
 
 
 def compute_statistics(data: CollectedData) -> Statistics:
-    """Compute every statistic table from collected data."""
-    commits_df = _records_to_df(data.commits, _COMMIT_COLS)
+    """Compute every statistic table from collected data.
+
+    The commits are read in streaming passes that keep counts per
+    repository, year, month, weekday, email and the like: memory grows with
+    those, not with the number of commits.
+    """
     prs_df = _records_to_df(data.pull_requests, _PR_COLS)
     # A size that wasn't recorded stays blank (and recorded ones stay "12", not "12.0").
     for column in ("additions", "deletions", "changed_files"):
@@ -120,70 +168,77 @@ def compute_statistics(data: CollectedData) -> Statistics:
     repos_df = _records_to_df(data.repos, _REPO_COLS)
     orgs_df = _records_to_df(data.organizations, _ORG_COLS)
 
-    authored = _commit_datetimes(data)
-    org_series = pd.Series([c.organization or "(personal)" for c in data.commits], dtype="object")
-    email_series = pd.Series([c.author_email or "(unknown)" for c in data.commits], dtype="object")
-    repo_series = pd.Series([c.full_name for c in data.commits], dtype="object")
-    login_series = pd.Series([c.author_login for c in data.commits], dtype="object")
+    repo_counts: Counter[tuple[str, str]] = Counter()
+    email_counts: Counter[str] = Counter()
+    year_counts: Counter[int] = Counter()
+    month_counts: Counter[str] = Counter()
+    weekday_counts: Counter[str] = Counter()
+    zone = None  # years, months and weekdays in the zone of the data (the first dated commit's)
+    first_dt = last_dt = None
+    n_commits = 0
+    for commit in data.commits:
+        n_commits += 1
+        repo_counts[(commit.full_name, commit.organization or "(personal)")] += 1
+        email_counts[commit.author_email or "(unknown)"] += 1
+        moment = commit.authored_date
+        if moment is None:
+            continue
+        if zone is None:
+            zone = moment.tzinfo
+        local = moment.astimezone(zone) if zone is not None else moment
+        if first_dt is None or local < first_dt:
+            first_dt = local
+        if last_dt is None or local > last_dt:
+            last_dt = local
+        year_counts[local.year] += 1
+        month_counts[f"{local.year:04d}-{local.month:02d}"] += 1
+        weekday_counts[_WEEKDAY_NAMES[local.weekday()]] += 1
 
     # -- commits per repository -------------------------------------------
-    if data.commits:
-        per_repo = (
-            pd.DataFrame({"full_name": repo_series, "organization": org_series})
-            .groupby(["full_name", "organization"], dropna=False)
-            .size()
-            .reset_index(name="commits")
-            .sort_values("commits", ascending=False, ignore_index=True)
-        )
+    if n_commits:
+        keys = sorted(repo_counts)  # as groupby orders them
+        per_repo = _object_frame({
+            "full_name": [k[0] for k in keys],
+            "organization": [k[1] for k in keys],
+            "commits": [repo_counts[k] for k in keys],
+        }).sort_values("commits", ascending=False, ignore_index=True)
     else:
         per_repo = pd.DataFrame(columns=["full_name", "organization", "commits"])
 
     # -- commits per year / month -----------------------------------------
-    valid_dates = authored.dropna()
-    if not valid_dates.empty:
-        per_year = (
-            valid_dates.dt.year.astype(int).value_counts().sort_index()
-            .rename_axis("year").reset_index(name="commits")
-        )
-        # strftime keeps the operation on tz-aware datetimes without the
-        # "dropping timezone information" warning that to_period() raises.
-        months = valid_dates.dt.strftime("%Y-%m")
-        per_month = (
-            months.value_counts().sort_index()
-            .rename_axis("month").reset_index(name="commits")
-        )
+    if year_counts:
+        # Quiet years and months are listed with 0: left out, a chart would
+        # draw June and October as neighbours.
+        first_year, last_year = min(year_counts), max(year_counts)
+        years = range(first_year, last_year + 1) if last_year - first_year <= _MAX_FILLED_YEARS else sorted(year_counts)
+        per_year = pd.DataFrame({"year": list(years), "commits": [int(year_counts.get(y, 0)) for y in years]})
+        if last_year - first_year <= _MAX_FILLED_YEARS:
+            month_keys = _month_range(min(month_counts), max(month_counts))
+        else:  # a bogus date decades away: list only the months with commits
+            month_keys = sorted(month_counts)
+        per_month = pd.DataFrame({"month": month_keys, "commits": [int(month_counts.get(m, 0)) for m in month_keys]})
     else:
         per_year = pd.DataFrame(columns=["year", "commits"])
         per_month = pd.DataFrame(columns=["month", "commits"])
 
     # -- commits by weekday (Mon..Sun) ------------------------------------
-    weekday_order = [
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    ]
-    if not valid_dates.empty:
-        wd_counts = valid_dates.dt.day_name().value_counts()
+    if year_counts:
         by_weekday = pd.DataFrame(
-            {
-                "weekday": weekday_order,
-                "commits": [int(wd_counts.get(day, 0)) for day in weekday_order],
-            }
+            {"weekday": list(_WEEKDAY_NAMES), "commits": [int(weekday_counts.get(day, 0)) for day in _WEEKDAY_NAMES]}
         )
     else:
         by_weekday = pd.DataFrame(columns=["weekday", "commits"])
 
     # -- commits by author email ------------------------------------------
-    if data.commits:
+    if n_commits:
+        # Counts in order of first appearance, sorted as value_counts sorts them.
         by_email = (
-            email_series.value_counts()
+            pd.Series(list(email_counts.values()), index=pd.Index(list(email_counts), dtype="object"))
+            .sort_values(ascending=False)
             .rename_axis("author_email").reset_index(name="commits")
-        )
-        by_login = (
-            login_series.value_counts()
-            .rename_axis("author_login").reset_index(name="commits")
         )
     else:
         by_email = pd.DataFrame(columns=["author_email", "commits"])
-        by_login = pd.DataFrame(columns=["author_login", "commits"])
 
     # -- commits / PRs by organization ------------------------------------
     by_org = _commits_prs_by_org(data)
@@ -202,13 +257,13 @@ def compute_statistics(data: CollectedData) -> Statistics:
     top_commits = _top_commits_by_impact(data)
 
     # -- headline summary --------------------------------------------------
-    summary_dict = _summary_dict(data, authored)
+    summary_dict = _summary_dict(data, first_dt, last_dt)
     summary_df = pd.DataFrame(
         [{"metric": k, "value": v} for k, v in summary_dict.items()]
     )
 
     return Statistics(
-        commits=commits_df,
+        commits=CommitTable(data.commits),
         pull_requests=prs_df,
         repositories=repos_df,
         organizations=orgs_df,
@@ -393,31 +448,40 @@ def _per_user(data: CollectedData) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("commits", ascending=False, ignore_index=True)
 
 
-def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]:
-    contributed_repos = {c.full_name for c in data.commits} | {
-        p.full_name for p in data.pull_requests
-    }
-    contributed_orgs = {c.organization for c in data.commits if c.organization} | {
-        p.organization for p in data.pull_requests if p.organization
-    }
+def _summary_dict(data: CollectedData, first_dt, last_dt) -> dict[str, object]:
+    """The headline numbers (one streaming pass over the commits)."""
+    contributed_repos = {p.full_name for p in data.pull_requests}
+    contributed_orgs = {p.organization for p in data.pull_requests if p.organization}
     member_or_contrib_orgs = {o.login for o in data.organizations if o.login}
 
     merged = sum(1 for p in data.pull_requests if p.merged)
     open_prs = sum(1 for p in data.pull_requests if p.state == "open")
 
-    valid_dates = authored.dropna()
-    first_dt = valid_dates.min() if not valid_dates.empty else None
-    last_dt = valid_dates.max() if not valid_dates.empty else None
-
-    total_additions = sum(c.additions for c in data.commits)
-    total_deletions = sum(c.deletions for c in data.commits)
-    total_files_changed = sum(c.files_changed for c in data.commits)
+    n_commits = total_additions = total_deletions = total_files_changed = measured = 0
+    emails: set[str] = set()
+    for c in data.commits:
+        n_commits += 1
+        contributed_repos.add(c.full_name)
+        if c.organization:
+            contributed_orgs.add(c.organization)
+        if c.author_email:
+            emails.add(c.author_email)
+        total_additions += c.additions
+        total_deletions += c.deletions
+        total_files_changed += c.files_changed
+        if c.stats_fetched and not c.is_merge:
+            measured += 1
     has_line_stats = total_additions > 0 or total_deletions > 0
 
+    # The accounts the report covers - also those without work in the period -
+    # else (older collections) whoever authored the work.
+    targets = [str(login) for login in data.meta.get("target_logins") or [] if str(login).strip()]
+    authors = sorted({c.author_login for c in data.commits if c.author_login}
+                     | {p.author_login for p in data.pull_requests if p.author_login})
     d: dict[str, object] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "tracked_users": ", ".join(sorted({c.author_login for c in data.commits} | {p.author_login for p in data.pull_requests})),
-        "total_lifetime_commits": len(data.commits),
+        "tracked_users": ", ".join(dict.fromkeys(targets) if targets else authors),
+        "total_lifetime_commits": n_commits,
         "total_pull_requests": len(data.pull_requests),
         "merged_pull_requests": merged,
         "open_pull_requests": open_prs,
@@ -426,7 +490,7 @@ def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]
         "repositories_contributed_to": len(contributed_repos),
         "organizations_contributed_to": len(contributed_orgs),
         "organizations_total": len(member_or_contrib_orgs),
-        "distinct_author_emails": len({c.author_email for c in data.commits if c.author_email}),
+        "distinct_author_emails": len(emails),
         "first_contribution_date": _iso_date(first_dt),
         "latest_contribution_date": _iso_date(last_dt),
     }
@@ -436,7 +500,6 @@ def _summary_dict(data: CollectedData, authored: pd.Series) -> dict[str, object]
         d["net_lines"] = total_additions - total_deletions
         d["total_files_changed"] = total_files_changed
         # Only commits whose lines were counted (merge commits never are).
-        measured = sum(1 for c in data.commits if c.stats_fetched and not c.is_merge)
         d["avg_lines_added_per_commit"] = round(total_additions / measured, 1) if measured else 0.0
     return d
 
@@ -469,7 +532,17 @@ def _top_commits_by_impact(data: CollectedData, top: int = 20) -> pd.DataFrame:
     """Top commits ranked by total lines changed (additions + deletions)."""
     cols = ["sha", "repository", "author_login", "authored_date",
             "additions", "deletions", "total_changes", "files_changed", "message_first_line", "url"]
-    commits_with_stats = [c for c in data.commits if c.additions or c.deletions]
+    # Only the ``top`` largest are kept as they stream past (a tie goes to the
+    # commit seen first): a min-heap on (size, -order) drops the smallest,
+    # and of equal ones the latest.
+    best: list[tuple[int, int, CommitRecord]] = []
+    for order, c in enumerate(data.commits):
+        if not (c.additions or c.deletions):
+            continue
+        heapq.heappush(best, (c.additions + c.deletions, -order, c))
+        if len(best) > top:
+            heapq.heappop(best)
+    commits_with_stats = [c for _size, _neg, c in sorted(best, key=lambda item: -item[1])]
     if not commits_with_stats:
         return pd.DataFrame(columns=cols)
     rows = [
@@ -488,7 +561,7 @@ def _top_commits_by_impact(data: CollectedData, top: int = 20) -> pd.DataFrame:
         for c in commits_with_stats
     ]
     df = pd.DataFrame(rows, columns=cols)
-    return df.sort_values("total_changes", ascending=False, ignore_index=True).head(top)
+    return df.sort_values("total_changes", ascending=False, ignore_index=True, kind="stable").head(top)
 
 
 def _iso_date(value) -> str:

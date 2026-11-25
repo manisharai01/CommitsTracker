@@ -83,6 +83,8 @@ def period_phrase(
         return f"From {_MONTHS[first.month - 1]} {first.year} to {_MONTHS[last.month - 1]} {last.year}"
     if start is not None and end is not None:
         year = start.year
+        if start == end:
+            return f"On {_day(start)}"
         if start == date(year, 1, 1) and end == date(year, 12, 31):
             return f"During {year}"
         if start == date(year, 1, 1) and end == date(year, 6, 30):
@@ -126,7 +128,8 @@ def build_linkedin_post(metrics: Mapping[str, object]) -> str:
     repos = _int(metrics, "repositories_contributed_to")
     projects = _int(metrics, "projects_contributed_to")
     private = _int(metrics, "private_repositories_contributed_to")
-    if not (commits or prs):
+    reviews = _int(metrics, "pull_request_reviews")
+    if not (commits or prs or reviews):
         return ""
 
     period = period_phrase(
@@ -147,11 +150,18 @@ def build_linkedin_post(metrics: Mapping[str, object]) -> str:
         shipped.append(_count(prs, "merged pull request"))
     elif prs:
         shipped.append(_count(prs, "pull request") + (f" ({merged:,} merged)" if merged else ""))
-    if repos:
+    if not shipped:  # a period with code reviews only
+        mates = _int(metrics, "teammates_reviewed")
+        reviewed_prs = _int(metrics, "prs_reviewed") or reviews
+        opening = (
+            f"{period}, I reviewed {_count(reviewed_prs, 'pull request')}"
+            + (f" from {_count(mates, 'teammate')}" if mates else "") + "."
+        )
+    elif repos:
         opening = f"{period}, I contributed to {where}, shipping {' and '.join(shipped)}."
     else:  # older summaries may lack the repository count
         opening = f"{period}, I shipped {' and '.join(shipped)}."
-    if repos and private == repos:
+    if shipped and repos and private == repos:
         opening += " All of it happened in private codebases."
     elif repos and private * 2 >= repos:
         opening += " Most of it happened in private codebases."
@@ -178,7 +188,7 @@ def build_linkedin_post(metrics: Mapping[str, object]) -> str:
     if median_hours is not None and merged >= 3:
         highlights.append(f"Half of my merged pull requests were merged {within(median_hours)} of opening")
     reviewed = _int(metrics, "prs_reviewed")
-    if reviewed >= 3:
+    if reviewed >= 3 and shipped:  # without shipped work, the opening already says it
         mates = _int(metrics, "teammates_reviewed")
         highlights.append(
             f"Reviewed {reviewed:,} pull requests" + (f" from {_count(mates, 'teammate')}" if mates else "")

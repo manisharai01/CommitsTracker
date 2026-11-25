@@ -13,6 +13,7 @@ const ACTIVE = new Set(["queued", "running"]);
 const MAX_ACCOUNTS = 20;
 const POLL_ACTIVE_MS = 1200;
 const POLL_IDLE_MS = 30000;
+const POLL_HIDDEN_MS = 15000; // a background tab, while a report runs
 const CONFIRM_MS = 4000;
 const NEW_TOKEN_URL =
   "https://github.com/settings/tokens/new?scopes=repo,read:org&description=CommitsTracker%20report";
@@ -862,10 +863,12 @@ function actionsHTML(job, logOpen) {
   const links = [];
   if (job.status === "done" && !job.expired) {
     const main = [];
-    // "Save as PDF" prints the report in this browser (its print dialog), so it
-    // works however long the report is, also when the server couldn't make one.
-    const savePdf = (style) => files.html
-      ? `<a class="btn ${style} btn-sm" href="${esc(files.html)}#save-pdf" target="_blank" rel="noopener noreferrer" ` +
+    // "Save as PDF" prints the report's concise summary (what the server's PDF
+    // holds) in this browser's print dialog, also when the server couldn't
+    // make one. Reports from before the summary existed print whole.
+    const printable = files.summary || files.html;
+    const savePdf = (style) => printable
+      ? `<a class="btn ${style} btn-sm" href="${esc(printable)}#save-pdf" target="_blank" rel="noopener noreferrer" ` +
         `title="Opens your browser's print dialog: choose “Save as PDF”">${icon("download")}Save as PDF</a>`
       : "";
     if (files.pdf) {
@@ -1326,8 +1329,12 @@ function schedulePoll(ms) {
   state.pollTimer = setTimeout(refresh, ms);
 }
 
+let pollFailures = 0;
+let polling = false;
+
 async function refresh() {
-  if (state.signedOut) return;
+  if (state.signedOut || polling) return;
+  polling = true; // one request at a time, however the poll was triggered
   try {
     const { jobs } = await api("/api/jobs");
     if (state.signedOut) return;
@@ -1338,12 +1345,19 @@ async function refresh() {
       if (job && entry.next < job.log_count) pulls.push(pullLog(id));
     }
     await Promise.all(pulls);
+    pollFailures = 0;
   } catch {
-    // The server may be restarting; keep trying on the normal schedule.
+    // The server may be restarting or busy: back off instead of hammering it.
+    pollFailures += 1;
+  } finally {
+    polling = false;
   }
   if (state.signedOut) return; // a 401 switched to the sign-in card
   const busy = state.jobs.some((job) => ACTIVE.has(job.status) || job.pdf === "rendering");
-  schedulePoll(busy ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+  let wait = busy ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+  if (document.hidden) wait = Math.max(wait, POLL_HIDDEN_MS);
+  if (pollFailures) wait = Math.max(wait, Math.min(POLL_IDLE_MS, POLL_ACTIVE_MS * 2 ** pollFailures));
+  schedulePoll(wait);
 }
 
 // ---------- GitHub sign-in ----------
@@ -1493,6 +1507,8 @@ async function init() {
     if (!document.hidden) {
       state.unseen = 0;
       document.title = BASE_TITLE;
+      // A hidden tab polls slowly: catch up as soon as it is looked at.
+      if (!state.signedOut) schedulePoll(0);
     }
   });
 

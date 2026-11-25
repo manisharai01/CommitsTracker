@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone, tzinfo
 
+from .commitstore import CommitStore
 from .config import AppConfig
 from .logging_config import get_logger
 from .models import CollectedData, CommitRecord, PullRequestRecord, RepoRecord
@@ -73,14 +74,19 @@ def apply_owner_exclusions(
         return data, {"repos": 0, "commits": 0, "pull_requests": 0}
 
     repos = [r for r in data.repos if _owner_of(r.full_name, r.owner) not in owners]
-    commits = [c for c in data.commits if _owner_of(c.full_name, c.owner) not in owners]
+    if isinstance(data.commits, CommitStore):  # marked in place: no copy of every commit
+        commits = data.commits
+        removed_commits = commits.drop_owners(owners)
+    else:
+        commits = [c for c in data.commits if _owner_of(c.full_name, c.owner) not in owners]
+        removed_commits = len(data.commits) - len(commits)
     prs = [p for p in data.pull_requests if _owner_of(p.full_name) not in owners]
     reviews = [r for r in data.reviews if _owner_of(r.full_name, r.owner) not in owners]
     organizations = aggregate_organizations(repos, commits, prs, _member_orgs(data, owners))
 
     removed = {
         "repos": len(data.repos) - len(repos),
-        "commits": len(data.commits) - len(commits),
+        "commits": removed_commits,
         "pull_requests": len(data.pull_requests) - len(prs),
     }
     if any(removed.values()):
@@ -116,11 +122,16 @@ def apply_date_range(
             and (until is None or moment <= until)
         )
 
-    commits = [c for c in data.commits if inside(c.authored_date)]
+    if isinstance(data.commits, CommitStore):
+        commits = data.commits
+        removed_commits = commits.drop_outside(since, until)
+    else:
+        commits = [c for c in data.commits if inside(c.authored_date)]
+        removed_commits = len(data.commits) - len(commits)
     prs = [p for p in data.pull_requests if inside(p.created_at)]
     reviews = [r for r in data.reviews if inside(r.submitted_at)]
     removed = {
-        "commits": len(data.commits) - len(commits),
+        "commits": removed_commits,
         "pull_requests": len(data.pull_requests) - len(prs),
     }
     organizations = aggregate_organizations(data.repos, commits, prs, _member_orgs(data))
@@ -143,8 +154,15 @@ class DedupeResult:
 _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
 
 
-def dedupe_contributions(data: CollectedData) -> tuple[CollectedData, DedupeResult]:
+def dedupe_contributions(
+    data: CollectedData, squash_prs: list[PullRequestRecord] | None = None
+) -> tuple[CollectedData, DedupeResult]:
     """Count every piece of work once.
+
+    ``squash_prs`` are the pull requests whose squash merges fold their
+    original commits (default: the data's own). A report period passes every
+    pull request, also those opened before it: a pull request opened in
+    December and squash-merged in January still folds its January commits.
 
     * **Same commit** — one SHA in several repositories (a fork and its
       upstream, a mirror) is the same commit; the copy in a non-fork
@@ -159,6 +177,14 @@ def dedupe_contributions(data: CollectedData) -> tuple[CollectedData, DedupeResu
       matching what landed (and GitHub's own contribution count).
     """
     result = DedupeResult()
+    if isinstance(data.commits, CommitStore):
+        store = data.commits
+        result.same_commit = store.drop_same_sha(data.repos)
+        result.rebased_copies = store.drop_rebased(data.repos)
+        result.squashed = store.drop_squashed(data.pull_requests if squash_prs is None else squash_prs)
+        _log_dedupe(result)
+        organizations = aggregate_organizations(data.repos, store, data.pull_requests, _member_orgs(data))
+        return replace(data, organizations=organizations), result
     repos = {r.full_name: r for r in data.repos}
 
     def on_default(commit: CommitRecord) -> bool:
@@ -216,10 +242,11 @@ def dedupe_contributions(data: CollectedData) -> tuple[CollectedData, DedupeResu
     result.rebased_copies = len(commits) - len(kept)
     commits = kept
 
-    # 3. Originals of squash-merged pull requests.
+    # 3. Originals of squash-merged pull requests (whose squash commit is in
+    #    the report: only then is the work counted, once, as what landed).
     present = {(c.full_name, c.sha): c for c in commits}
     folded: set[tuple[str, str]] = set()
-    for pr in data.pull_requests:
+    for pr in data.pull_requests if squash_prs is None else squash_prs:
         squash = present.get((pr.full_name, pr.merge_commit_sha)) if pr.merge_commit_sha else None
         if (
             squash is None
@@ -233,16 +260,20 @@ def dedupe_contributions(data: CollectedData) -> tuple[CollectedData, DedupeResu
     result.squashed = len(commits) - len(kept)
     commits = kept
 
+    _log_dedupe(result)
+    organizations = aggregate_organizations(
+        data.repos, commits, data.pull_requests, _member_orgs(data)
+    )
+    return replace(data, commits=commits, organizations=organizations), result
+
+
+def _log_dedupe(result: DedupeResult) -> None:
     if result.total:
         log.info(
             "counted each change once: -%d same commit in another repo, -%d rebased/"
             "cherry-picked copies, -%d squash-merged originals",
             result.same_commit, result.rebased_copies, result.squashed,
         )
-    organizations = aggregate_organizations(
-        data.repos, commits, data.pull_requests, _member_orgs(data)
-    )
-    return replace(data, commits=commits, organizations=organizations), result
 
 
 def _local(moment: datetime | None, tz: tzinfo) -> datetime | None:
@@ -251,10 +282,14 @@ def _local(moment: datetime | None, tz: tzinfo) -> datetime | None:
 
 def localize(data: CollectedData, tz: tzinfo) -> CollectedData:
     """``data`` with every timestamp expressed in ``tz`` (same instants)."""
-    commits = [
-        replace(c, authored_date=_local(c.authored_date, tz), committed_date=_local(c.committed_date, tz))
-        for c in data.commits
-    ]
+    if isinstance(data.commits, CommitStore):
+        commits = data.commits
+        commits.tz = tz  # read in the report's zone from now on: nothing is copied
+    else:
+        commits = [
+            replace(c, authored_date=_local(c.authored_date, tz), committed_date=_local(c.committed_date, tz))
+            for c in data.commits
+        ]
     prs: list[PullRequestRecord] = [
         replace(
             p,
@@ -297,11 +332,21 @@ class ReportScope:
 def prepare_report_data(
     data: CollectedData, config: AppConfig
 ) -> tuple[CollectedData, ReportScope]:
-    """Run every report-time step in order and describe what was done."""
+    """Run every report-time step in order and describe what was done.
+
+    The commits end up in a :class:`CommitStore` (a list is copied into a new
+    one), so no step needs memory for every commit. A store is reset first:
+    preparing the same data twice gives the same report.
+    """
     owners = excluded_owner_set(config, data)
+    if isinstance(data.commits, CommitStore):
+        data.commits.reset()
+    else:
+        data = replace(data, commits=CommitStore.from_records(data.commits))
     data, excluded = apply_owner_exclusions(data, owners)
+    every_pr = list(data.pull_requests)  # squash merges fold commits whatever the PR's opening date
     data, outside = apply_date_range(data, config.since, config.until)
-    data, duplicates = dedupe_contributions(data)
+    data, duplicates = dedupe_contributions(data, squash_prs=every_pr)
     data = localize(data, config.tz)
 
     collection = dict(data.meta)

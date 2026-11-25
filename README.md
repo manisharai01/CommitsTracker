@@ -6,11 +6,11 @@ Collects commits from every branch and reads each pull request's commits, which 
 Filters to the chosen time range and drops excluded owners.
 Counts each change once. The same commit in a fork and its upstream counts once, as do rebased or cherry-picked copies. The original commits of a squash-merged pull request are folded into the squash commit.
 Computes statistics in the user's time zone.
-What it produces. It writes a PDF report, an HTML report with charts built in, a Markdown report, an Excel workbook and CSV files. The report includes:
+What it produces. It writes a PDF summary, an HTML report with charts built in, a Markdown report, an Excel workbook and CSV files. The PDF is a concise summary of a few pages, however much work the report covers; the HTML report and the workbook hold every commit. The report includes:
 headline numbers and a dashboard for each repository;
 an executive summary written from the data;
 activity insights and a breakdown of work in each repository;
-a complete commit timeline.
+a complete commit timeline, and a GitHub-style commit calendar of the report period.
 Two sections explain the numbers. Data completeness lists anything that could not be read, and How this report was compiled states the period, branches, filters and de-duplication used.
 Accuracy. Nothing is dropped silently: every repository, branch, search or request that fails becomes a visible note. On real data, every commit that GitHub's own search knew about appeared in the report. Each option (default branch only, time range, owner exclusions) matched a count made separately.
 Two ways to use it.
@@ -207,11 +207,11 @@ See `python webui.py --help` for every limit.
 | **Insights & analytics** | Review-ready **highlights**; **delivery** (pull requests merged, merge rate, median and 90th-percentile time to merge, PR size, largest merged PRs); **code reviews** given; **work mix** (features, improvements, fixes, refactoring, tests, docs, chores — from commit wording); **quarter by quarter** (commits, PRs, reviews, repos, lines, change vs the previous complete quarter, and what shipped); **project timeline** (when each of the 12 busiest repositories was worked on, month by month); **working rhythm** (day × hour heatmap in the report's time zone, weeks with commits across the report period, best 30 days); **code footprint** (median commit size, share of small commits). Also in Excel (Highlights, Quarterly, Work Mix, PR Delivery, Working Rhythm sheets). |
 | **Technologies** | Languages, frameworks, databases, cloud/DevOps, testing and AI tools of the repositories worked on — from GitHub's language statistics, dependency files (`package.json`, `pubspec.yaml`, `requirements.txt`, `pyproject.toml`, `go.mod`, `pom.xml`, `Gemfile`, `composer.json`, …) and telltale files (Dockerfile, CI workflows, Terraform). Each is weighted by the commits in the repositories that use it; every repository card lists its stack. Also in Excel (Technologies sheet) and the LinkedIn draft. |
 | **Code reviews** | Reviews the tracked accounts gave on other people's pull requests (approvals, change requests, comments), by repository and quarter, from GitHub's contribution history — read a year at a time with each account's own token. Also in Excel (Code Reviews sheet) and `reviews.csv`. |
-| **PDF export** | `--pdf` renders `report.html` to `report.pdf` with headless Edge/Chrome — commit lists expanded, ready to submit. A long commit appendix is printed in parts that pypdf joins, so the browser's memory stays flat however many commits there are. |
+| **PDF export** | `--pdf` prints the report's concise summary (`summary.html`: headline numbers, highlights, executive summary, top repositories, delivery, quarters, working rhythm, technologies) to `report.pdf` with headless Edge/Chrome — a few pages and a few seconds, whether the report holds 50 commits or 50,000. Every commit stays in `report.html` and the Excel workbook. |
 | **All repos included** | Personal repos (owned by the tracked login) are included by default; opt in to dropping them with `--exclude-own-repos` / `--exclude-owner`. `--regen` restyles reports from cached CSVs without re-collecting. |
 | **Activity insights** | Active days, longest daily streak, busiest day-of-week & month, average commits per active week, and primary languages. |
 | **Any user** | Works for any GitHub login via `--user <login>`. |
-| **Outputs** | 6 CSV files + a 22-sheet formatted Excel workbook + HTML & Markdown reports. |
+| **Outputs** | 6 CSV files + a 22-sheet formatted Excel workbook + HTML & Markdown reports + the summary page the PDF is printed from. Large reports are written as they are made (about 210 MB peak for 30,000 commits). |
 | **Charts** | Per-year, per-month, day-of-week, top-repository and per-org bar charts, plus a combined dashboard PNG. |
 | **Branches** | Scans **every branch by default** (complete coverage); `--default-branch-only` for a faster run. |
 | **Performance** | GraphQL collection (batched queries, branch comparison, 25 commits' line stats per query) with REST as the fallback; async (`aiohttp`) requests with a shared concurrency limiter, rate-limit handling (primary + secondary), exponential-backoff retries and progress bars. |
@@ -248,7 +248,7 @@ CommitsTracker/
 │   ├── filters.py              # exclusions, time range, count-once rules, time zone
 │   ├── linkedin.py             # LinkedIn post drafted from the report's numbers
 │   ├── report.py               # orchestration (collect → compute → export)
-│   ├── pdfexport.py            # report.html → report.pdf via headless Edge/Chrome
+│   ├── pdfexport.py            # summary.html → report.pdf via headless Edge/Chrome
 │   ├── offline.py              # --regen: reload a previous run's CSVs
 │   ├── webapp.py               # web UI server: form → queued report runs
 │   ├── auth.py                 # "Sign in with GitHub" (OAuth App) + encrypted session cookie
@@ -263,6 +263,9 @@ CommitsTracker/
 │   ├── test_stack.py           # technology detection (fake GraphQL)
 │   ├── test_reviews.py         # code reviews (fake GraphQL)
 │   ├── test_pdfexport.py       # PDF in parts, memory guard, incomplete parts
+│   ├── test_report_layout.py   # commit calendar, summary PDF page, streamed output
+│   ├── test_collection_limits.py # rate limits, deadline, partial GraphQL failures
+│   ├── test_webapp_ops.py      # logs on disk, token-check limits, memory, deadline
 │   ├── test_auth.py            # sign-in, sessions, report history
 │   └── test_webapp.py          # web UI tests (fake CLI, no network needed)
 ├── Dockerfile, render.yaml     # Render deployment (see DEPLOY.md)
@@ -383,7 +386,7 @@ python github_report.py --user YOUR_LOGIN \
 | `--since DATE` | Only report work from this date on (`YYYY-MM-DD`, inclusive, or an ISO 8601 timestamp). Commits count by author date, pull requests by the date they were opened. | all time |
 | `--until DATE` | Only report work up to this date (inclusive: the whole day counts). | all time |
 | `--timezone TZ` | Time zone for `--since`/`--until` and for days, weeks and months in the report — an IANA name (`Asia/Kolkata`) or an offset (`+05:30`). | `UTC` |
-| `--pdf` | Also render `report.html` → `report.pdf` via headless Edge/Chrome (all commit lists expanded). | off |
+| `--pdf` | Also print the report's concise summary to `report.pdf` via headless Edge/Chrome. | off |
 | `--regen` | Rebuild all report artifacts from the CSVs of a previous run — no token/network needed. Source CSVs are left untouched. | off |
 | `--log-level LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. | `INFO` |
 | `--version` | Print version and exit. | — |

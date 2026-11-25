@@ -125,12 +125,15 @@ def build_dashboard(stats: Statistics, path: Path) -> Path:
     ax_text = fig.add_subplot(gs[0, 0])
     ax_text.axis("off")
     s = stats.summary_dict
+    period = str(s.get("report_period") or "all time")
+    commits_label = "Lifetime commits" if period == "all time" else "Commits in period"
     headline = "\n".join(
         [
             "GitHub Contribution Dashboard",
             "",
             f"Tracked users: {s.get('tracked_users', '')}",
-            f"Lifetime commits: {s.get('total_lifetime_commits', 0)}",
+            f"Period: {period}",
+            f"{commits_label}: {s.get('total_lifetime_commits', 0)}",
             f"Pull requests: {s.get('total_pull_requests', 0)} "
             f"(merged {s.get('merged_pull_requests', 0)})",
             f"Repositories contributed: {s.get('repositories_contributed_to', 0)}",

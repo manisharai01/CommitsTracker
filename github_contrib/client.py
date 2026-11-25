@@ -16,7 +16,8 @@ import json
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from email.utils import parsedate_to_datetime
+from typing import Any, AsyncIterator, Callable
 
 import aiohttp
 
@@ -33,6 +34,15 @@ _EMPTY_STATUSES = frozenset({404, 409, 451})
 _RETRY_STATUSES = frozenset({500, 502, 503, 504})
 
 
+#: Rate-limit retries of one request (secondary limits wait 1, 2, 4, 8, 15,
+#: 15... minutes when GitHub doesn't say how long).
+RATE_LIMIT_RETRIES = 8
+#: Longest single wait for a rate limit, in seconds.
+MAX_RATE_LIMIT_WAIT = 3600.0
+#: What a request past the run's deadline (see config.DEADLINE_ENV) says.
+TIME_LIMIT_MESSAGE = "the run reached its time limit before this could be read from GitHub"
+
+
 class GitHubError(RuntimeError):
     """A non-recoverable error talking to the GitHub API."""
 
@@ -43,6 +53,17 @@ class GitHubError(RuntimeError):
 
 class GraphQLQueryError(GitHubError):
     """A GraphQL query that failed as a whole (often: it took too long)."""
+
+
+class RateLimitedError(GitHubError):
+    """GitHub kept refusing a request for its rate limit, through every retry."""
+
+
+class DeadlineError(GitHubError):
+    """The run's collection deadline has passed (or would pass while waiting)."""
+
+    def __init__(self) -> None:
+        super().__init__(TIME_LIMIT_MESSAGE)
 
 
 @dataclass
@@ -59,11 +80,16 @@ class GitHubClient:
     # Receives a note for every access-denied response, so permission gaps
     # show up in the report's data-completeness section.
     coverage: Coverage | None = None
+    # Unix time after which nothing more is requested (see config.run_deadline).
+    deadline: float | None = None
     # Telemetry / discovered metadata
     request_count: int = field(default=0, init=False)
     graphql_count: int = field(default=0, init=False)
     rate_limit_waits: int = field(default=0, init=False)
     scopes: str | None = field(default=None, init=False)
+    # When GitHub asked this token to pause (monotonic clock): every request
+    # waits until then, so a rate limit hit by one is respected by all.
+    _resume_at: float = field(default=0.0, init=False, repr=False)
 
     @property
     def token_kind(self) -> str:
@@ -115,7 +141,9 @@ class GitHubClient:
         """Compute how long to wait from rate-limit headers, without sleeping.
 
         Returns the number of seconds to wait, or ``None`` if the headers do
-        not indicate a (computable) rate-limit wait.
+        not indicate a (computable) rate-limit wait. The reset time is
+        measured against GitHub's own clock (the ``Date`` header), so a fast
+        or slow local clock neither skips the wait nor stretches it.
         """
         retry_after = headers.get("Retry-After")
         remaining = headers.get("X-RateLimit-Remaining")
@@ -123,19 +151,55 @@ class GitHubClient:
 
         if retry_after is not None:
             try:
-                return max(0.0, float(retry_after))
+                return max(1.0, float(retry_after))
             except ValueError:
                 pass
         if remaining is not None and reset is not None:
             try:
                 if int(remaining) <= 0:
-                    return max(0.0, float(reset) - time.time())
+                    wait = float(reset) - _server_time(headers)
+                    # Without GitHub's clock, a reset that looks past may be a
+                    # fast local clock: wait a minute rather than not at all.
+                    return max(1.0 if headers.get("Date") else 60.0, wait)
             except ValueError:
                 pass
         return None
 
+    @staticmethod
+    def _secondary_wait(attempt: int) -> float:
+        """GitHub's advice for a secondary limit that names no wait: at least a
+        minute, then exponentially longer."""
+        return min(60.0 * 2 ** max(attempt - 1, 0), 900.0) + random.uniform(0, 5)
+
     def _backoff_delay(self, attempt: int) -> float:
         return min(60.0, 2.0 ** attempt) + random.uniform(0, 0.5)
+
+    def _check_deadline(self, wait: float = 0.0) -> None:
+        """Raise :class:`DeadlineError` when the deadline has passed, or would
+        pass during a ``wait`` of that many seconds."""
+        if self.deadline is not None and time.time() + wait >= self.deadline:
+            raise DeadlineError()
+
+    def pause(self, seconds: float) -> None:
+        """Hold every request of this token for ``seconds`` (a rate limit)."""
+        self._resume_at = max(self._resume_at, time.monotonic() + min(seconds, MAX_RATE_LIMIT_WAIT))
+
+    async def _wait_gate(self) -> None:
+        """Wait out a pause: requests sent during a rate limit are refused, and
+        refused requests make a secondary limit last longer. Waits again only
+        when another request extended the pause meanwhile."""
+        seen = None
+        while self._resume_at != seen:
+            seen = self._resume_at
+            delay = seen - time.monotonic()
+            if delay <= 0:
+                return
+            self._check_deadline(delay)
+            await asyncio.sleep(delay)
+
+    async def _sleep(self, seconds: float) -> None:
+        self._check_deadline(seconds)
+        await asyncio.sleep(seconds)
 
     async def request(
         self,
@@ -160,9 +224,13 @@ class GitHubClient:
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         max_retries = self.max_retries if retries is None else retries
         send_json = {} if json_body is None else {"json": json_body}
-        attempt = 0
+        attempt = 0  # server errors, network failures and unreadable answers
+        limited = 0  # rate-limit refusals
 
         while True:
+            # A pause another request of this token was asked for comes first.
+            self._check_deadline()
+            await self._wait_gate()
             attempt += 1
             # Decided inside the semaphore, performed after it is released.
             sleep_seconds: float | None = None
@@ -180,13 +248,23 @@ class GitHubClient:
                         status = response.status
 
                         if status in (200, 201):
-                            data = await response.json()
-                            return data, response.headers, status
+                            try:
+                                data = await response.json()
+                            except ValueError as exc:  # a cut-off or garbled answer
+                                if attempt > max_retries:
+                                    raise GitHubError(
+                                        f"GitHub sent an unreadable answer for {_api_path(url)} ({exc}).",
+                                        status=status,
+                                    ) from None
+                                log.debug("Unreadable answer for %s (attempt %d): %s", url, attempt, exc)
+                                sleep_seconds = self._backoff_delay(attempt)
+                            else:
+                                return data, response.headers, status
 
-                        if status in _EMPTY_STATUSES:
+                        elif status in _EMPTY_STATUSES:
                             return None, response.headers, status
 
-                        if status in (403, 429):
+                        elif status in (403, 429):
                             body = await _safe_text(response)
                             wait = self._rate_limit_wait(response.headers)
                             is_rate_limit = (
@@ -208,20 +286,23 @@ class GitHubClient:
                                 else:
                                     log.warning(message)
                                 return None, response.headers, status
-                            if attempt > self.max_retries:
-                                raise GitHubError(
-                                    f"Rate limited and out of retries for {url}: {body[:200]}",
+                            limited += 1
+                            if limited > max(self.max_retries, RATE_LIMIT_RETRIES):
+                                raise RateLimitedError(
+                                    f"Rate limited and out of retries for {_api_path(url)}: {_one_line(body)}",
                                     status=status,
                                 )
+                            attempt -= 1  # a rate limit isn't a failure of the request
                             self.rate_limit_waits += 1
-                            sleep_seconds = wait if wait is not None else self._backoff_delay(attempt)
+                            pause = wait if wait is not None else self._secondary_wait(limited)
+                            self.pause(pause + 1.0)
                             log.warning(
                                 "[%s] Rate limited (%d); sleeping %.0fs before retry %d/%d.",
                                 self.login or "client",
                                 status,
-                                min(sleep_seconds + 1.0, 3600.0),
-                                attempt,
-                                self.max_retries,
+                                min(pause + 1.0, MAX_RATE_LIMIT_WAIT),
+                                limited,
+                                max(self.max_retries, RATE_LIMIT_RETRIES),
                             )
 
                         elif status == 401:
@@ -259,9 +340,10 @@ class GitHubClient:
                 )
                 sleep_seconds = self._backoff_delay(attempt)
 
-            # Perform the wait outside the semaphore so we free the slot.
+            # Perform the wait outside the semaphore so we free the slot (a
+            # rate limit waits at the gate, at the top of the loop).
             if sleep_seconds is not None:
-                await asyncio.sleep(min(sleep_seconds + 1.0, 3600.0))
+                await self._sleep(min(sleep_seconds + 1.0, MAX_RATE_LIMIT_WAIT))
             # Loop again to retry.
 
     # -- public helpers ----------------------------------------------------
@@ -284,11 +366,13 @@ class GitHubClient:
         params: dict[str, Any] | None = None,
         accept: str = "application/vnd.github+json",
         max_items: int | None = None,
+        on_empty: Callable[[int], None] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield every item of a paginated list endpoint.
 
         Pagination follows the ``Link: rel="next"`` header.  Handles endpoints
-        that return a bare JSON array.
+        that return a bare JSON array. ``on_empty(status)`` hears why a list
+        had nothing at all (404 gone or no access, 409 empty, 451 blocked...).
         """
         query = dict(params or {})
         query.setdefault("per_page", self.per_page)
@@ -307,6 +391,8 @@ class GitHubClient:
             if data is None:
                 if page_index == 0:
                     # Legitimately empty / not found / no access.
+                    if on_empty is not None:
+                        on_empty(status)
                     return
                 # We already yielded items but a later page came back empty.
                 # Raising (instead of silently returning) prevents the caller
@@ -386,7 +472,8 @@ class GitHubClient:
         caller can split it — and waits out GraphQL rate limits, which arrive
         as errors in a 200 response.
         """
-        for attempt in range(1, self.max_retries + 2):
+        retries = max(self.max_retries, RATE_LIMIT_RETRIES)
+        for attempt in range(1, retries + 2):
             data, headers, status = await self.request(
                 "POST", "/graphql", json_body={"query": query}, retries=0
             )
@@ -395,16 +482,17 @@ class GitHubClient:
                 raise GraphQLQueryError(f"GraphQL request failed (status {status})", status=status)
             errors = [e for e in data.get("errors") or [] if isinstance(e, dict)]
             if any(e.get("type") == "RATE_LIMITED" for e in errors):
-                if attempt > self.max_retries:
-                    raise GitHubError("GraphQL rate limit exceeded and out of retries.", status=403)
+                if attempt > retries:
+                    raise RateLimitedError("GraphQL rate limit exceeded and out of retries.", status=403)
                 wait = self._rate_limit_wait(headers) if headers is not None else None
                 self.rate_limit_waits += 1
-                sleep_seconds = min((wait if wait is not None else self._backoff_delay(attempt)) + 1.0, 3600.0)
+                pause = min((wait if wait is not None else self._secondary_wait(attempt)) + 1.0, MAX_RATE_LIMIT_WAIT)
                 log.warning(
                     "[%s] GraphQL rate limited; sleeping %.0fs before retry %d/%d.",
-                    self.login or "client", sleep_seconds, attempt, self.max_retries,
+                    self.login or "client", pause, attempt, retries,
                 )
-                await asyncio.sleep(sleep_seconds)
+                self.pause(pause)  # every other query of this token waits too
+                await self._wait_gate()
                 continue
             payload = data.get("data")
             if not isinstance(payload, dict):
@@ -429,6 +517,17 @@ class GitHubClient:
             self.login = str(data["login"])
         self.scopes = headers.get("X-OAuth-Scopes") if headers else None
         return self.login, self.scopes
+
+
+def _server_time(headers: "aiohttp.typedefs.CIMultiDictProxy[str]") -> float:
+    """GitHub's clock (the answer's ``Date`` header), else this machine's."""
+    text = headers.get("Date")
+    if text:
+        try:
+            return parsedate_to_datetime(text).timestamp()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            pass
+    return time.time()
 
 
 def _is_secondary_rate_limit(body: str) -> bool:

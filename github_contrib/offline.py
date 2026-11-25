@@ -12,8 +12,9 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+from .commitstore import CommitStore
 from .exporters import FORMULA_PREFIXES
 from .logging_config import get_logger
 from .models import (
@@ -30,12 +31,17 @@ log = get_logger("offline")
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
+    return list(_iter_rows(path))
+
+
+def _iter_rows(path: Path) -> Iterator[dict[str, str]]:
+    """The rows of a CSV, one at a time (a commits.csv can be any size)."""
     if not path.exists():
         log.warning("%s not found — continuing without it.", path.name)
-        return []
+        return
     # utf-8-sig transparently strips the BOM that export_csvs writes.
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        return list(csv.DictReader(fh))
+        yield from csv.DictReader(fh)
 
 
 def _s(row: dict[str, str], key: str) -> str:
@@ -207,8 +213,11 @@ def _load_collection_file(output_dir: Path) -> tuple[dict[str, Any], list[str]]:
 
 def load_collected_from_csv(output_dir: Path) -> CollectedData:
     """Load a previous run's CSVs back into a :class:`CollectedData`."""
+    # Commits go straight from the file into a store on disk: never all in memory.
+    commits = CommitStore()
+    added = commits.add(_commit(row) for row in _iter_rows(output_dir / "commits.csv"))
+    log.info("loaded %d row(s) from commits.csv", added)
     mappers: list[tuple[str, Any]] = [
-        ("commits.csv", _commit),
         ("pull_requests.csv", _pr),
         ("repositories.csv", _repo),
         ("organizations.csv", _org),
@@ -224,7 +233,7 @@ def load_collected_from_csv(output_dir: Path) -> CollectedData:
     meta, notes = _load_collection_file(output_dir)
     data = CollectedData(
         repos=loaded["repositories.csv"],
-        commits=loaded["commits.csv"],
+        commits=commits,
         pull_requests=loaded["pull_requests.csv"],
         organizations=loaded["organizations.csv"],
         notes=notes,

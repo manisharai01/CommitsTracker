@@ -58,6 +58,7 @@ from aiohttp import web
 from . import __version__
 from . import auth as gh_auth
 from .config import (
+    DEADLINE_ENV,
     NO_DOTENV_ENV,
     ConfigError,
     _sanitize_login_for_env,
@@ -67,10 +68,11 @@ from .config import (
 )
 from .linkedin import LINKEDIN_LIMIT, build_linkedin_post
 from .logging_config import get_logger
-from .pdfexport import EXIT_NO_MEMORY, find_browser, pdf_timeout
+from .pdfexport import EXIT_NO_MEMORY, find_browser, memory_use, pdf_timeout
 from .reportscript import (  # not htmlreport: pandas would cost the server ~40 MB
     REPORT_CSP,
     SCRIPT,
+    SUMMARY_FILE,
     is_current,
     with_current_script,
 )
@@ -86,12 +88,17 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 #: Downloadable files of a finished run, keyed by the kind used in URLs.
+#: "summary" is the concise page the PDF is printed from (and that "Save as
+#: PDF" prints in the reader's browser).
 REPORT_FILES: dict[str, str] = {
     "pdf": "report.pdf",
     "html": "report.html",
+    "summary": SUMMARY_FILE,
     "xlsx": "github_contributions.xlsx",
     "md": "report.md",
 }
+#: Kinds that are report pages (opened in a tab, under the report's policy).
+PAGE_KINDS = frozenset({"html", "summary"})
 
 #: Metrics from contribution_summary.csv shown on a finished report card.
 SUMMARY_KEYS: tuple[str, ...] = (
@@ -162,9 +169,25 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 MAX_ACCOUNTS = 20
 MAX_LOG_LINES = 5000
+MAX_LOG_LINE = 4000  # characters kept of one output line
 MAX_WARNINGS = 10
 SESSION_MAX_AGE = 30 * 24 * 3600
 HISTORY_CACHE_SECONDS = 20.0
+#: Public mode: tokens one user (or address) may have checked with GitHub
+#: per window. Each check is a request from this server to GitHub.
+TOKEN_CHECKS_PER_WINDOW = 60
+TOKEN_CHECK_WINDOW = 600.0
+TOKEN_CHECK_CONCURRENCY = 8
+#: Memory one report run may need at its peak (collection, workbook, report
+#: pages); with less than this per run, runs execute one at a time.
+RUN_MEMORY_MB = 600
+#: Of a run's time limit, what is kept back for writing the report: the
+#: collection stops at the rest (see REPORT_DEADLINE in config.py), so a slow
+#: run still ends with a report of what it read.
+OUTPUT_RESERVE_SECONDS = 10 * 60
+#: The run's output, as the page showed it, saved when the run ends (the
+#: memory copy is dropped then).
+CONSOLE_LOG = "console.log"
 
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -633,6 +656,23 @@ def token_problem(login: str, token: str, info: TokenInfo | None) -> tuple[str, 
     return None
 
 
+def runs_that_fit(parallel: int) -> int:
+    """``parallel``, lowered to the report runs this server's memory holds at
+    once (RUN_MEMORY_MB each, besides the server's own ~150 MB); at least 1.
+    Two runs at once on a 512 MB host would take the whole server down."""
+    wanted = max(1, int(parallel or 1))
+    use = memory_use()
+    if use is None:  # not Linux: the operator knows the machine
+        return wanted
+    fits = max(1, (use[1] // (1024 * 1024) - 150) // RUN_MEMORY_MB)
+    if fits < wanted:
+        log.warning(
+            "This server has %d MB of memory: report runs execute %d at a time, not %d.",
+            use[1] // (1024 * 1024), fits, wanted,
+        )
+    return min(wanted, fits)
+
+
 def read_metrics(out_dir: Path) -> dict[str, str]:
     """Every metric of a finished run's contribution_summary.csv (empty when unavailable)."""
     try:
@@ -828,6 +868,10 @@ class Job:
     summary: dict[str, str] = field(default_factory=dict)
     log: list[str] = field(default_factory=list)
     log_dropped: int = 0
+    # A finished run's output lives in console.log: the absolute number of its
+    # first line, and how many lines it holds.
+    log_offset: int = 0
+    saved_lines: int = 0
     request: JobRequest | None = None  # holds the tokens; cleared when the run ends
     process: asyncio.subprocess.Process | None = None
     cancel_requested: bool = False
@@ -879,7 +923,8 @@ class Job:
 
     def download_name(self, kind: str) -> str:
         who = "+".join(self.logins[:3]) + ("+more" if len(self.logins) > 3 else "")
-        return f"github-report-{who}-{self.created_at[:10]}{Path(REPORT_FILES[kind]).suffix}"
+        label = "-summary" if kind == "summary" else ""
+        return f"github-report-{who}-{self.created_at[:10]}{label}{Path(REPORT_FILES[kind]).suffix}"
 
     def record(self) -> dict:
         """The token-free state persisted to job.json."""
@@ -910,7 +955,7 @@ class Job:
             "progress": self.progress,
             "message": self.message,
             "files": self.files(),
-            "log_count": self.log_dropped + len(self.log),
+            "log_count": self.log_count,
             "share_url": f"{share_base}/shared/{self.share_token}" if share_base and self.share_token else "",
         }
 
@@ -952,7 +997,7 @@ class Job:
 
     def add_output(self, line: str) -> None:
         """Record one line of the child's output and update the live status."""
-        line = self.redact(line).rstrip()
+        line = self.redact(line[: MAX_LOG_LINE * 2]).rstrip()[:MAX_LOG_LINE]
         text = line.strip()
         if not text:
             return
@@ -986,19 +1031,48 @@ class Job:
             if fragment in msg:
                 self.phase, self.progress = phase, None
 
+    @property
+    def log_count(self) -> int:
+        """Lines of output so far (absolute: dropped ones included)."""
+        if self.log:
+            return self.log_dropped + len(self.log)
+        return self.log_offset + self.saved_lines
+
     def log_since(self, since: int) -> tuple[list[str], int]:
-        """Log lines from absolute index ``since`` on, plus the next index."""
+        """Log lines from absolute index ``since`` on, plus the next index.
+        A finished run's log is read from disk each time (see :meth:`save_log`)."""
+        if not self.active and not self.log:
+            lines = self.saved_log()
+            start = max(since - self.log_offset, 0)
+            return lines[start:], self.log_offset + len(lines)
         start = max(since - self.log_dropped, 0)
         return self.log[start:], self.log_dropped + len(self.log)
 
-    def load_run_log(self) -> None:
-        """Fill the log of a restored job from the run.log the CLI wrote."""
-        try:
-            lines = (self.out_dir / "run.log").read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+    def save_log(self) -> None:
+        """Keep the run's output on disk, not in the server's memory: a hosted
+        server holds many finished reports, each with up to MAX_LOG_LINES lines.
+        Line numbers stay the same, so an open log panel misses nothing."""
+        if not self.log:
             return
-        self.log = [self.redact(line) for line in lines[-MAX_LOG_LINES:]]
-        self.log_dropped = 0
+        try:
+            (self.out_dir / CONSOLE_LOG).write_text("\n".join(self.log) + "\n", encoding="utf-8", newline="")
+        except OSError as exc:
+            log.warning("could not save %s/%s: %s", self.id, CONSOLE_LOG, exc)
+            return
+        self.log_offset, self.saved_lines = self.log_dropped, len(self.log)
+        self.log, self.log_dropped = [], 0
+
+    def saved_log(self) -> list[str]:
+        """The saved output of a finished run (console.log), else the run.log
+        the CLI wrote (reports from before console.log existed)."""
+        for name in (CONSOLE_LOG, "run.log"):
+            try:
+                text = (self.out_dir / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = text.splitlines()[-MAX_LOG_LINES:]
+            return [self.redact(line[:MAX_LOG_LINE]) for line in lines]
+        return []
 
 
 class JobManager:
@@ -1010,9 +1084,14 @@ class JobManager:
         self.store = store
         self.jobs_dir = Path(settings.jobs_dir).resolve()
         self.jobs: dict[str, Job] = {}
-        self._slots = asyncio.Semaphore(max(1, settings.parallel))
+        self.parallel = runs_that_fit(settings.parallel)
+        self._slots = asyncio.Semaphore(self.parallel)
         self._tasks: set[asyncio.Task] = set()
         self._recent: dict[str, collections.deque[float]] = {}
+        # Tokens checked with GitHub, per user/address (public mode), and at
+        # most TOKEN_CHECK_CONCURRENCY checks in flight.
+        self._token_checks: dict[str, collections.deque[float]] = {}
+        self._token_check_slots = asyncio.Semaphore(TOKEN_CHECK_CONCURRENCY)
         #: Report ids deleted while this server runs (never listed again, even
         #: if deleting the history row failed).
         self.forgotten: set[str] = set()
@@ -1043,6 +1122,8 @@ class JobManager:
                 429,
             )
         if self.settings.max_jobs_per_hour:
+            if len(self._recent) > 10_000:
+                self.prune_rate_limits()
             window = self._recent.setdefault(self._rate_key(owner, client), collections.deque())
             cutoff = time.monotonic() - 3600
             while window and window[0] < cutoff:
@@ -1055,6 +1136,33 @@ class JobManager:
     def _rate_key(self, owner: str, client: str) -> str:
         """Hourly limits count per account when signed in, else per client address."""
         return owner if self.settings.auth else client
+
+    def allow_token_check(self, owner: str, client: str, tokens: int) -> bool:
+        """Whether ``tokens`` more tokens may be checked with GitHub now: in
+        public mode each user (or address) gets TOKEN_CHECKS_PER_WINDOW per
+        TOKEN_CHECK_WINDOW, so the server can't be used to test tokens in bulk."""
+        if not self.settings.public or tokens <= 0:
+            return True
+        now = time.monotonic()
+        window = self._token_checks.setdefault(self._rate_key(owner, client), collections.deque())
+        while window and window[0] < now - TOKEN_CHECK_WINDOW:
+            window.popleft()
+        if len(window) + tokens > TOKEN_CHECKS_PER_WINDOW:
+            return False
+        window.extend([now] * tokens)
+        return True
+
+    async def check_token(self, token: str) -> TokenInfo | None:
+        async with self._token_check_slots:
+            return await fetch_token_info(token)
+
+    def prune_rate_limits(self) -> None:
+        """Forget the rate-limit windows that hold nothing recent (one per
+        address or user ever seen would otherwise pile up)."""
+        now = time.monotonic()
+        for windows, span in ((self._recent, 3600.0), (self._token_checks, TOKEN_CHECK_WINDOW)):
+            for key in [key for key, window in windows.items() if not window or window[-1] < now - span]:
+                del windows[key]
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1250,6 +1358,7 @@ class JobManager:
 
     def expire(self, now: datetime | None = None) -> int:
         """Delete reports older than the retention period; returns how many."""
+        self.prune_rate_limits()
         hours = self.settings.retention_hours
         if hours <= 0:
             return 0
@@ -1258,9 +1367,11 @@ class JobManager:
         for job in list(self.jobs.values()):
             finished = job.finished_at or job.created_at
             try:
-                moment = datetime.fromisoformat(finished)
+                moment = datetime.fromisoformat(str(finished))
             except ValueError:
                 continue
+            if moment.tzinfo is None:  # written without a zone: the server writes UTC
+                moment = moment.replace(tzinfo=timezone.utc)
             if not job.active and moment < cutoff:
                 expired.append(job)
         for job in expired:
@@ -1316,6 +1427,7 @@ class JobManager:
         if job.delete_requested:
             self._remove(job)
         else:
+            job.save_log()
             self._save(job)
         await self.sync(job)
 
@@ -1387,10 +1499,16 @@ class JobManager:
         job.status, job.phase = "running", "Starting"
         self._sync_soon(job)
         job.out_dir.mkdir(parents=True, exist_ok=True)
+        env = build_env(request, os.environ, isolated=settings.public)
+        if settings.job_timeout:
+            # The collection stops here and the report is written from what it
+            # read (with a completeness note), before the hard stop below.
+            reserve = min(OUTPUT_RESERVE_SECONDS, settings.job_timeout / 4)
+            env[DEADLINE_ENV] = f"{time.time() + settings.job_timeout - reserve:.0f}"
         process = await asyncio.create_subprocess_exec(
             *build_command(request, job.out_dir, settings.python, settings.script),
             cwd=PROJECT_ROOT,
-            env=build_env(request, os.environ, isolated=settings.public),
+            env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -1813,7 +1931,12 @@ async def _check_tokens(request: web.Request) -> web.Response:
         if _LOGIN_RE.match(login) and _TOKEN_RE.match(token):
             rows.append((login, token))
     tokens = list(dict.fromkeys(token for _login, token in rows))
-    infos = dict(zip(tokens, await asyncio.gather(*(fetch_token_info(token) for token in tokens))))
+    manager = request.app[MANAGER]
+    settings = request.app[SETTINGS]
+    if not manager.allow_token_check(request[OWNER], _client_address(request, settings), len(tokens)):
+        # The page treats a failed check as "no problems found": runs go on.
+        return _error("Too many token checks. Try again in a few minutes.", 429)
+    infos = dict(zip(tokens, await asyncio.gather(*(manager.check_token(token) for token in tokens))))
     problems = []
     for login, token in rows:
         found = token_problem(login, token, infos[token])
@@ -1883,16 +2006,14 @@ async def _job_log(request: web.Request) -> web.Response:
         since = max(int(request.query.get("since", "0")), 0)
     except ValueError:
         since = 0
-    if not job.log and not job.active:
-        job.load_run_log()
     lines, next_index = job.log_since(since)
     return web.json_response({"lines": lines, "next": next_index})
 
 
 def _report_file(path: Path, kind: str) -> web.StreamResponse:
-    """A report file as written; report.html from before the report's script
+    """A report file as written; a report page from before the report's script
     last changed gets the current one (see reportscript.with_current_script)."""
-    if kind != "html":
+    if kind not in PAGE_KINDS:
         return web.FileResponse(path)
     try:
         with path.open("rb") as fh:
@@ -1913,11 +2034,11 @@ async def _job_file(request: web.Request) -> web.StreamResponse:
     path = job.out_dir / name if name else None
     if path is None or not path.is_file():
         raise web.HTTPNotFound(text="That file isn't available for this report.")
-    # HTML opens in a tab; everything else (and ?download) saves to disk.
-    disposition = "inline" if kind == "html" and "download" not in request.query else "attachment"
+    # Pages open in a tab; everything else (and ?download) saves to disk.
+    disposition = "inline" if kind in PAGE_KINDS and "download" not in request.query else "attachment"
     response = _report_file(path, kind)
     response.headers["Content-Disposition"] = f'{disposition}; filename="{job.download_name(kind)}"'
-    if kind == "html":
+    if kind in PAGE_KINDS:
         response.headers["Content-Security-Policy"] = _REPORT_HTML_CSP
     return response
 
@@ -1925,7 +2046,7 @@ async def _job_file(request: web.Request) -> web.StreamResponse:
 # -- shared links (read-only, no session) -----------------------------------
 
 #: Files a shared link exposes — never the logs, the workbook or the data.
-SHARED_FILES = ("pdf", "html")
+SHARED_FILES = ("pdf", "html", "summary")
 
 _SHARED_CSP = (
     "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; "
@@ -2001,9 +2122,11 @@ async def _shared_page(request: web.Request) -> web.Response:
         buttons.append(f'<a class="btn btn-primary" href="{base}/pdf">Open PDF</a>')
         buttons.append(f'<a class="btn btn-outline" href="{base}/pdf?download">Download</a>')
     elif "html" in files:
-        # No PDF from the server: the viewer's browser prints one.
+        # No PDF from the server: the viewer's browser prints one (from the
+        # concise summary, as the server would have).
+        printable = "summary" if "summary" in files else "html"
         buttons.append(
-            f'<a class="btn btn-primary" href="{base}/html#save-pdf" target="_blank" '
+            f'<a class="btn btn-primary" href="{base}/{printable}#save-pdf" target="_blank" '
             'rel="noopener noreferrer">Save as PDF</a>'
         )
     if "html" in files:
@@ -2052,7 +2175,7 @@ async def _shared_file(request: web.Request) -> web.StreamResponse:
     disposition = "attachment" if "download" in request.query else "inline"
     response = _report_file(path, kind)
     response.headers["Content-Disposition"] = f'{disposition}; filename="{job.download_name(kind)}"'
-    if kind == "html":
+    if kind in PAGE_KINDS:
         response.headers["Content-Security-Policy"] = _REPORT_HTML_CSP
     return response
 
